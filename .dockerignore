@@ -1,0 +1,10 @@
+.env
+HALT
+data/*.db
+data/*.db-wal
+data/*.db-shm
+.venv
+__pycache__
+.pytest_cache
+.git
+*.pyc

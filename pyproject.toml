@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "snowball"
+version = "1.0.0"
+description = "Snowball 24/7 crypto paper-trading bot (Coinbase Advanced Trade, local fill simulator)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ccxt>=4.4.0",
+    "pydantic-settings>=2.4.0",
+    "pydantic>=2.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+snowball = "snowball.engine:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["snowball"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.hatch.build.targets.wheel.force-include]
+"snowball/static/index.html" = "snowball/static/index.html"

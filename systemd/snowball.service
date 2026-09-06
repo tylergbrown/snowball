@@ -1,0 +1,24 @@
+[Unit]
+Description=Snowball crypto paper-trading bot
+Documentation=file:///opt/snowball/README.md
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=snowball
+Group=snowball
+WorkingDirectory=/opt/snowball
+EnvironmentFile=-/opt/snowball/.env
+ExecStart=/opt/snowball/.venv/bin/python -m snowball
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snowball
+# systemd stop is the LAN off switch (SIGTERM -> process exits).
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

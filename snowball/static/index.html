@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Snowball</title>
+  <style>
+    :root {
+      --bg: #111214;
+      --fg: #e8e6e1;
+      --muted: #9a968c;
+      --card: #1b1c1f;
+      --line: #2a2c31;
+      --good: #7dce82;
+      --bad: #e07a7a;
+      --warn: #d6b35c;
+      --halt: #e07a7a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--fg);
+      font: 14px/1.45 ui-sans-serif, system-ui, sans-serif;
+    }
+    header {
+      display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+      padding: 12px 16px; border-bottom: 1px solid var(--line);
+    }
+    h1 { font-size: 16px; margin: 0; letter-spacing: 0.08em; text-transform: uppercase; }
+    .badge {
+      font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+      padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted);
+    }
+    .badge.on { color: var(--good); border-color: var(--good); }
+    .badge.off { color: var(--bad); border-color: var(--bad); }
+    .badge.warn { color: var(--warn); border-color: var(--warn); }
+    main { padding: 16px; display: grid; gap: 16px; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .value { font-size: 22px; font-variant-numeric: tabular-nums; margin-top: 4px; }
+    .pos { color: var(--good); }
+    .neg { color: var(--bad); }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button {
+      background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+      padding: 6px 12px; border-radius: 6px; cursor: pointer;
+    }
+    button.danger { border-color: var(--bad); color: var(--bad); }
+    button:hover { border-color: var(--fg); }
+    .muted { color: var(--muted); }
+    .note { color: var(--muted); font-size: 12px; max-width: 72ch; }
+    .tag { font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;
+      border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px; color: var(--muted); margin-right: 4px; }
+    .imp3 { color: var(--bad); border-color: var(--bad); }
+    .imp2 { color: var(--warn); border-color: var(--warn); }
+    a { color: var(--fg); }
+    .warn-banner { color: var(--warn); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 4px 0 8px; }
+    h2.section { font-size: 13px; margin: 0 0 8px; letter-spacing: 0.08em; text-transform: uppercase; }
+    #err { color: var(--bad); min-height: 1em; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Snowball</h1>
+    <span id="mode" class="badge">…</span>
+    <span id="halt" class="badge">halt</span>
+    <span id="trading" class="badge">trading</span>
+    <span id="kill" class="badge">daily kill</span>
+    <span id="strats" class="badge">strategies</span>
+    <span id="clock" class="muted"></span>
+  </header>
+  <main>
+    <p class="note">
+      LAN dashboard only. No internet exposure, no live-trading controls.
+      systemd stop is the off switch. Halt writes the local HALT file (paper ops).
+    </p>
+    <div class="kpis">
+      <div class="card"><div class="label">Equity</div><div class="value" id="equity">—</div></div>
+      <div class="card"><div class="label">Bankroll</div><div class="value" id="bankroll">—</div></div>
+      <div class="card"><div class="label">Cash</div><div class="value" id="cash">—</div></div>
+      <div class="card"><div class="label">Daily PnL / $25 kill</div><div class="value" id="dpnl">—</div></div>
+      <div class="card"><div class="label">Open lots</div><div class="value" id="open">—</div></div>
+    </div>
+    <div class="card">
+      <div class="row">
+        <div class="label">Paper ops</div>
+        <button id="btnHalt" class="danger">Halt</button>
+        <button id="btnResume">Resume</button>
+        <span id="err"></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Pairs (SMA 20/50 on 15m and 5m)</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Pair</th><th>Last</th>
+            <th>15m 20</th><th>15m 50</th><th>15m Sig</th>
+            <th>5m 20</th><th>5m 50</th><th>5m Sig</th>
+            <th>Lots</th><th>Pause</th>
+          </tr>
+        </thead>
+        <tbody id="pairs"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="label">Paused pairs</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Pair</th><th>Until</th><th>Reason</th><th>Streak</th>
+          </tr>
+        </thead>
+        <tbody id="pauses"></tbody>
+      </table>
+      <p class="note">Auto-pause after consecutive closed losers. Exits still allowed. Clear via PAIR_PAUSE_CLEAR_FILE.</p>
+    </div>
+    <div class="card">
+      <div class="label">Strategy scorecard (5m vs 15m)</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Strategy</th><th>Closed</th><th>Win rate</th><th>Realized PnL</th><th>Open</th>
+          </tr>
+        </thead>
+        <tbody id="scoreStrat"></tbody>
+      </table>
+      <div class="label" style="margin-top:10px">Per product</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Product</th><th>Closed</th><th>Win rate</th><th>Realized PnL</th><th>Open</th>
+          </tr>
+        </thead>
+        <tbody id="scoreProd"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="label">Open positions</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Id</th><th>Pair</th><th>Strategy</th><th>Side</th><th>Qty</th>
+            <th>Entry</th><th>Mark</th><th>Unrealized</th>
+          </tr>
+        </thead>
+        <tbody id="positions"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="label">Recent fills</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Pair</th><th>Strategy</th><th>Side</th><th>Qty</th>
+            <th>Price</th><th>Notional</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="fills"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2 class="section">Stock Paper</h2>
+      <div class="warn-banner">PAPER ONLY · Yahoo marks · isolated book (data/snowball_stocks.db) · never live stock orders</div>
+      <p class="note">HOT watchlist: top-25 SPY + top-25 QQQ (deduped) + core/chip-AI overlay + Yolo Demon dynamic tickers. Caps active traded symbols. Crypto live ledger is untouched.</p>
+      <div class="muted" id="stockMeta"></div>
+      <div class="kpis" style="margin-top:10px">
+        <div class="card"><div class="label">Stock Equity</div><div class="value" id="stockEquity">—</div></div>
+        <div class="card"><div class="label">Stock Cash</div><div class="value" id="stockCash">—</div></div>
+        <div class="card"><div class="label">Stock Daily PnL / kill</div><div class="value" id="stockDpnl">—</div></div>
+        <div class="card"><div class="label">Stock Open lots</div><div class="value" id="stockOpen">—</div></div>
+      </div>
+      <div class="label" style="margin-top:10px">Active symbols (paper)</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Last</th>
+            <th>15m/1d 20</th><th>15m/1d 50</th><th>Sig</th>
+            <th>5m Sig</th><th>1d Sig</th>
+            <th>Lots</th><th>Src</th>
+          </tr>
+        </thead>
+        <tbody id="stockPairs"></tbody>
+      </table>
+      <div class="label" style="margin-top:10px">Stock open positions</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Id</th><th>Symbol</th><th>Strategy</th><th>Qty</th>
+            <th>Entry</th><th>Mark</th><th>Unrealized</th>
+          </tr>
+        </thead>
+        <tbody id="stockPositions"></tbody>
+      </table>
+      <div class="label" style="margin-top:10px">Stock recent fills</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Symbol</th><th>Strategy</th><th>Side</th>
+            <th>Price</th><th>Notional</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="stockFills"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2 class="section">The Watcher</h2>
+      <p class="note">Official central-bank / treasury RSS and optional calendar APIs. Research log only — no orders from this panel.</p>
+      <div class="muted" id="watcherMeta"></div>
+      <div class="label" style="margin-top:10px">Upcoming calendar (next 48h)</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Source</th><th>Title</th><th>Imp</th><th>Tags</th>
+          </tr>
+        </thead>
+        <tbody id="watcherCal"></tbody>
+      </table>
+      <div class="label" style="margin-top:10px">Latest official press</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Source</th><th>Title</th><th>Tags</th>
+          </tr>
+        </thead>
+        <tbody id="watcherPress"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2 class="section">Yolo Demon</h2>
+      <div class="warn-banner">HIGH RISK / RESEARCH ONLY / DOES NOT TRADE</div>
+      <p class="note">YouTube priority channels (every video) + X API v2 mention heat. StockTwits dropped (no API keys). HIGH RISK / RESEARCH ONLY / DOES NOT TRADE. X disabled by default (pay-per-use).</p>
+      <div class="muted" id="yoloMeta"></div>
+      <h3 class="section" style="font-size:1rem;margin-top:1rem">Priority channel videos</h3>
+      <p class="note">Every upload from @thetradingfraternity and @thestockmarket (backfill from YOLO_YOUTUBE_BACKFILL_SINCE). Tickers extracted when present.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Published</th><th>Channel</th><th>Title</th><th>Tickers</th>
+          </tr>
+        </thead>
+        <tbody id="yoloVideos"></tbody>
+      </table>
+      <h3 class="section" style="font-size:1rem;margin-top:1rem">Mention heat</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th><th>Source</th><th>Score</th><th>6h / 24h</th><th>Sample</th>
+          </tr>
+        </thead>
+        <tbody id="yoloIdeas"></tbody>
+      </table>
+    </div>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const usd = (n) => n == null ? "—" : Number(n).toLocaleString(undefined, {style:"currency", currency:"USD", maximumFractionDigits: 2});
+    const num = (n, d=4) => n == null ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d});
+    const cls = (n) => n > 0 ? "pos" : n < 0 ? "neg" : "";
+
+    function render(s) {
+      $("clock").textContent = s.ts || "";
+      const st = s.status || {};
+      const r = s.risk || {};
+      const mode = $("mode");
+      mode.textContent = st.paper ? "paper" : (st.mode || "?");
+      mode.className = "badge " + (st.paper ? "on" : "off");
+      $("halt").textContent = st.halt_active ? "HALT" : "running";
+      $("halt").className = "badge " + (st.halt_active ? "off" : "on");
+      $("trading").textContent = st.trading_enabled ? "trading on" : "trading off";
+      $("trading").className = "badge " + (st.trading_enabled ? "on" : "off");
+      $("kill").textContent = st.daily_killed ? "daily kill" : "daily ok";
+      $("kill").className = "badge " + (st.daily_killed ? "off" : "on");
+      $("strats").textContent = (st.strategies || []).join(" + ") || "strategies";
+      $("equity").textContent = usd(r.equity_usd);
+      $("bankroll").textContent = usd(r.bankroll_usd);
+      $("cash").textContent = usd(r.cash_usd);
+      const dp = r.daily_pnl_usd;
+      $("dpnl").innerHTML = `<span class="${cls(dp)}">${usd(dp)}</span> <span class="muted">/ ${usd(r.daily_loss_kill_usd)}</span>`;
+      $("open").textContent = `${r.open_positions || 0} / ${r.max_book_positions || 8}`;
+
+      $("pairs").innerHTML = (s.pairs || []).map(p => `
+        <tr>
+          <td>${p.product}${p.paused ? ' <span class="tag imp3">paused</span>' : ""}</td>
+          <td>${num(p.last, 6)}</td>
+          <td>${num(p.sma_fast_15m ?? p.sma_fast, 6)}</td>
+          <td>${num(p.sma_slow_15m ?? p.sma_slow, 6)}</td>
+          <td>${p.signal_15m || p.signal || "hold"}</td>
+          <td>${num(p.sma_fast_5m, 6)}</td>
+          <td>${num(p.sma_slow_5m, 6)}</td>
+          <td>${p.signal_5m || "hold"}</td>
+          <td>${p.open_count}/${p.max_open}</td>
+          <td>${p.paused ? ((p.paused_until || "").replace("T"," ").slice(0,19) || "yes") : "—"}</td>
+        </tr>`).join("") || `<tr><td colspan="10" class="muted">no pair data yet</td></tr>`;
+
+      $("pauses").innerHTML = (s.pair_pauses || []).map(p => `
+        <tr>
+          <td>${p.product}</td>
+          <td>${(p.paused_until || "").replace("T"," ").slice(0,19) || "—"}</td>
+          <td>${p.reason || ""}</td>
+          <td>${p.consecutive_losses ?? 0}</td>
+        </tr>`).join("") || `<tr><td colspan="4" class="muted">no pairs paused</td></tr>`;
+
+      const sc = s.scorecard || {};
+      const wr = (x) => x == null ? "—" : (Number(x) * 100).toFixed(0) + "%";
+      $("scoreStrat").innerHTML = (sc.by_strategy || []).map(r => `
+        <tr>
+          <td>${r.strategy}</td>
+          <td>${r.closed_trades}</td>
+          <td>${wr(r.win_rate)}</td>
+          <td class="${cls(r.realized_pnl)}">${usd(r.realized_pnl)}</td>
+          <td>${r.open_count}</td>
+        </tr>`).join("") || `<tr><td colspan="5" class="muted">no closed trades yet</td></tr>`;
+      $("scoreProd").innerHTML = (sc.by_product || []).map(r => `
+        <tr>
+          <td>${r.product}</td>
+          <td>${r.closed_trades}</td>
+          <td>${wr(r.win_rate)}</td>
+          <td class="${cls(r.realized_pnl)}">${usd(r.realized_pnl)}</td>
+          <td>${r.open_count}</td>
+        </tr>`).join("") || `<tr><td colspan="5" class="muted">no closed trades yet</td></tr>`;
+
+      $("positions").innerHTML = (s.positions || []).map(p => `
+        <tr>
+          <td>${p.id}</td>
+          <td>${p.product}</td>
+          <td>${p.strategy || ""}</td>
+          <td>${p.side}</td>
+          <td>${num(p.qty, 8)}</td>
+          <td>${num(p.entry_price, 6)}</td>
+          <td>${num(p.mark, 6)}</td>
+          <td class="${cls(p.unrealized_pnl)}">${usd(p.unrealized_pnl)}</td>
+        </tr>`).join("") || `<tr><td colspan="8" class="muted">flat</td></tr>`;
+
+      $("fills").innerHTML = (s.fills || []).map(f => `
+        <tr>
+          <td>${(f.ts || "").replace("T", " ").slice(0, 19)}</td>
+          <td>${f.product}</td>
+          <td>${f.strategy || ""}</td>
+          <td>${f.side}</td>
+          <td>${num(f.qty, 8)}</td>
+          <td>${num(f.price, 6)}</td>
+          <td>${usd(f.notional_usd)}</td>
+          <td>${f.reason}</td>
+        </tr>`).join("") || `<tr><td colspan="8" class="muted">no fills</td></tr>`;
+
+      const stk = s.stocks || {};
+      if (stk.enabled) {
+        const sr = stk.risk || {};
+        const sst = stk.status || {};
+        const uni = stk.universe || {};
+        $("stockMeta").textContent =
+          `${stk.label || "STOCK PAPER"} · marks=${stk.mark_source || "?"} · active=${(uni.active||[]).length}/${(uni.all||[]).length}` +
+          (sst.strategies ? ` · ${(sst.strategies||[]).join("+")}` : "") +
+          (stk.last_tick_at ? ` · tick ${stk.last_tick_at}` : "") +
+          (sst.block_reasons && sst.block_reasons.length ? ` · blocked:${sst.block_reasons.join(",")}` : "");
+        $("stockEquity").textContent = usd(sr.equity_usd);
+        $("stockCash").textContent = usd(sr.cash_usd);
+        const sdp = sr.daily_pnl_usd;
+        $("stockDpnl").innerHTML = `<span class="${cls(sdp)}">${usd(sdp)}</span> <span class="muted">/ ${usd(sr.daily_loss_kill_usd)}</span>`;
+        $("stockOpen").textContent = `${sr.open_positions || 0}`;
+        $("stockPairs").innerHTML = (stk.pairs || []).slice(0, 60).map(p => `
+          <tr>
+            <td>${p.product}${p.paused ? ' <span class="tag imp3">paused</span>' : ""}</td>
+            <td>${num(p.last, 4)}</td>
+            <td>${num(p.sma_fast_15m ?? p.sma_fast, 4)}</td>
+            <td>${num(p.sma_slow_15m ?? p.sma_slow, 4)}</td>
+            <td>${p.signal_15m || p.signal || "hold"}</td>
+            <td>${p.signal_5m || "—"}</td>
+            <td>${p.signal_1d || "—"}</td>
+            <td>${p.open_count}/${p.max_open}</td>
+            <td>${p.mark_source || stk.mark_source || ""}</td>
+          </tr>`).join("") || `<tr><td colspan="9" class="muted">no stock marks yet</td></tr>`;
+        $("stockPositions").innerHTML = (stk.positions || []).map(p => `
+          <tr>
+            <td>${p.id}</td><td>${p.product}</td><td>${p.strategy || ""}</td>
+            <td>${num(p.qty, 6)}</td><td>${num(p.entry_price, 4)}</td>
+            <td>${num(p.mark, 4)}</td>
+            <td class="${cls(p.unrealized_pnl)}">${usd(p.unrealized_pnl)}</td>
+          </tr>`).join("") || `<tr><td colspan="7" class="muted">flat</td></tr>`;
+        $("stockFills").innerHTML = (stk.fills || []).map(f => `
+          <tr>
+            <td>${(f.ts || "").replace("T"," ").slice(0,19)}</td>
+            <td>${f.product}</td><td>${f.strategy || ""}</td><td>${f.side}</td>
+            <td>${num(f.price, 4)}</td><td>${usd(f.notional_usd)}</td><td>${f.reason}</td>
+          </tr>`).join("") || `<tr><td colspan="7" class="muted">no fills</td></tr>`;
+      } else {
+        $("stockMeta").textContent = "Stock paper lane disabled";
+      }
+
+      const w = s.watcher || {};
+      $("watcherMeta").textContent = w.enabled === false
+        ? "The Watcher disabled"
+        : `The Watcher · TE ${w.te_configured ? "on" : "off"} · FRED ${w.fred_configured ? "on" : "off"}` +
+          (w.last_poll_at ? ` · polled ${w.last_poll_at}` : "");
+      const tags = (list) => (list || []).map(t => `<span class="tag">${t}</span>`).join("") || "";
+      const when = (iso) => (iso || "").replace("T", " ").slice(0, 19) || "—";
+      const link = (ev) => ev.url ? `<a href="${ev.url}" target="_blank" rel="noopener">${ev.title || ev.url}</a>` : (ev.title || "");
+      $("watcherCal").innerHTML = (w.upcoming_calendar || []).map(ev => `
+        <tr>
+          <td>${when(ev.published_at)}</td>
+          <td>${ev.source || ""}</td>
+          <td>${link(ev)}</td>
+          <td><span class="tag ${ev.importance === 3 ? "imp3" : ev.importance === 2 ? "imp2" : ""}">${ev.importance ?? "—"}</span></td>
+          <td>${tags(ev.tags)}</td>
+        </tr>`).join("") || `<tr><td colspan="5" class="muted">no upcoming calendar events</td></tr>`;
+      $("watcherPress").innerHTML = (w.latest_press || []).map(ev => `
+        <tr>
+          <td>${when(ev.published_at)}</td>
+          <td>${ev.source || ""}</td>
+          <td>${link(ev)}</td>
+          <td>${tags(ev.tags)}</td>
+        </tr>`).join("") || `<tr><td colspan="4" class="muted">no official press yet</td></tr>`;
+
+      const y = s.yolo_demon || {};
+      const src = y.sources || {};
+      const srcLine = [
+        `YouTube: ${src.youtube || "?"}`,
+        `X: ${src.x || "?"} (default OFF / pay-per-use)`
+      ].join(" · ");
+      const br = y.source_breakdown || {};
+      const brLine = Object.keys(br).length
+        ? " · ideas: " + Object.entries(br).map(([k,v]) => `${k}=${v}`).join(", ")
+        : "";
+      const bf = y.youtube_backfill_done
+        ? ` · backfill ok (${y.youtube_backfill_counts || y.youtube_backfill_done})`
+        : "";
+      $("yoloMeta").textContent = y.enabled === false
+        ? "Yolo Demon disabled"
+        : (y.configured ? srcLine : "idle — set YOUTUBE_API_KEY (X needs X_ENABLED=true; StockTwits dropped)") +
+          brLine +
+          (y.last_poll_at ? ` · polled ${y.last_poll_at}` : "") +
+          bf;
+      $("yoloVideos").innerHTML = (y.priority_videos || []).map(v => `
+        <tr>
+          <td>${when(v.published_at)}</td>
+          <td>${v.channel_handle ? "@" + v.channel_handle : ""}</td>
+          <td>${v.url ? `<a href="${v.url}" target="_blank" rel="noopener">${v.title || v.url}</a>` : (v.title || "")}</td>
+          <td>${tags(v.tickers)}</td>
+        </tr>`).join("") || `<tr><td colspan="4" class="muted">no priority videos yet</td></tr>`;
+      $("yoloIdeas").innerHTML = (y.ideas || []).map(i => `
+        <tr>
+          <td>${i.ticker}${i.is_crypto ? ' <span class="tag">crypto</span>' : ""}</td>
+          <td>${i.source || ""}</td>
+          <td>${num(i.score, 2)}</td>
+          <td>${i.mentions_6h || 0} / ${i.mentions_24h || 0}</td>
+          <td>${i.url ? `<a href="${i.url}" target="_blank" rel="noopener">${i.sample_title || i.url}</a>` : (i.sample_title || "")}</td>
+        </tr>`).join("") || `<tr><td colspan="5" class="muted">no ideas yet</td></tr>`;
+    }
+
+    async function post(path) {
+      $("err").textContent = "";
+      const res = await fetch(path, {method: "POST"});
+      if (!res.ok) {
+        $("err").textContent = await res.text();
+        return;
+      }
+      const snap = await fetch("/api/snapshot").then(r => r.json());
+      render(snap);
+    }
+    $("btnHalt").onclick = () => post("/api/halt");
+    $("btnResume").onclick = () => post("/api/resume");
+
+    function connect() {
+      if (window.EventSource) {
+        const es = new EventSource("/api/stream");
+        es.onmessage = (ev) => {
+          try { render(JSON.parse(ev.data)); } catch (e) {}
+        };
+        es.onerror = () => { es.close(); setTimeout(connect, 2000); };
+      } else {
+        setInterval(async () => {
+          const s = await fetch("/api/snapshot").then(r => r.json());
+          render(s);
+        }, 1000);
+      }
+    }
+    fetch("/api/snapshot").then(r => r.json()).then(render).catch(() => {});
+    connect();
+  </script>
+</body>
+</html>
