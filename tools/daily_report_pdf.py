@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import urllib.request
-from datetime import datetime, timezone
+import argparse
+from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -91,9 +92,11 @@ def make_table(headers, rows, widths):
     return t
 
 
-def build(path: Path, *, sample: bool = False) -> Path:
+def build(path: Path, *, sample: bool = False, report_day: date | None = None) -> Path:
     now_ct = datetime.now(CT)
-    today = now_ct.date().isoformat()
+    day = report_day or now_ct.date()
+    today = day.isoformat()
+    is_today = day == now_ct.date()
     snap = fetch_snap()
     status = snap.get("status") or {}
     risk = snap.get("risk") or {}
@@ -103,13 +106,21 @@ def build(path: Path, *, sample: bool = False) -> Path:
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     leaders = top_trades(con, 10)
-    day_start = datetime(now_ct.year, now_ct.month, now_ct.day, tzinfo=CT).astimezone(timezone.utc).isoformat()
+    day_start_dt = datetime(day.year, day.month, day.day, tzinfo=CT)
+    day_end_dt = day_start_dt + timedelta(days=1)
+    day_start = day_start_dt.astimezone(timezone.utc).isoformat()
+    day_end = day_end_dt.astimezone(timezone.utc).isoformat()
     today_fills = list(
         con.execute(
-            "select product, side, strategy, round(notional_usd,2) notional, reason from fills where ts >= ? order by ts desc limit 20",
-            (day_start,),
+            "select product, side, strategy, round(notional_usd,2) notional, reason from fills where ts >= ? and ts < ? order by ts desc limit 20",
+            (day_start, day_end),
         )
     )
+    closed_day = con.execute(
+        "select coalesce(sum(realized_pnl),0) p, count(*) c from positions where status='closed' and closed_at >= ? and closed_at < ?",
+        (day_start, day_end),
+    ).fetchone()
+    day_realized = float(closed_day["p"] or 0)
 
     doc = SimpleDocTemplate(
         str(path),
@@ -127,7 +138,10 @@ def build(path: Path, *, sample: bool = False) -> Path:
     muted = ParagraphStyle("m", parent=styles["Normal"], fontSize=8, textColor=colors.HexColor("#94a3b8"), leading=11)
     praise = ParagraphStyle("p", parent=styles["Normal"], fontSize=10, textColor=colors.HexColor("#0f172a"), leading=14, spaceBefore=4, spaceAfter=8, backColor=colors.HexColor("#ecfdf5"), borderPadding=8)
 
-    pnl = float(risk.get("daily_pnl_usd") or 0)
+    if is_today:
+        pnl = float(risk.get("daily_pnl_usd") or 0)
+    else:
+        pnl = day_realized
     big = ParagraphStyle(
         "big",
         parent=styles["Normal"],
@@ -146,11 +160,14 @@ def build(path: Path, *, sample: bool = False) -> Path:
 
     story.append(Paragraph("Daily P/L", h2))
     story.append(Paragraph(("+" if pnl >= 0 else "") + f"${pnl:,.2f}", big))
+    eq_note = "book as of report" if is_today else "current book (live)"
     story.append(
         Paragraph(
             f"Equity ${float(risk.get('equity_usd') or 0):,.2f}&nbsp;&nbsp;·&nbsp;&nbsp;"
             f"Cash ${float(risk.get('cash_usd') or 0):,.2f}&nbsp;&nbsp;·&nbsp;&nbsp;"
-            f"Mode {status.get('mode', '?')}{' · LIVE' if status.get('live_enabled') else ''}",
+            f"Mode {status.get('mode', '?')}{' · LIVE' if status.get('live_enabled') else ''}"
+            f"&nbsp;&nbsp;·&nbsp;&nbsp;{eq_note}"
+            + (f"&nbsp;&nbsp;·&nbsp;&nbsp;Day closed PnL from {int(closed_day['c'] or 0)} exits" if not is_today else ""),
             body,
         )
     )
@@ -244,7 +261,8 @@ def build(path: Path, *, sample: bool = False) -> Path:
     else:
         story.append(Paragraph("None open.", body))
 
-    story.append(Paragraph("Today's fills (CT day so far)", h2))
+    fills_title = "Today's fills (CT day so far)" if is_today else f"Fills for {today} (CT)"
+    story.append(Paragraph(fills_title, h2))
     if today_fills:
         rows = [
             [
@@ -264,7 +282,7 @@ def build(path: Path, *, sample: bool = False) -> Path:
             )
         )
     else:
-        story.append(Paragraph("No fills yet today (CT).", body))
+        story.append(Paragraph(f"No fills on {today} (CT).", body))
 
     story.append(Spacer(1, 16))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0"), spaceBefore=4, spaceAfter=8))
@@ -279,8 +297,24 @@ def build(path: Path, *, sample: bool = False) -> Path:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Snowball daily trade PDF")
+    parser.add_argument(
+        "--date",
+        help="Report day America/Chicago YYYY-MM-DD (default: prior CT day)",
+    )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Mark PDF as SAMPLE and use SAMPLE filename suffix",
+    )
+    args = parser.parse_args()
     REPORTS.mkdir(parents=True, exist_ok=True)
-    today = datetime.now(CT).date().isoformat()
-    path = REPORTS / f"daily-{today}-SAMPLE.pdf"
-    build(path, sample=True)
+    now_ct = datetime.now(CT)
+    if args.date:
+        report_day = date.fromisoformat(args.date)
+    else:
+        report_day = (now_ct.date() - timedelta(days=1))
+    suffix = "-SAMPLE" if args.sample else ""
+    path = REPORTS / f"daily-{report_day.isoformat()}{suffix}.pdf"
+    build(path, sample=args.sample, report_day=report_day)
     print(path)
