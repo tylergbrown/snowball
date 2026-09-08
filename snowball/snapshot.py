@@ -81,6 +81,15 @@ def build_snapshot(state: AppState) -> dict:
                     "sma_slow_5m": snap.sma_slow_5m if snap else None,
                     "signal_5m": snap.signal_5m if snap else "hold",
                     "candle_ts_5m": snap.candle_ts_5m.isoformat() if snap and snap.candle_ts_5m else None,
+                    "sma_fast_1d": getattr(snap, "sma_fast_1d", None) if snap else None,
+                    "sma_slow_1d": getattr(snap, "sma_slow_1d", None) if snap else None,
+                    "signal_1d": getattr(snap, "signal_1d", "hold") if snap else "hold",
+                    "ema_fast_15m": getattr(snap, "ema_fast_15m", None) if snap else None,
+                    "ema_slow_15m": getattr(snap, "ema_slow_15m", None) if snap else None,
+                    "signal_ema_15m": getattr(snap, "signal_ema_15m", "hold") if snap else "hold",
+                    "donchian_high_1d": getattr(snap, "donchian_high_1d", None) if snap else None,
+                    "donchian_low_1d": getattr(snap, "donchian_low_1d", None) if snap else None,
+                    "signal_donchian_1d": getattr(snap, "signal_donchian_1d", "hold") if snap else "hold",
                     "open_count": open_count,
                     "max_open": settings.max_positions_per_pair,
                     "last_error": snap.last_error if snap else None,
@@ -142,6 +151,7 @@ def build_snapshot(state: AppState) -> dict:
             "pair_pauses": pair_pauses,
             "watcher": _watcher_payload(state),
             "yolo_demon": _yolo_payload(state),
+            "clerk": _clerk_payload(state),
             "stocks": build_stocks_snapshot(state),
         }
 
@@ -233,3 +243,60 @@ def _yolo_payload(state: AppState) -> dict:
         "x_reads_today": x_reads_today,
         "x_cost_note": "X is pay-per-use (~$0.005/post read); X_ENABLED defaults false",
     }
+
+
+def _clerk_watchlist_labels() -> list:
+    """Clerk sidecar is optional; strategy snapshot must not require it."""
+    try:
+        from snowball.clerk.watchlist import watchlist_labels
+    except Exception:
+        return []
+    try:
+        return watchlist_labels()
+    except Exception:
+        return []
+
+
+def _clerk_payload(state: AppState) -> dict:
+    settings = state.settings
+    sidecar = getattr(state, "clerk_sidecar", None)
+    last_poll = getattr(sidecar, "last_poll_at", None) if sidecar is not None else None
+    last_error = getattr(sidecar, "last_error", None) if sidecar is not None else None
+    counts = {
+        "filings": 0,
+        "transactions": 0,
+        "watchlist_filings": 0,
+        "watchlist_transactions": 0,
+        "scanned_skip": 0,
+    }
+    recent: list = []
+    store = getattr(state, "clerk", None)
+    if store is not None:
+        counts = store.counts()
+        recent = store.recent_watchlist(20)
+        last_poll = last_poll or store.get_meta("last_poll_at")
+        stored_err = store.get_meta("last_error")
+        last_error = last_error or stored_err or None
+    poll_counts = getattr(sidecar, "last_counts", None) if sidecar is not None else None
+    if isinstance(poll_counts, dict):
+        counts = {
+            **counts,
+            "last_poll_pdfs": int(poll_counts.get("pdfs") or 0),
+            "last_poll_transactions": int(poll_counts.get("transactions") or 0),
+        }
+    return {
+        "id": "clerk",
+        "name": "The Clerk",
+        "enabled": bool(getattr(settings, "clerk_enabled", True)),
+        "label": "RESEARCH ONLY / DOES NOT TRADE / NO ORDERS",
+        "places_orders": False,
+        "source": "https://disclosures-clerk.house.gov",
+        "last_poll_at": last_poll.isoformat() if hasattr(last_poll, "isoformat") else last_poll,
+        "last_error": last_error or None,
+        "counts": counts,
+        "recent_watchlist": recent,
+        "watchlist": _clerk_watchlist_labels(),
+        "poll_seconds": max(21600.0, float(getattr(settings, "clerk_poll_seconds", 21600.0))),
+        "pdf_cap": int(getattr(settings, "clerk_pdf_cap", 25)),
+    }
+

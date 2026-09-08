@@ -24,7 +24,22 @@ from snowball.risk import RiskContext, allow_entry, allow_exit, daily_loss_breac
 from snowball.state import AppState
 from snowball.stocks.market import YahooPaperMarket, resolve_coinbase_equity_ids
 from snowball.stocks.universe import build_stock_universe
-from snowball.strategy import crossover_signal, sma
+from snowball.gates import sma_fast_for_strategy, sma_slow_for_strategy
+from snowball.strategy import (
+    DONCHIAN_1D,
+    EMA_15M,
+    SMA_15M,
+    SMA_1D,
+    SMA_5M,
+    crossover_signal,
+    donchian_breakout_signal,
+    donchian_channels,
+    ema,
+    ema_crossover_signal,
+    enabled_timeframes,
+    signal_for_strategy,
+    sma,
+)
 
 log = logging.getLogger("snowball.stocks.engine")
 
@@ -61,37 +76,15 @@ def _stock_risk_ctx(
 
 
 def _sma_slow(snap: PairSnapshot, strategy_id: str) -> float | None:
-    if strategy_id == "sma_5m":
-        return snap.sma_slow_5m
-    if strategy_id == "sma_1d":
-        return getattr(snap, "sma_slow_1d", None) or snap.sma_slow
-    return snap.sma_slow
+    return sma_slow_for_strategy(snap, strategy_id)
 
 
 def _sma_fast(snap: PairSnapshot, strategy_id: str) -> float | None:
-    if strategy_id == "sma_5m":
-        return snap.sma_fast_5m
-    if strategy_id == "sma_1d":
-        return getattr(snap, "sma_fast_1d", None) or snap.sma_fast
-    return snap.sma_fast
+    return sma_fast_for_strategy(snap, strategy_id)
 
 
 def _signal_for(snap: PairSnapshot, strategy_id: str) -> tuple[Signal, bool]:
-    if strategy_id == "sma_5m":
-        up = (
-            snap.sma_fast_5m is not None
-            and snap.sma_slow_5m is not None
-            and snap.sma_fast_5m > snap.sma_slow_5m
-        )
-        return Signal(snap.signal_5m), up
-    if strategy_id == "sma_1d":
-        fast = getattr(snap, "sma_fast_1d", None)
-        slow = getattr(snap, "sma_slow_1d", None)
-        sig = getattr(snap, "signal_1d", Signal.HOLD.value)
-        up = fast is not None and slow is not None and fast > slow
-        return Signal(sig), up
-    up = snap.sma_fast is not None and snap.sma_slow is not None and snap.sma_fast > snap.sma_slow
-    return Signal(snap.signal), up
+    return signal_for_strategy(snap, strategy_id)
 
 
 class StockPaperEngine:
@@ -229,17 +222,15 @@ class StockPaperEngine:
 
         # Only fetch timeframes required by enabled stock strategies.
         wanted = set(settings.stock_strategy_list)
-        frames: list[tuple[str, str]] = []
-        if "sma_15m" in wanted:
-            frames.append(("15m", "15m"))
-        if "sma_5m" in wanted:
-            frames.append(("5m", "5m"))
-        if "sma_1d" in wanted or not frames:
-            frames.append(("1d", "1d"))
-        for timeframe, dest in frames:
+        frames = enabled_timeframes(settings.stock_strategy_list)
+        if not frames:
+            frames = ["1d"]
+        for timeframe in frames:
             try:
                 rows = self.market.fetch_ohlcv(product, timeframe, limit)
                 closes = [float(r[4]) for r in rows]
+                highs = [float(r[2]) for r in rows]
+                lows = [float(r[3]) for r in rows]
                 candle_ts = None
                 if rows:
                     candle_ts = datetime.fromtimestamp(
@@ -248,27 +239,42 @@ class StockPaperEngine:
                 sig = crossover_signal(closes, settings.sma_fast, settings.sma_slow)
                 fast_v = sma(closes, settings.sma_fast)
                 slow_v = sma(closes, settings.sma_slow)
-                if dest == "15m" and len(closes) >= settings.sma_slow:
+                if timeframe == "15m" and SMA_15M in wanted and len(closes) >= settings.sma_slow:
                     snap.sma_fast = fast_v
                     snap.sma_slow = slow_v
                     snap.signal = sig.value
                     snap.candle_ts = candle_ts
-                elif dest == "5m" and len(closes) >= settings.sma_slow:
+                elif timeframe == "5m" and SMA_5M in wanted and len(closes) >= settings.sma_slow:
                     snap.sma_fast_5m = fast_v
                     snap.sma_slow_5m = slow_v
                     snap.signal_5m = sig.value
                     snap.candle_ts_5m = candle_ts
-                elif dest == "1d":
+                elif timeframe == "1d" and SMA_1D in wanted:
                     snap.sma_fast_1d = fast_v
                     snap.sma_slow_1d = slow_v
                     snap.signal_1d = sig.value
                     snap.candle_ts_1d = candle_ts
-                    # If 15m missing (weekend), mirror daily into 15m slots for display
+                    # If 15m missing (weekend), mirror daily SMA into 15m slots for display
                     if snap.sma_fast is None and fast_v is not None:
                         snap.sma_fast = fast_v
                         snap.sma_slow = slow_v
                         snap.signal = sig.value
                         snap.candle_ts = candle_ts
+                if timeframe == "15m" and EMA_15M in wanted:
+                    snap.ema_fast_15m = ema(closes, 12)
+                    snap.ema_slow_15m = ema(closes, 26)
+                    snap.signal_ema_15m = ema_crossover_signal(closes).value
+                    if snap.candle_ts is None:
+                        snap.candle_ts = candle_ts
+                if timeframe == "1d" and DONCHIAN_1D in wanted:
+                    high, low = donchian_channels(highs, lows)
+                    snap.donchian_high_1d = high
+                    snap.donchian_low_1d = low
+                    snap.signal_donchian_1d = donchian_breakout_signal(
+                        closes, highs, lows
+                    ).value
+                    if snap.candle_ts_1d is None:
+                        snap.candle_ts_1d = candle_ts
             except Exception as exc:  # noqa: BLE001
                 log.exception(
                     "stock ohlcv failed",

@@ -27,7 +27,21 @@ from snowball.gates import (
     strategy_exit_allowed,
     trend_filter_allows,
 )
-from snowball.strategy import crossover_signal, enabled_timeframes, signal_for_strategy, sma
+from snowball.strategy import (
+    DONCHIAN_1D,
+    EMA_15M,
+    SMA_15M,
+    SMA_1D,
+    SMA_5M,
+    crossover_signal,
+    donchian_breakout_signal,
+    donchian_channels,
+    ema,
+    ema_crossover_signal,
+    enabled_timeframes,
+    signal_for_strategy,
+    sma,
+)
 
 log = logging.getLogger("snowball.engine")
 
@@ -121,27 +135,56 @@ class Engine:
             snap.last_error = str(exc)
             self.state.last_error = str(exc)
 
+        wanted = set(settings.strategy_list)
         for timeframe in enabled_timeframes(settings.strategy_list):
             try:
                 rows = self.market.fetch_ohlcv(product, timeframe, limit)
                 closes = [float(r[4]) for r in rows]
+                highs = [float(r[2]) for r in rows]
+                lows = [float(r[3]) for r in rows]
                 candle_ts = None
                 if rows:
                     candle_ts = datetime.fromtimestamp(float(rows[-1][0]) / 1000.0, tz=timezone.utc)
                     self._last_candle[f"{product}:{timeframe}"] = float(rows[-1][0])
-                sig = crossover_signal(closes, settings.sma_fast, settings.sma_slow)
-                fast_v = sma(closes, settings.sma_fast)
-                slow_v = sma(closes, settings.sma_slow)
-                if timeframe == "15m":
+                if timeframe == "15m" and SMA_15M in wanted:
+                    sig = crossover_signal(closes, settings.sma_fast, settings.sma_slow)
+                    fast_v = sma(closes, settings.sma_fast)
+                    slow_v = sma(closes, settings.sma_slow)
                     snap.sma_fast = fast_v
                     snap.sma_slow = slow_v
                     snap.signal = sig.value
                     snap.candle_ts = candle_ts
-                elif timeframe == "5m":
+                elif timeframe == "5m" and SMA_5M in wanted:
+                    sig = crossover_signal(closes, settings.sma_fast, settings.sma_slow)
+                    fast_v = sma(closes, settings.sma_fast)
+                    slow_v = sma(closes, settings.sma_slow)
                     snap.sma_fast_5m = fast_v
                     snap.sma_slow_5m = slow_v
                     snap.signal_5m = sig.value
                     snap.candle_ts_5m = candle_ts
+                elif timeframe == "1d" and SMA_1D in wanted:
+                    sig = crossover_signal(closes, settings.sma_fast, settings.sma_slow)
+                    fast_v = sma(closes, settings.sma_fast)
+                    slow_v = sma(closes, settings.sma_slow)
+                    snap.sma_fast_1d = fast_v
+                    snap.sma_slow_1d = slow_v
+                    snap.signal_1d = sig.value
+                    snap.candle_ts_1d = candle_ts
+                if timeframe == "15m" and EMA_15M in wanted:
+                    snap.ema_fast_15m = ema(closes, 12)
+                    snap.ema_slow_15m = ema(closes, 26)
+                    snap.signal_ema_15m = ema_crossover_signal(closes).value
+                    if snap.candle_ts is None:
+                        snap.candle_ts = candle_ts
+                if timeframe == "1d" and DONCHIAN_1D in wanted:
+                    high, low = donchian_channels(highs, lows)
+                    snap.donchian_high_1d = high
+                    snap.donchian_low_1d = low
+                    snap.signal_donchian_1d = donchian_breakout_signal(
+                        closes, highs, lows
+                    ).value
+                    if snap.candle_ts_1d is None:
+                        snap.candle_ts_1d = candle_ts
             except Exception as exc:  # noqa: BLE001 — keep the loop alive
                 log.exception(
                     "ohlcv update failed",
@@ -190,6 +233,10 @@ class Engine:
         marks: dict[str, float],
     ) -> None:
         settings = self.state.settings
+        # New strategies stay stock-paper only. Do not place live crypto orders
+        # for them even if STRATEGIES is misconfigured.
+        if strategy_id in (EMA_15M, DONCHIAN_1D):
+            return
         signal, uptrend = signal_for_strategy(snap, strategy_id)
         all_lots = self.state.ledger.open_positions(product)
         strategy_lots = [lot for lot in all_lots if lot.strategy == strategy_id]
@@ -730,6 +777,11 @@ def build_state(
         from snowball.yolo_demon.store import YoloStore
 
         state.yolo = YoloStore(settings.sqlite_path)
+    if settings.clerk_enabled:
+        from snowball.clerk.poller import clerk_db_path
+        from snowball.clerk.store import ClerkStore
+
+        state.clerk = ClerkStore(clerk_db_path(settings))
     if settings.stock_enabled:
         from snowball.stocks.engine import attach_stock_lane
 
@@ -791,6 +843,16 @@ def main() -> None:
         t_y.start()
         extra_threads.append(t_y)
         log.info("Yolo Demon thread started")
+
+    if settings.clerk_enabled and state.clerk is not None:
+        from snowball.clerk.poller import ClerkSidecar
+
+        clerk = ClerkSidecar(settings, state.clerk, running=state)
+        state.clerk_sidecar = clerk
+        t_c = threading.Thread(target=clerk.run_forever, name="snowball-clerk", daemon=True)
+        t_c.start()
+        extra_threads.append(t_c)
+        log.info("The Clerk thread started")
 
     if settings.stock_enabled and state.stock_engine is not None:
         stock_engine = state.stock_engine

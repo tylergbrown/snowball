@@ -101,6 +101,15 @@ class Settings(BaseSettings):
     x_enabled: bool = False
     x_daily_max_reads: int = 50
 
+    # --- The Clerk (House Clerk PTR research sidecar; never trades) ---
+    clerk_enabled: bool = True
+    clerk_poll_seconds: float = 21600.0
+    clerk_sqlite_path: Path = Path("./data/snowball_clerk.db")
+    clerk_pdf_cap: int = 25
+    clerk_pdf_delay_seconds: float = 0.75
+    # Empty = current calendar year and the prior year (conditional GET, cached).
+    clerk_years: str = ""
+
     # --- STOCK PAPER lane (isolated book; never live equity orders) ---
     stock_enabled: bool = True
     # paper only this week — live stock orders are refused
@@ -110,7 +119,7 @@ class Settings(BaseSettings):
     stock_max_positions: int = 5
     stock_max_notional_usd: float = 100.0
     stock_daily_loss_kill_usd: float = 25.0
-    stock_strategies: str = "sma_15m,sma_5m,sma_1d"
+    stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d"
     stock_poll_seconds: float = 60.0
     # Cap symbols that the paper engine may trade (marks universe may be larger)
     stock_max_active: int = 60
@@ -179,8 +188,9 @@ class Settings(BaseSettings):
     def cooldown_seconds_for(self, strategy_id: str) -> int:
         if strategy_id == "sma_5m":
             return self.entry_cooldown_5m_seconds
-        if strategy_id == "sma_1d":
+        if strategy_id in ("sma_1d", "donchian_1d"):
             return self.entry_cooldown_1d_seconds
+        # sma_15m and ema_15m share the 15m candle cooldown
         return self.entry_cooldown_seconds
 
     @property

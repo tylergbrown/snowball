@@ -180,6 +180,7 @@
             <th>Symbol</th><th>Last</th>
             <th>15m/1d 20</th><th>15m/1d 50</th><th>Sig</th>
             <th>5m Sig</th><th>1d Sig</th>
+            <th>EMA 15m</th><th>Donchian 1d</th>
             <th>Lots</th><th>Src</th>
           </tr>
         </thead>
@@ -252,6 +253,22 @@
           </tr>
         </thead>
         <tbody id="yoloIdeas"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2 class="section">The Clerk</h2>
+      <div class="warn-banner">RESEARCH ONLY / DOES NOT TRADE / NO ORDERS</div>
+      <p class="note">Official House Clerk periodic transaction reports only. Logs filings and ideas. Never places orders, never writes HALT, never touches the crypto or stock paper ledgers.</p>
+      <div class="muted" id="clerkMeta"></div>
+      <div class="label" style="margin-top:10px">Watchlist transactions</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th><th>Member</th><th>Owner</th><th>Ticker</th>
+            <th>Type</th><th>Amount</th><th>Asset</th>
+          </tr>
+        </thead>
+        <tbody id="clerkTx"></tbody>
       </table>
     </div>
   </main>
@@ -371,9 +388,11 @@
             <td>${p.signal_15m || p.signal || "hold"}</td>
             <td>${p.signal_5m || "—"}</td>
             <td>${p.signal_1d || "—"}</td>
+            <td>${p.signal_ema_15m || "—"}</td>
+            <td>${p.signal_donchian_1d || "—"}</td>
             <td>${p.open_count}/${p.max_open}</td>
             <td>${p.mark_source || stk.mark_source || ""}</td>
-          </tr>`).join("") || `<tr><td colspan="9" class="muted">no stock marks yet</td></tr>`;
+          </tr>`).join("") || `<tr><td colspan="11" class="muted">no stock marks yet</td></tr>`;
         $("stockPositions").innerHTML = (stk.positions || []).map(p => `
           <tr>
             <td>${p.id}</td><td>${p.product}</td><td>${p.strategy || ""}</td>
@@ -449,6 +468,25 @@
           <td>${i.mentions_6h || 0} / ${i.mentions_24h || 0}</td>
           <td>${i.url ? `<a href="${i.url}" target="_blank" rel="noopener">${i.sample_title || i.url}</a>` : (i.sample_title || "")}</td>
         </tr>`).join("") || `<tr><td colspan="5" class="muted">no ideas yet</td></tr>`;
+
+      const c = s.clerk || {};
+      const cc = c.counts || {};
+      const esc = (v) => String(v ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]));
+      $("clerkMeta").textContent = c.enabled === false
+        ? "The Clerk disabled"
+        : `The Clerk · RESEARCH ONLY / NO ORDERS · filings ${cc.filings || 0} · tx ${cc.transactions || 0} · scanned ${cc.scanned_skip || 0}` +
+          (c.last_poll_at ? ` · polled ${c.last_poll_at}` : "") +
+          (c.last_error ? ` · error ${c.last_error}` : "");
+      $("clerkTx").innerHTML = (c.recent_watchlist || []).map(tx => `
+        <tr>
+          <td>${when(tx.tx_date || tx.filing_date)}</td>
+          <td>${esc(tx.member || "")}</td>
+          <td>${esc(tx.owner || "")}</td>
+          <td>${tx.pdf_url ? `<a href="${esc(tx.pdf_url)}" target="_blank" rel="noopener">${esc(tx.ticker || "—")}</a>` : esc(tx.ticker || "—")}</td>
+          <td>${esc(tx.tx_type || "")}${tx.partial ? " partial" : ""}</td>
+          <td>${esc(tx.amount_range || "")}</td>
+          <td>${esc(tx.asset_name || "")}</td>
+        </tr>`).join("") || `<tr><td colspan="7" class="muted">no watchlist transactions yet</td></tr>`;
     }
 
     async function post(path) {

@@ -96,6 +96,12 @@ class PairSnapshot:
     sma_slow_1d: float | None = None
     signal_1d: str = Signal.HOLD.value
     candle_ts_1d: datetime | None = None
+    ema_fast_15m: float | None = None
+    ema_slow_15m: float | None = None
+    signal_ema_15m: str = Signal.HOLD.value
+    donchian_high_1d: float | None = None
+    donchian_low_1d: float | None = None
+    signal_donchian_1d: str = Signal.HOLD.value
     open_count: int = 0
     max_open: int = 2
     last_error: str | None = None

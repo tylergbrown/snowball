@@ -50,20 +50,36 @@ def trend_filter_allows(
 
 
 def sma_slow_for_strategy(snap: object, strategy_id: str) -> float | None:
-    """Return the strategy timeframe's SMA slow from a PairSnapshot-like object."""
+    """Return the strategy timeframe's slow line from a PairSnapshot-like object.
+
+    SMA strategies use SMA slow. ema_15m uses EMA 26. donchian_1d uses the
+    prior 10-day low (exit channel) so fade/trend gates stay on the same path.
+    """
     if strategy_id == "sma_5m":
         return getattr(snap, "sma_slow_5m", None)
     if strategy_id == "sma_1d":
         return getattr(snap, "sma_slow_1d", None) or getattr(snap, "sma_slow", None)
+    if strategy_id == "ema_15m":
+        return getattr(snap, "ema_slow_15m", None)
+    if strategy_id == "donchian_1d":
+        return getattr(snap, "donchian_low_1d", None)
     return getattr(snap, "sma_slow", None)
 
 
 def sma_fast_for_strategy(snap: object, strategy_id: str) -> float | None:
-    """Return the strategy timeframe's SMA fast from a PairSnapshot-like object."""
+    """Return the strategy timeframe's fast line from a PairSnapshot-like object.
+
+    SMA strategies use SMA fast. ema_15m uses EMA 12. donchian_1d uses the
+    prior 20-day high (entry channel) so fade is a pullback off the breakout.
+    """
     if strategy_id == "sma_5m":
         return getattr(snap, "sma_fast_5m", None)
     if strategy_id == "sma_1d":
         return getattr(snap, "sma_fast_1d", None) or getattr(snap, "sma_fast", None)
+    if strategy_id == "ema_15m":
+        return getattr(snap, "ema_fast_15m", None)
+    if strategy_id == "donchian_1d":
+        return getattr(snap, "donchian_high_1d", None)
     return getattr(snap, "sma_fast", None)
 
 

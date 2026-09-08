@@ -38,12 +38,13 @@ ccxt public tickers/OHLCV ──► engine tick (15s)
                                 └─ in-memory snapshot ──► FastAPI :8080 (SSE)
 ```
 
-One process: engine thread + dashboard + **The Watcher** (official-macro research) + **Yolo Demon** (YouTube / X research). systemd or Docker runs that process. `systemctl stop snowball` is the LAN off switch. Research sidecars never place orders.
+One process: engine thread + dashboard + **The Watcher** (official-macro research) + **Yolo Demon** (YouTube / X research) + **The Clerk** (House Clerk PTR research). systemd or Docker runs that process. `systemctl stop snowball` is the LAN off switch. Research sidecars never place orders.
 
 ```
 official RSS/APIs ──► The Watcher thread (300s) ──► sqlite research_events
 YouTube/X        ──► Yolo Demon thread (120s) ──► sqlite yolo_ideas
-                      (same process / same db; dashboard read-only panels)
+House Clerk PTRs ──► The Clerk thread (>=6h) ──► sqlite data/snowball_clerk.db
+                      (same process; Clerk uses its own db; dashboard read-only panels)
 ```
 
 
@@ -55,6 +56,8 @@ YouTube/X        ──► Yolo Demon thread (120s) ──► sqlite yolo_ideas
 | --- | --- | --- | --- | --- |
 | `sma_15m` | 15-minute candles | `ENTRY_COOLDOWN_SECONDS` | 900s | Never sell red; exit/fade ≥5% |
 | `sma_5m` | 5-minute candles | `ENTRY_COOLDOWN_5M_SECONDS` | 300s | Never sell red; exit/fade ≥5% |
+| `ema_15m` | 15-minute candles | `ENTRY_COOLDOWN_SECONDS` | 900s | Stock paper only. EMA 12/26 cross. Never sell red; exit/fade ≥5% |
+| `donchian_1d` | daily candles | `ENTRY_COOLDOWN_1D_SECONDS` | 86400s | Stock paper only. 20-day high break / 10-day low exit. Never sell red; exit/fade ≥5% |
 
 Same 20/50 periods (`SMA_FAST` / `SMA_SLOW`). Max 5 open lots **per pair across all strategies**. Strategy exits require `MIN_TAKE_PROFIT_PCT` (default 0.05) **plus** a death cross (all eligible) or momentum fade (one lot); HALT / daily-loss kill still flatten including losers. Enable both (already default):
 
@@ -172,6 +175,22 @@ Optional auto-HALT around high-importance FOMC / rate-decision calendar windows 
 
 Dashboard panel **The Watcher**: upcoming calendar (next 48h) + latest official press. Links out. No buy/sell controls.
 
+## The Clerk (House congressional disclosure research)
+
+Same process as the trading bot. Polls the official House Clerk yearly index
+`https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip`
+at most once per 6 hours (default `CLERK_POLL_SECONDS=21600`) and logs
+`FilingType=P` Periodic Transaction Reports. Electronic PTR PDFs are parsed
+with `pdftotext`. Scanned paper (DocIDs starting 8 or 9, or empty text) is
+logged with `parse_status=scanned_skip` and not OCR'd.
+
+Own database: `data/snowball_clerk.db`. Does not write the crypto ledger, the
+stock paper ledger, or `HALT`. **The Clerk never places orders.**
+
+Dashboard panel **The Clerk** plus `/api/clerk` snapshot key. Watchlist names
+are surfaced first; other House P filings are indexed, with new PDF downloads
+capped (`CLERK_PDF_CAP`, default 25).
+
 ## Yolo Demon (multi-source research)
 
 Separate sidecar (`yolo_demon`). Pulls **official APIs only** — YouTube Data API v3 and X (Twitter) API v2. No HTML scrape, no posting, never places orders.
@@ -237,7 +256,7 @@ Coinbase Advanced Trade under the current CDP key exposes equity **perps** (`*-P
 
 ### Risk (stock book only)
 
-Same discipline as crypto paper: never sell red on strategy logic, `MIN_TAKE_PROFIT_PCT=0.05`, momentum-fade scale-out, max 5 lots/symbol (`STOCK_MAX_POSITIONS`), $100/leg (`STOCK_MAX_NOTIONAL_USD`), daily loss kill $25 (`STOCK_DAILY_LOSS_KILL_USD`). Strategies: `sma_15m` / `sma_5m` when intraday bars exist; `sma_1d` (SMA 20/50 on daily) otherwise.
+Same discipline as crypto paper: never sell red on strategy logic, `MIN_TAKE_PROFIT_PCT=0.05`, momentum-fade scale-out, max 5 lots/symbol (`STOCK_MAX_POSITIONS`), $100/leg (`STOCK_MAX_NOTIONAL_USD`), daily loss kill $25 (`STOCK_DAILY_LOSS_KILL_USD`). Strategies: `sma_15m` / `sma_5m` when intraday bars exist; `sma_1d` (SMA 20/50 on daily); plus stock-paper `ema_15m` (EMA 12/26 on 15m) and `donchian_1d` (20-day Donchian breakout / 10-day low exit). Crypto live stays `sma_5m`/`sma_15m` only.
 
 ### Dashboard
 
