@@ -29,7 +29,7 @@ def _expand_env_newlines(value: str) -> str:
 
 
 def normalize_futures_product(product: str) -> str:
-    """Normalize to Coinbase product id (e.g. SPY-PERP-INTX)."""
+    """Normalize to Coinbase product id (e.g. SPY-PERP-INTX / AAPL-PERP-INTX)."""
     p = product.strip().upper().replace("_", "-")
     if p in PRODUCT_TO_CCXT:
         return p
@@ -39,16 +39,38 @@ def normalize_futures_product(product: str) -> str:
         base = unified.split("/")[0].upper()
         if p in (base, f"{base}-PERP", f"{base}-PERP-INTX"):
             return pid
+    # Generic INTX equity/crypto perps: BASE or BASE-PERP → BASE-PERP-INTX
+    if p.endswith("-PERP-INTX"):
+        return p
+    if p.endswith("-PERP"):
+        return f"{p}-INTX"
+    if "/" in p:
+        # Already unified-ish; leave for to_futures_ccxt_symbol
+        return p
+    if p.isalpha() or (p.replace("-", "").isalnum() and "-" not in p):
+        return f"{p}-PERP-INTX"
     return p
 
 
 def to_futures_ccxt_symbol(product: str) -> str:
+    """Map Coinbase INTX product id to ccxt unified swap symbol.
+
+    Known aliases (SPY/QQQ) use PRODUCT_TO_CCXT. Any other ``{BASE}-PERP-INTX``
+    becomes ``{BASE}/USDC:USDC`` so stock equity perps can share this market.
+    """
     pid = normalize_futures_product(product)
     if pid in PRODUCT_TO_CCXT:
         return PRODUCT_TO_CCXT[pid]
     if "/" in pid:
         return pid
-    raise ValueError(f"unknown futures product {product!r}; known: {sorted(PRODUCT_TO_CCXT)}")
+    if pid.endswith("-PERP-INTX"):
+        base = pid[: -len("-PERP-INTX")]
+        if base:
+            return f"{base}/USDC:USDC"
+    raise ValueError(
+        f"unknown futures product {product!r}; expected *-PERP-INTX "
+        f"(known aliases: {sorted(PRODUCT_TO_CCXT)})"
+    )
 
 
 def parse_futures_order_fill(order: dict[str, Any]) -> tuple[float, float, float]:

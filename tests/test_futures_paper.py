@@ -42,6 +42,8 @@ def test_product_symbol_mapping() -> None:
     assert normalize_futures_product("QQQ") == "QQQ-PERP-INTX"
     assert to_futures_ccxt_symbol("SPY-PERP-INTX") == "SPY/USDC:USDC"
     assert to_futures_ccxt_symbol("QQQ-PERP-INTX") == "QQQ/USDC:USDC"
+    assert to_futures_ccxt_symbol("AAPL-PERP-INTX") == "AAPL/USDC:USDC"
+    assert to_futures_ccxt_symbol("NVDA") == "NVDA/USDC:USDC"
     assert DEFAULT_FUTURES_PRODUCTS == ("SPY-PERP-INTX", "QQQ-PERP-INTX")
 
 
