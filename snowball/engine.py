@@ -782,11 +782,24 @@ def build_state(
         from snowball.clerk.store import ClerkStore
 
         state.clerk = ClerkStore(clerk_db_path(settings))
+    if getattr(settings, "earnings_enabled", True):
+        try:
+            from snowball.earnings.poller import earnings_db_path
+            from snowball.earnings.store import EarningsStore
+
+            state.earnings = EarningsStore(earnings_db_path(settings))
+        except ImportError:
+            log.warning("Earnings Scout package not present; skipping attach")
     if settings.stock_enabled:
         from snowball.stocks.engine import attach_stock_lane
 
         settings.assert_stock_paper_only()
         attach_stock_lane(state)
+    if settings.futures_enabled:
+        from snowball.futures.engine import attach_futures_lane
+
+        settings.assert_futures_paper_only()
+        attach_futures_lane(state)
     market = market or CcxtMarket(settings)
     return state, Engine(state, market)
 
@@ -805,6 +818,8 @@ def main() -> None:
                 "paper": settings.mode == "paper" and not settings.live_enabled,
                 "stock_enabled": settings.stock_enabled,
                 "stock_mode": settings.stock_mode,
+                "futures_enabled": settings.futures_enabled,
+                "futures_mode": settings.futures_mode,
             }
         },
     )
@@ -854,6 +869,16 @@ def main() -> None:
         extra_threads.append(t_c)
         log.info("The Clerk thread started")
 
+    if getattr(settings, "earnings_enabled", True) and getattr(state, "earnings", None) is not None:
+        from snowball.earnings.poller import EarningsScout
+
+        earnings = EarningsScout(settings, state.earnings, running=state)
+        state.earnings_sidecar = earnings
+        t_e = threading.Thread(target=earnings.run_forever, name="snowball-earnings-scout", daemon=True)
+        t_e.start()
+        extra_threads.append(t_e)
+        log.info("Earnings Scout thread started")
+
     if settings.stock_enabled and state.stock_engine is not None:
         stock_engine = state.stock_engine
         t_s = threading.Thread(
@@ -868,6 +893,25 @@ def main() -> None:
                     "active": len(state.stock_universe_active or []),
                     "sqlite": str(settings.stock_sqlite_path),
                     "mark_source": state.stock_mark_source,
+                }
+            },
+        )
+
+    if settings.futures_enabled and state.futures_engine is not None:
+        futures_engine = state.futures_engine
+        t_f = threading.Thread(
+            target=futures_engine.run_forever, name="snowball-futures-paper", daemon=True
+        )
+        t_f.start()
+        extra_threads.append(t_f)
+        log.info(
+            "Future Trader thread started",
+            extra={
+                "data": {
+                    "products": settings.futures_product_list,
+                    "sqlite": str(settings.futures_sqlite_path),
+                    "mark_source": state.futures_mark_source,
+                    "strategies": settings.futures_strategy_list,
                 }
             },
         )

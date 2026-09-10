@@ -29,6 +29,7 @@ def tmp_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
         poll_seconds=0.05,
         products="BTC-USD,SOL-USD,ETH-USD,DOGE-USD",
         stock_enabled=False,
+        futures_enabled=False,
     )
 
 

@@ -7,6 +7,7 @@ from snowball.state import AppState
 from snowball.watcher.store import event_to_dict
 from snowball.yolo_demon.store import idea_to_dict
 from snowball.stocks.snapshot import build_stocks_snapshot
+from snowball.futures.snapshot import build_futures_snapshot
 
 
 def build_snapshot(state: AppState) -> dict:
@@ -152,7 +153,9 @@ def build_snapshot(state: AppState) -> dict:
             "watcher": _watcher_payload(state),
             "yolo_demon": _yolo_payload(state),
             "clerk": _clerk_payload(state),
+            "earnings": _earnings_payload(state),
             "stocks": build_stocks_snapshot(state),
+            "futures": build_futures_snapshot(state),
         }
 
 
@@ -298,5 +301,54 @@ def _clerk_payload(state: AppState) -> dict:
         "watchlist": _clerk_watchlist_labels(),
         "poll_seconds": max(21600.0, float(getattr(settings, "clerk_poll_seconds", 21600.0))),
         "pdf_cap": int(getattr(settings, "clerk_pdf_cap", 25)),
+    }
+
+def _earnings_payload(state: AppState) -> dict:
+    """Earnings Scout research panel. Never places orders."""
+    settings = state.settings
+    sidecar = getattr(state, "earnings_sidecar", None)
+    last_poll = getattr(sidecar, "last_poll_at", None) if sidecar is not None else None
+    last_error = getattr(sidecar, "last_error", None) if sidecar is not None else None
+    store = getattr(state, "earnings", None)
+    upcoming: list = []
+    recent: list = []
+    counts = {"events": 0}
+    from datetime import date, timedelta
+
+    today = date.today()
+    if store is not None:
+        try:
+            counts = store.counts()
+            upcoming = store.upcoming(
+                from_date=today.isoformat(),
+                to_date=(today + timedelta(days=10)).isoformat(),
+                limit=40,
+            )
+            recent = store.recent_reported(
+                from_date=(today - timedelta(days=16)).isoformat(),
+                to_date=today.isoformat(),
+                limit=20,
+            )
+            last_poll = last_poll or store.get_meta("last_poll_at")
+            stored_err = store.get_meta("last_error")
+            last_error = last_error or stored_err or None
+        except Exception:
+            pass
+    poll_counts = getattr(sidecar, "last_counts", None) if sidecar is not None else None
+    return {
+        "id": "earnings",
+        "name": "Earnings Scout",
+        "enabled": bool(getattr(settings, "earnings_enabled", True)),
+        "label": "RESEARCH ONLY / DOES NOT TRADE / NO ORDERS",
+        "places_orders": False,
+        "note": "Heuristic pre_momentum labels are research-only and never order signals.",
+        "source": "https://api.nasdaq.com/api/calendar/earnings + Yahoo chart v8",
+        "last_poll_at": last_poll.isoformat() if hasattr(last_poll, "isoformat") else last_poll,
+        "last_error": last_error or None,
+        "counts": counts,
+        "poll_counts": poll_counts if isinstance(poll_counts, dict) else None,
+        "upcoming": upcoming,
+        "recent_reported": recent,
+        "poll_seconds": float(getattr(settings, "earnings_poll_seconds", 14400.0)),
     }
 

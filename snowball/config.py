@@ -126,11 +126,31 @@ class Settings(BaseSettings):
     stock_dynamic_max: int = 30
     entry_cooldown_1d_seconds: int = 86400
 
+    # --- Earnings Scout (Nasdaq calendar research sidecar; never trades) ---
+    earnings_enabled: bool = True
+    earnings_poll_seconds: float = 14400.0
+    earnings_sqlite_path: Path = Path("./data/snowball_earnings.db")
+
+    # --- Future Trader (Coinbase equity perps paper; never live in v1) ---
+    futures_enabled: bool = True
+    futures_mode: Literal["paper", "live"] = "paper"
+    # Dual gate for any future live path: FUTURES_MODE=live AND FUTURES_LIVE_ENABLED=true
+    futures_live_enabled: bool = False
+    futures_sqlite_path: Path = Path("./data/snowball_futures.db")
+    futures_bankroll_usd: float = 1000.0
+    futures_max_positions: int = 5
+    futures_max_notional_usd: float = 100.0
+    futures_daily_loss_kill_usd: float = 25.0
+    # Daily-focused; ema_15m skipped (thin 15m history on INTX perps)
+    futures_strategies: str = "sma_1d,donchian_1d"
+    futures_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
+    futures_poll_seconds: float = 120.0
+
     coinbase_api_key: str = ""
     coinbase_api_secret: str = ""
     coinbase_api_passphrase: str = ""
 
-    @field_validator("mode", "stock_mode", mode="before")
+    @field_validator("mode", "stock_mode", "futures_mode", mode="before")
     @classmethod
     def _norm_mode(cls, v: object) -> object:
         if isinstance(v, str):
@@ -169,6 +189,16 @@ class Settings(BaseSettings):
         if self.stock_mode != "paper" and self.stock_enabled:
             # Soft: still load but assert_stock_paper_only refuses at runtime.
             pass
+        fut_ids = parse_strategies(self.futures_strategies)
+        if self.futures_enabled and not fut_ids:
+            raise ValueError(
+                "FUTURES_STRATEGIES must list at least one strategy when futures enabled"
+            )
+        fut_unknown = [s for s in fut_ids if s not in KNOWN_STRATEGY_IDS]
+        if fut_unknown:
+            raise ValueError(
+                f"Unknown FUTURES_STRATEGIES {fut_unknown}; known: {sorted(KNOWN_STRATEGY_IDS)}"
+            )
         return self
 
     @property
@@ -203,6 +233,33 @@ class Settings(BaseSettings):
                 f"Stock trading refused: STOCK_MODE={self.stock_mode!r} "
                 "(stock lane is paper-only; never places live equity orders)."
             )
+
+    @property
+    def futures_strategy_list(self) -> list[str]:
+        return parse_strategies(self.futures_strategies)
+
+    @property
+    def futures_product_list(self) -> list[str]:
+        items = [p.strip().upper() for p in self.futures_products.split(",") if p.strip()]
+        return items or ["SPY-PERP-INTX", "QQQ-PERP-INTX"]
+
+    def assert_futures_paper_only(self) -> None:
+        if not self.futures_enabled:
+            return
+        if self.futures_mode != "paper":
+            raise LiveTradingRefused(
+                f"Futures trading refused: FUTURES_MODE={self.futures_mode!r} "
+                "(Future Trader v1 is paper-only; never places live futures orders)."
+            )
+        if self.futures_live_enabled:
+            raise LiveTradingRefused(
+                "Futures trading refused: FUTURES_LIVE_ENABLED=true while "
+                "FUTURES_MODE is not live (dual gate required for any live futures path)."
+            )
+
+    def futures_live_orders_permitted(self) -> bool:
+        """Future live path requires BOTH futures flags. Default False."""
+        return self.futures_mode == "live" and self.futures_live_enabled is True
 
     def live_orders_permitted(self) -> bool:
         """Live ccxt orders require BOTH flags. Default config returns False."""

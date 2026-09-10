@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from snowball.halt import clear_halt, write_halt
 from snowball.snapshot import build_snapshot
 from snowball.stocks.snapshot import build_stocks_snapshot
+from snowball.futures.snapshot import build_futures_snapshot
 from snowball.state import AppState
 
 log = logging.getLogger("snowball.dashboard")
@@ -71,8 +72,22 @@ def create_app(state: AppState) -> FastAPI:
         snap = build_snapshot(state)
         return JSONResponse(snap.get("yolo_demon") or {})
 
+    @app.get("/api/clerk")
+    def clerk() -> JSONResponse:
+        snap = build_snapshot(state)
+        return JSONResponse(snap.get("clerk") or {})
+
+    @app.get("/api/earnings")
+    def earnings() -> JSONResponse:
+        snap = build_snapshot(state)
+        return JSONResponse(snap.get("earnings") or {})
+
     @app.get("/api/stocks")
     def stocks() -> JSONResponse:
         return JSONResponse(build_stocks_snapshot(state))
+
+    @app.get("/api/futures")
+    def futures() -> JSONResponse:
+        return JSONResponse(build_futures_snapshot(state))
 
     return app

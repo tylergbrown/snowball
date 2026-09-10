@@ -10,6 +10,7 @@ from snowball.paper import PaperLedger
 from snowball.live import LiveBroker
 from snowball.watcher.store import WatcherStore
 from snowball.yolo_demon.store import YoloStore
+from snowball.clerk.store import ClerkStore
 
 
 @dataclass
@@ -27,6 +28,10 @@ class AppState:
     yolo: YoloStore | None = None
     watcher_sidecar: object | None = None
     yolo_sidecar: object | None = None
+    clerk: ClerkStore | None = None
+    clerk_sidecar: object | None = None
+    earnings: object | None = None
+    earnings_sidecar: object | None = None
     # --- STOCK PAPER (isolated; never mixes with crypto ledger) ---
     stock_ledger: PaperLedger | None = None
     stock_pairs: dict[str, PairSnapshot] = field(default_factory=dict)
@@ -38,6 +43,12 @@ class AppState:
     stock_universe_sources: dict = field(default_factory=dict)
     stock_coinbase_ids: dict[str, str] = field(default_factory=dict)
     stock_engine: object | None = None
+    # --- Future Trader (isolated; never mixes with crypto/stock ledgers) ---
+    futures_ledger: PaperLedger | None = None
+    futures_pairs: dict[str, PairSnapshot] = field(default_factory=dict)
+    futures_last_tick_at: datetime | None = None
+    futures_mark_source: str = "coinbase_perp"
+    futures_engine: object | None = None
 
     def marks(self) -> dict[str, float]:
         out: dict[str, float] = {}
