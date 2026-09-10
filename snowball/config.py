@@ -50,7 +50,10 @@ class Settings(BaseSettings):
     scale_in_min_profit_pct: float = 0.005
     # Strategy exits (all lanes): never sell red; only take profit at this unrealized fraction.
     # HALT / daily-loss kill still flatten including losers (emergency).
-    min_take_profit_pct: float = 0.05
+    # Effective strategy/fade floor ≈ MIN_TAKE_PROFIT_PCT + FEE_BUFFER_PCT (0.06+0.01=0.07).
+    min_take_profit_pct: float = 0.06
+    # Round-trip fee estimate (~1%). Exits that would be red after fees are refused.
+    fee_buffer_pct: float = 0.01
     never_sell_red: bool = True
     never_sell_red_emergency: bool = True
     # Trend filter: require last > SMA slow before any new entry / scale-in.
@@ -63,6 +66,8 @@ class Settings(BaseSettings):
     pair_pause_clear_file: Path | None = None
     slippage_bps: float = 5.0
     taker_fee_bps: float = 0.0
+    # Max fraction of total Coinbase account value the crypto lane may deploy (open notional).
+    crypto_account_budget_pct: float = 0.40
 
     sqlite_path: Path = Path("./data/snowball.db")
     heartbeat_path: Path = Path("./data/heartbeat")
@@ -110,18 +115,21 @@ class Settings(BaseSettings):
     # Empty = current calendar year and the prior year (conditional GET, cached).
     clerk_years: str = ""
 
-    # --- STOCK PAPER lane (isolated book; never live equity orders) ---
+    # --- STOCK lane (isolated book; live = Coinbase INTX equity perps only) ---
     stock_enabled: bool = True
-    # paper only this week — live stock orders are refused
+    # Dual gate for live stock: STOCK_MODE=live AND STOCK_LIVE_ENABLED=true
     stock_mode: Literal["paper", "live"] = "paper"
+    stock_live_enabled: bool = False
     stock_sqlite_path: Path = Path("./data/snowball_stocks.db")
     stock_bankroll_usd: float = 1000.0
     stock_max_positions: int = 5
     stock_max_notional_usd: float = 100.0
     stock_daily_loss_kill_usd: float = 25.0
+    # Fraction of total Coinbase account value stock lane may use (INTX perps, lev=1)
+    stock_account_budget_pct: float = 0.40
     stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d"
     stock_poll_seconds: float = 60.0
-    # Cap symbols that the paper engine may trade (marks universe may be larger)
+    # Cap symbols that the engine may trade (marks universe may be larger)
     stock_max_active: int = 60
     stock_dynamic_max: int = 30
     entry_cooldown_1d_seconds: int = 86400
@@ -144,7 +152,7 @@ class Settings(BaseSettings):
     futures_max_notional_usd: float = 500.0
     futures_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value FT may use (split 50/50 across products)
-    futures_account_budget_pct: float = 0.10
+    futures_account_budget_pct: float = 0.20
     # session_day = ET session long-only engine; legacy sma_1d/donchian_1d still parseable
     futures_strategies: str = "session_day"
     futures_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
@@ -236,12 +244,47 @@ class Settings(BaseSettings):
     def stock_strategy_list(self) -> list[str]:
         return parse_strategies(self.stock_strategies)
 
-    def assert_stock_paper_only(self) -> None:
-        if self.stock_enabled and self.stock_mode != "paper":
+    def assert_stock_config(self) -> None:
+        """Refuse inconsistent dual-gate; allow paper or fully dual-gated live."""
+        if not self.stock_enabled:
+            return
+        if self.stock_mode == "live" and not self.stock_live_enabled:
             raise LiveTradingRefused(
-                f"Stock trading refused: STOCK_MODE={self.stock_mode!r} "
-                "(stock lane is paper-only; never places live equity orders)."
+                "Stock trading refused: STOCK_MODE=live but STOCK_LIVE_ENABLED "
+                "is false (both required for live INTX equity-perp orders)."
             )
+        if self.stock_mode != "live" and self.stock_live_enabled:
+            raise LiveTradingRefused(
+                "Stock trading refused: STOCK_LIVE_ENABLED=true while "
+                "STOCK_MODE is not live (dual gate required)."
+            )
+        if not (0.0 < float(self.stock_account_budget_pct) <= 1.0):
+            raise LiveTradingRefused(
+                f"STOCK_ACCOUNT_BUDGET_PCT must be in (0,1]; got {self.stock_account_budget_pct}"
+            )
+
+    def assert_stock_paper_only(self) -> None:
+        """Back-compat: enforce dual-gate consistency (paper or live both OK)."""
+        self.assert_stock_config()
+
+    def stock_live_orders_permitted(self) -> bool:
+        """Stock live INTX path requires BOTH stock flags. Default False."""
+        return self.stock_mode == "live" and self.stock_live_enabled is True
+
+    def effective_min_take_profit_pct(self) -> float:
+        """min_take_profit_pct + fee_buffer_pct (strategy/fade exit floor vs entry)."""
+        from snowball.allocation import effective_take_profit_floor
+
+        return effective_take_profit_floor(self.min_take_profit_pct, self.fee_buffer_pct)
+
+    def lane_budget_pcts(self) -> dict[str, float]:
+        from snowball.allocation import lane_budget_pcts
+
+        return lane_budget_pcts(
+            crypto_pct=self.crypto_account_budget_pct,
+            stock_pct=self.stock_account_budget_pct,
+            futures_pct=self.futures_account_budget_pct,
+        )
 
     @property
     def futures_strategy_list(self) -> list[str]:

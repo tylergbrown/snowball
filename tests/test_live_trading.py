@@ -283,7 +283,7 @@ def test_live_sell_records_exchange_fill(tmp_path: Path) -> None:
         last={p: 100.0 for p in PAIRS},
         ohlcv={("BTC-USD", "15m"): death},
     )
-    market.last["BTC-USD"] = 210.0
+    market.last["BTC-USD"] = 214.0  # >= 7% floor (6% TP + 1% fee buffer)
     Engine(state, market).tick()
     assert any(o[2] == "sell" for o in ex.orders)
     assert ledger.open_count("BTC-USD") == 0

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from snowball.allocation import leg_notional_usd, open_notional_usd
 from snowball.config import LiveTradingRefused, Settings
 from snowball.halt import halt_active, trading_enabled
 from snowball.live import make_broker
@@ -272,6 +273,7 @@ class Engine:
                     mark,
                     min_take_profit_pct=settings.min_take_profit_pct,
                     never_sell_red=settings.never_sell_red,
+                    fee_buffer_pct=settings.fee_buffer_pct,
                 )
                 if ok_sw:
                     lots_to_close.append(lot)
@@ -300,6 +302,7 @@ class Engine:
                     mark,
                     min_take_profit_pct=settings.min_take_profit_pct,
                     never_sell_red=settings.never_sell_red,
+                    fee_buffer_pct=settings.fee_buffer_pct,
                 )
                 if ok_sw:
                     eligible.append(lot)
@@ -393,6 +396,22 @@ class Engine:
             )
             return
 
+        # Cap new lots so crypto open notional stays within CRYPTO_ACCOUNT_BUDGET_PCT.
+        crypto_notional = self._crypto_leg_notional(marks)
+        if crypto_notional <= 1e-6:
+            log.info(
+                "entry blocked",
+                extra={
+                    "data": {
+                        "product": product,
+                        "strategy": strategy_id,
+                        "reason": "crypto_budget_full",
+                        "budget_pct": settings.crypto_account_budget_pct,
+                    }
+                },
+            )
+            return
+
         ctx = context_from_settings(
             settings,
             now=now,
@@ -402,7 +421,7 @@ class Engine:
             open_count_for_pair=len(all_lots),
             last_entry_at=self.state.ledger.last_entry_at(product, strategy_id),
             cash_usd=self.state.ledger.cash_usd(),
-            requested_notional=settings.max_position_notional_usd,
+            requested_notional=crypto_notional,
             cooldown_seconds=settings.cooldown_seconds_for(strategy_id),
         )
         ok, reason = allow_entry(ctx)
@@ -415,7 +434,45 @@ class Engine:
         entry_reason = (
             f"{strategy_id}:scale_in" if is_scale_in else f"{strategy_id}:enter"
         )
-        self._open_lot(product, marks, reason=entry_reason, now=now, strategy=strategy_id)
+        self._open_lot(
+            product,
+            marks,
+            reason=entry_reason,
+            now=now,
+            strategy=strategy_id,
+            notional_usd=crypto_notional,
+        )
+
+
+    def _crypto_leg_notional(self, marks: dict[str, float] | None = None) -> float:
+        """Cap new crypto lot size so open notional stays within crypto_account_budget_pct."""
+        settings = self.state.settings
+        ledger = self.state.ledger
+        open_n = open_notional_usd(ledger.open_positions())
+        account_value = 0.0
+        # Prefer live free+positions equity; fall back to ledger equity / bankroll
+        try:
+            if self.state.broker is not None and settings.live_orders_permitted():
+                # Use ledger equity marked to market as account proxy when broker
+                # balance sync already updated cash; futures lane owns full AV fetch.
+                account_value = float(ledger.equity_usd(marks or self.state.marks()))
+            else:
+                account_value = float(ledger.equity_usd(marks or self.state.marks()))
+        except Exception:
+            account_value = float(ledger.cash_usd() + open_n)
+        if account_value <= 0:
+            account_value = float(settings.bankroll_usd)
+        # If futures engine cached a fresher Coinbase AV, prefer it for allocation.
+        ft_av = getattr(self.state, "futures_account_value_usd", None)
+        if ft_av is not None and float(ft_av) > 0:
+            account_value = float(ft_av)
+        budget = account_value * float(settings.crypto_account_budget_pct)
+        return leg_notional_usd(
+            budget_usd=budget,
+            open_notional_usd=open_n,
+            max_notional_usd=settings.max_position_notional_usd,
+            target_legs=max(4, settings.max_positions_per_pair * 2),
+        )
 
     def _open_lot(
         self,
@@ -424,12 +481,18 @@ class Engine:
         reason: str,
         now: datetime,
         strategy: str = "sma_15m",
+        notional_usd: float | None = None,
     ) -> None:
         settings = self.state.settings
         snap = self.state.pairs[product]
         from snowball.models import Ticker
 
         ticker = Ticker(product=product, last=snap.last, bid=snap.bid, ask=snap.ask, ts=now)
+        target = float(
+            notional_usd
+            if notional_usd is not None
+            else settings.max_position_notional_usd
+        )
         broker = self.state.broker
         if broker is not None and settings.live_orders_permitted():
             self._open_lot_live(
@@ -438,18 +501,19 @@ class Engine:
                 reason=reason,
                 now=now,
                 strategy=strategy,
+                notional_usd=target,
             )
             return
         px = fill_price(ticker, "buy", settings.slippage_bps)
-        notional = min(settings.max_position_notional_usd, self.state.ledger.cash_usd())
+        notional = min(target, self.state.ledger.cash_usd())
         if notional > settings.max_position_notional_usd + 1e-9:
-            return
+            notional = min(notional, settings.max_position_notional_usd)
         if notional <= 0:
             return
         pos, fill = self.state.ledger.open_buy(
             product=product,
             fill_px=px,
-            notional_usd=settings.max_position_notional_usd,
+            notional_usd=notional,
             slippage_bps=settings.slippage_bps,
             fee_usd=0.0,
             reason=reason,
@@ -479,6 +543,7 @@ class Engine:
         reason: str,
         now: datetime,
         strategy: str,
+        notional_usd: float | None = None,
     ) -> None:
         """Place a Coinbase market buy and record the exchange fill into the ledger."""
         from snowball.live import parse_order_fill
@@ -499,11 +564,23 @@ class Engine:
             self.state.ledger.set_cash_usd(free_usd, ts=now)
         except Exception:  # noqa: BLE001
             log.exception("live cash sync failed")
-        notional = min(settings.max_position_notional_usd, free_usd, self.state.ledger.cash_usd())
+        target = float(
+            notional_usd
+            if notional_usd is not None
+            else settings.max_position_notional_usd
+        )
+        notional = min(target, free_usd, self.state.ledger.cash_usd())
         if notional <= 1e-6:
             log.info(
                 "live buy skipped",
-                extra={"data": {"product": product, "reason": "insufficient_funds", "free_usd": free_usd}},
+                extra={
+                    "data": {
+                        "product": product,
+                        "reason": "insufficient_funds_or_budget",
+                        "free_usd": free_usd,
+                        "target": target,
+                    }
+                },
             )
             return
         try:
@@ -793,7 +870,7 @@ def build_state(
     if settings.stock_enabled:
         from snowball.stocks.engine import attach_stock_lane
 
-        settings.assert_stock_paper_only()
+        settings.assert_stock_config()
         attach_stock_lane(state)
     if settings.futures_enabled:
         from snowball.futures.engine import attach_futures_lane
@@ -818,6 +895,10 @@ def main() -> None:
                 "paper": settings.mode == "paper" and not settings.live_enabled,
                 "stock_enabled": settings.stock_enabled,
                 "stock_mode": settings.stock_mode,
+                "stock_live_enabled": settings.stock_live_enabled,
+                "lane_budgets": settings.lane_budget_pcts(),
+                "min_take_profit_pct": settings.min_take_profit_pct,
+                "fee_buffer_pct": settings.fee_buffer_pct,
                 "futures_enabled": settings.futures_enabled,
                 "futures_mode": settings.futures_mode,
             }

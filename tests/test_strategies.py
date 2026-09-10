@@ -15,6 +15,10 @@ def _both_enabled(app_state: AppState, **extra: object) -> None:
         "strategies": "sma_15m,sma_5m",
         "entry_cooldown_seconds": 0,
         "entry_cooldown_5m_seconds": 0,
+        # Isolation tests use a clean 5% floor (no fee buffer) so strategy
+        # scoping stays independent of production 6%+1% settings.
+        "min_take_profit_pct": 0.05,
+        "fee_buffer_pct": 0.0,
     }
     update.update(extra)
     app_state.settings = app_state.settings.model_copy(update=update)

@@ -1,0 +1,311 @@
+"""Capital split 40/40/20, fee-buffer exits, stock dual-gate + INTX perps."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from snowball.allocation import (
+    effective_take_profit_floor,
+    lane_budget_pcts,
+    lane_budgets_usd,
+    leg_notional_usd,
+)
+from snowball.config import LiveTradingRefused, Settings
+from snowball.gates import strategy_exit_allowed
+from snowball.models import Position, PositionStatus, Ticker
+from snowball.paper import PaperLedger
+from snowball.state import AppState
+from snowball.stocks.engine import StockPaperEngine, attach_stock_lane
+from snowball.stocks.market import resolve_coinbase_equity_perps, ticker_to_perp_product
+from snowball.models import PairSnapshot
+
+
+def test_allocation_helpers_40_40_20() -> None:
+    pcts = lane_budget_pcts()
+    assert pcts == {"crypto": 0.40, "stock": 0.40, "futures": 0.20}
+    budgets = lane_budgets_usd(1000.0)
+    assert budgets["crypto_usd"] == 400.0
+    assert budgets["stock_usd"] == 400.0
+    assert budgets["futures_usd"] == 200.0
+    s = Settings(_env_file=None, stock_enabled=False, futures_enabled=False)
+    assert s.crypto_account_budget_pct == 0.40
+    assert s.stock_account_budget_pct == 0.40
+    assert s.futures_account_budget_pct == 0.20
+    assert s.lane_budget_pcts() == pcts
+    assert s.min_take_profit_pct == 0.06
+    assert s.fee_buffer_pct == 0.01
+    assert s.effective_min_take_profit_pct() == pytest.approx(0.07)
+
+
+def test_fee_buffer_math() -> None:
+    assert effective_take_profit_floor(0.06, 0.01) == pytest.approx(0.07)
+    lot = Position(
+        id=1,
+        product="BTC-USD",
+        side="long",
+        qty=1.0,
+        entry_price=100.0,
+        notional_usd=100.0,
+        opened_at=datetime.now(timezone.utc),
+        status=PositionStatus.OPEN,
+        strategy="sma_15m",
+    )
+    # Never exit below entry
+    ok, reason = strategy_exit_allowed(
+        lot, 99.0, min_take_profit_pct=0.06, never_sell_red=True, fee_buffer_pct=0.01
+    )
+    assert ok is False and reason == "never_sell_red"
+    # 6% green refused after fee buffer (needs 7%)
+    ok, reason = strategy_exit_allowed(
+        lot, 106.0, min_take_profit_pct=0.06, never_sell_red=True, fee_buffer_pct=0.01
+    )
+    assert ok is False and reason == "below_take_profit"
+    # 7% ok
+    ok, reason = strategy_exit_allowed(
+        lot, 107.0, min_take_profit_pct=0.06, never_sell_red=True, fee_buffer_pct=0.01
+    )
+    assert ok is True and reason == "ok"
+
+
+def test_never_exit_below_entry() -> None:
+    lot = Position(
+        id=2,
+        product="AAPL",
+        side="long",
+        qty=1.0,
+        entry_price=200.0,
+        notional_usd=200.0,
+        opened_at=datetime.now(timezone.utc),
+        status=PositionStatus.OPEN,
+        strategy="sma_15m",
+    )
+    ok, reason = strategy_exit_allowed(
+        lot, 200.0, min_take_profit_pct=0.0, never_sell_red=True, fee_buffer_pct=0.0
+    )
+    # pnl_pct == 0 is not < 0, so never_sell_red passes; below_take_profit if min>0
+    assert ok is True
+    ok, reason = strategy_exit_allowed(
+        lot, 199.99, min_take_profit_pct=0.0, never_sell_red=True, fee_buffer_pct=0.0
+    )
+    assert ok is False and reason == "never_sell_red"
+
+
+def test_stock_live_refused_without_both_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STOCK_MODE", raising=False)
+    monkeypatch.delenv("STOCK_LIVE_ENABLED", raising=False)
+    s_live_only = Settings(
+        _env_file=None,
+        stock_enabled=True,
+        stock_mode="live",
+        stock_live_enabled=False,
+        stock_sqlite_path=tmp_path / "s.db",
+        halt_file=tmp_path / "HALT",
+        sqlite_path=tmp_path / "c.db",
+        heartbeat_path=tmp_path / "hb",
+    )
+    with pytest.raises(LiveTradingRefused):
+        s_live_only.assert_stock_config()
+    assert s_live_only.stock_live_orders_permitted() is False
+
+    s_flag_only = Settings(
+        _env_file=None,
+        stock_enabled=True,
+        stock_mode="paper",
+        stock_live_enabled=True,
+        stock_sqlite_path=tmp_path / "s2.db",
+        halt_file=tmp_path / "HALT",
+        sqlite_path=tmp_path / "c2.db",
+        heartbeat_path=tmp_path / "hb2",
+    )
+    with pytest.raises(LiveTradingRefused):
+        s_flag_only.assert_stock_config()
+
+    s_both = Settings(
+        _env_file=None,
+        stock_enabled=True,
+        stock_mode="live",
+        stock_live_enabled=True,
+        stock_sqlite_path=tmp_path / "s3.db",
+        halt_file=tmp_path / "HALT",
+        sqlite_path=tmp_path / "c3.db",
+        heartbeat_path=tmp_path / "hb3",
+        coinbase_api_key="organizations/x/apiKeys/y",
+        coinbase_api_secret="-----BEGIN EC PRIVATE KEY-----\nM\n-----END EC PRIVATE KEY-----\n",
+    )
+    s_both.assert_stock_config()
+    assert s_both.stock_live_orders_permitted() is True
+
+
+def test_resolve_intx_perps_maps_and_skips() -> None:
+    markets = {
+        "AAPL/USDC:USDC": {
+            "id": "AAPL-PERP-INTX",
+            "base": "AAPL",
+            "type": "swap",
+        },
+        "MSFT/USDC:USDC": {
+            "id": "MSFT-PERP-INTX",
+            "base": "MSFT",
+            "type": "swap",
+        },
+        "BTC/USDC:USDC": {
+            "id": "BTC-PERP-INTX",
+            "base": "BTC",
+            "type": "swap",
+        },
+    }
+    mapped = resolve_coinbase_equity_perps(
+        ["AAPL", "MSFT", "NFLX", "SPY"],
+        markets=markets,
+        exclude_bases={"SPY", "QQQ"},
+    )
+    assert mapped == {"AAPL": "AAPL-PERP-INTX", "MSFT": "MSFT-PERP-INTX"}
+    assert "NFLX" not in mapped
+    assert "SPY" not in mapped
+    assert ticker_to_perp_product("AAPL") == "AAPL-PERP-INTX"
+
+
+class FakeYahoo:
+    mark_source = "yahoo_paper"
+
+    def __init__(self) -> None:
+        self.closes = [100.0] * 50 + [200.0]
+        self.orders: list[tuple] = []
+
+    def fetch_ohlcv(self, product: str, timeframe: str, limit: int) -> list[list[float]]:
+        closes = self.closes[-limit:]
+        step = {"5m": 300_000.0, "15m": 900_000.0, "1d": 86_400_000.0}.get(timeframe, 900_000.0)
+        base = 1_700_000_000_000.0
+        return [[base + i * step, c, c, c, c, 1.0] for i, c in enumerate(closes)]
+
+    def fetch_ticker(self, product: str) -> Ticker:
+        return Ticker(
+            product=product,
+            last=200.0,
+            bid=None,
+            ask=None,
+            ts=datetime.now(timezone.utc),
+        )
+
+
+class FakeIntxMarket:
+    mark_source = "coinbase_perp"
+
+    def __init__(self) -> None:
+        self.orders: list[dict[str, Any]] = []
+        self.allow_orders = True
+
+    def fetch_ohlcv(self, product: str, timeframe: str, limit: int) -> list[list[float]]:
+        closes = [100.0] * 50 + [200.0]
+        step = 900_000.0
+        base = 1_700_000_000_000.0
+        return [[base + i * step, c, c, c, c, 1.0] for i, c in enumerate(closes[-limit:])]
+
+    def fetch_ticker(self, product: str) -> Ticker:
+        return Ticker(
+            product=product,
+            last=200.0,
+            bid=199.0,
+            ask=201.0,
+            ts=datetime.now(timezone.utc),
+        )
+
+    def fetch_account_value_usd(self, *, crypto_marks=None) -> float:
+        return 1000.0
+
+    def create_swap_market_order(self, product, side, amount, *, leverage=1.0, reduce_only=False):
+        assert product.endswith("-PERP-INTX") or "PERP" in product
+        assert "yahoo" not in str(product).lower()
+        order = {
+            "id": f"ord-{len(self.orders)+1}",
+            "filled": float(amount),
+            "average": 200.0,
+            "price": 200.0,
+            "fee": {"cost": 0.1, "currency": "USDC"},
+        }
+        self.orders.append(
+            {"product": product, "side": side, "amount": amount, "reduce_only": reduce_only}
+        )
+        return order
+
+
+def test_stock_live_uses_perp_not_yahoo_for_orders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("STOCK_MODE", raising=False)
+    monkeypatch.delenv("STOCK_LIVE_ENABLED", raising=False)
+    monkeypatch.delenv("MODE", raising=False)
+    monkeypatch.delenv("LIVE_ENABLED", raising=False)
+    settings = Settings(
+        _env_file=None,
+        mode="paper",
+        live_enabled=False,
+        trading_enabled=True,
+        halt_file=tmp_path / "HALT",
+        sqlite_path=tmp_path / "crypto.db",
+        heartbeat_path=tmp_path / "hb",
+        stock_enabled=True,
+        stock_mode="live",
+        stock_live_enabled=True,
+        stock_sqlite_path=tmp_path / "stocks.db",
+        stock_strategies="sma_15m",
+        stock_max_active=8,
+        stock_dynamic_max=0,
+        stock_account_budget_pct=0.40,
+        stock_max_notional_usd=100.0,
+        stock_bankroll_usd=1000.0,
+        futures_enabled=False,
+        min_take_profit_pct=0.06,
+        fee_buffer_pct=0.01,
+        never_sell_red=True,
+    )
+    state = AppState(settings=settings, ledger=PaperLedger(settings.sqlite_path, 1000.0))
+    # Manual attach without real Coinbase
+    settings.assert_stock_config()
+    state.stock_ledger = PaperLedger(settings.stock_sqlite_path, settings.stock_bankroll_usd)
+    state.stock_universe_active = ["AAPL", "NFLX"]  # NFLX has no perp in our fake map
+    for p in state.stock_universe_active:
+        state.stock_pairs[p] = PairSnapshot(product=p, max_open=5)
+    engine = StockPaperEngine(state, market=FakeYahoo())
+    fake_cb = FakeIntxMarket()
+    engine._cb_market = fake_cb
+    engine._perp_map = {"AAPL": "AAPL-PERP-INTX"}
+    state.stock_coinbase_ids = dict(engine._perp_map)
+    engine._last_budget = {
+        "account_value_usd": 1000.0,
+        "budget_usd": 400.0,
+        "open_notional_usd": 0.0,
+    }
+    # Prevent universe refresh from replacing the tiny test active set
+    import time as _time
+    engine._last_universe_refresh = _time.monotonic()
+    engine.tick()
+    # AAPL should have a live-backed lot; NFLX skipped (no perp) for entries
+    assert state.stock_ledger is not None
+    assert state.stock_ledger.open_count("AAPL") == 1
+    assert state.stock_ledger.open_count("NFLX") == 0
+    assert fake_cb.orders, "expected INTX swap order"
+    assert fake_cb.orders[0]["product"] == "AAPL-PERP-INTX"
+    assert fake_cb.orders[0]["side"] == "buy"
+    # Lot marked live-backed
+    lot = state.stock_ledger.open_positions("AAPL")[0]
+    assert engine._lot_is_live_backed(lot) is True
+
+
+def test_leg_notional_respects_budget() -> None:
+    assert leg_notional_usd(
+        budget_usd=400.0, open_notional_usd=350.0, max_notional_usd=100.0, target_legs=8
+    ) == pytest.approx(50.0)
+    assert leg_notional_usd(
+        budget_usd=400.0, open_notional_usd=0.0, max_notional_usd=100.0, target_legs=8
+    ) == pytest.approx(100.0)
+    assert (
+        leg_notional_usd(
+            budget_usd=400.0, open_notional_usd=400.0, max_notional_usd=100.0, target_legs=8
+        )
+        == 0.0
+    )

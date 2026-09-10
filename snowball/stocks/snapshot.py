@@ -1,4 +1,4 @@
-"""Dashboard / API snapshot for the isolated STOCK PAPER book."""
+"""Dashboard / API snapshot for the isolated STOCK book (paper or live INTX)."""
 
 from __future__ import annotations
 
@@ -39,7 +39,10 @@ def build_stocks_snapshot(state: AppState) -> dict[str, Any]:
         utc_date, start_eq, killed = ledger.ensure_utc_day(now, equity)
         daily_pnl = equity - start_eq
         halted = halt_active(settings.halt_file)
-        can_trade = trading_enabled(settings) and settings.stock_mode == "paper"
+        live = settings.stock_live_orders_permitted()
+        can_trade = trading_enabled(settings) and (
+            settings.stock_mode == "paper" or live
+        )
 
         positions = []
         for pos in ledger.open_positions():
@@ -118,8 +121,10 @@ def build_stocks_snapshot(state: AppState) -> dict[str, Any]:
             )
 
         block: list[str] = []
-        if settings.stock_mode != "paper":
-            block.append("stock_mode_not_paper")
+        if settings.stock_mode == "live" and not settings.stock_live_enabled:
+            block.append("stock_live_gate_incomplete")
+        if settings.stock_mode != "live" and settings.stock_live_enabled:
+            block.append("stock_live_gate_incomplete")
         if halted:
             block.append("halt_file")
         if not can_trade:
@@ -133,9 +138,15 @@ def build_stocks_snapshot(state: AppState) -> dict[str, Any]:
             "enabled": True,
             "ts": now.isoformat(),
             "last_tick_at": state.stock_last_tick_at.isoformat() if state.stock_last_tick_at else None,
-            "mode": "paper",
+            "mode": "live" if live else "paper",
             "stock_mode": settings.stock_mode,
-            "label": "STOCK PAPER — Yahoo marks; isolated book; never live stock orders",
+            "stock_live_enabled": settings.stock_live_enabled,
+            "live_orders_permitted": live,
+            "label": (
+                "STOCK LIVE — Coinbase INTX equity perps; isolated book; long-only"
+                if live
+                else "STOCK PAPER — Yahoo marks; isolated book; dual-gate for live INTX"
+            ),
             "mark_source": state.stock_mark_source,
             "status": {
                 "halt_active": halted,
@@ -155,10 +166,15 @@ def build_stocks_snapshot(state: AppState) -> dict[str, Any]:
                 "unrealized_pnl_usd": ledger.unrealized_pnl(marks),
                 "max_positions_per_pair": settings.stock_max_positions,
                 "max_position_notional_usd": settings.stock_max_notional_usd,
+                "account_value_usd": getattr(state, "stock_account_value_usd", None),
+                "budget_pct": settings.stock_account_budget_pct,
+                "budget_usd": getattr(state, "stock_budget_usd", None),
                 "open_positions": len(positions),
                 "max_book_positions": settings.stock_max_positions
                 * max(1, len(state.stock_universe_active or [])),
                 "min_take_profit_pct": settings.min_take_profit_pct,
+                "fee_buffer_pct": settings.fee_buffer_pct,
+                "effective_take_profit_floor": settings.effective_min_take_profit_pct(),
                 "never_sell_red": settings.never_sell_red,
             },
             "universe": {
@@ -173,4 +189,5 @@ def build_stocks_snapshot(state: AppState) -> dict[str, Any]:
             "scorecard": ledger.scorecard(),
             "pair_pauses": [p for p in pause_rows.values() if p.get("active")],
             "coinbase_equity_ids": state.stock_coinbase_ids or {},
+            "intx_perp_map": state.stock_coinbase_ids or {},
         }

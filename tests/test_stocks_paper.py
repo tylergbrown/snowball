@@ -128,6 +128,8 @@ def test_stock_paper_entry_isolated_from_crypto(
         state.stock_pairs[p] = PairSnapshot(product=p, max_open=settings.stock_max_positions)
 
     engine = StockPaperEngine(state, market=FakeYahoo())  # type: ignore[arg-type]
+    import time as _time
+    engine._last_universe_refresh = _time.monotonic()
     engine.tick()
     assert state.stock_ledger.open_count("AAPL") == 1
     assert state.stock_ledger.open_count("MSFT") == 1
@@ -202,6 +204,8 @@ def test_crypto_live_flags_do_not_enable_stock_live(
     state.stock_universe_active = ["AAPL"]
     state.stock_pairs["AAPL"] = PairSnapshot(product="AAPL", max_open=5)
     engine = StockPaperEngine(state, market=FakeYahoo())  # type: ignore[arg-type]
+    import time as _time
+    engine._last_universe_refresh = _time.monotonic()
     engine.tick()
     assert state.stock_ledger is not None
     assert state.stock_ledger.open_count("AAPL") == 1

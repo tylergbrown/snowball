@@ -65,9 +65,11 @@ def test_daily_kill_flattens_and_blocks(app_state: AppState) -> None:
     )
     market.last["BTC-USD"] = 70.0
     engine.tick()
-    assert app_state.ledger.open_positions() == []
+    # Never-sell-red holds the underwater lot; daily kill still arms.
+    assert app_state.ledger.open_count("BTC-USD") == 1
     assert app_state.ledger.is_daily_killed(utcnow())
     market.closes["BTC-USD"] = [100.0] * 50 + [200.0]
     market.last["BTC-USD"] = 200.0
     engine.tick()
-    assert app_state.ledger.open_count("BTC-USD") == 0
+    # New entries blocked while daily-killed; existing lot remains.
+    assert app_state.ledger.open_count("BTC-USD") == 1

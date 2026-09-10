@@ -1,8 +1,9 @@
-"""Public equity marks for STOCK PAPER — Yahoo Finance chart API (no orders).
+"""Stock marks + live Coinbase INTX equity-perp orders.
 
-Coinbase Advanced Trade currently exposes equity *perps* (e.g. NVDA-PERP-INTX),
-not spot US equities under the CDP key we use for crypto. Paper marks therefore
-come from Yahoo public data and are labeled ``yahoo_paper``.
+Paper marks come from Yahoo Finance (``yahoo_paper``). Live stock trading uses
+Coinbase Advanced Trade INTX equity perps (``{SYM}-PERP-INTX`` / ccxt
+``{SYM}/USDC:USDC``) — there is no US equity spot on Advanced Trade. Symbols
+without a listed INTX perp stay research/watch only (Yahoo marks, no orders).
 """
 
 from __future__ import annotations
@@ -43,12 +44,10 @@ class YahooPaperMarket:
         sym = normalize_symbol(product)
         tf = timeframe.strip().lower()
         if tf not in _INTERVAL:
-            # Map unknown to daily
             tf = "1d"
         interval, range_ = _INTERVAL[tf]
         rows = self._chart_ohlcv(sym, interval=interval, range_=range_)
         if not rows and tf != "1d":
-            # Fall back to daily when intraday is empty (weekend / after-hours / thin)
             rows = self._chart_ohlcv(sym, interval="1d", range_="1y")
         if limit > 0:
             rows = rows[-limit:]
@@ -60,7 +59,6 @@ class YahooPaperMarket:
         last = meta.get("regularMarketPrice")
         if last is None:
             last = meta.get("previousClose")
-        # Yahoo chart meta rarely has bid/ask; leave None
         ts_raw = meta.get("regularMarketTime")
         if isinstance(ts_raw, (int, float)) and ts_raw > 0:
             ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
@@ -137,10 +135,10 @@ class YahooPaperMarket:
 
 
 def resolve_coinbase_equity_ids(wanted: list[str]) -> dict[str, str]:
-    """Best-effort map ticker → Coinbase product id if spot equity exists.
+    """Best-effort map ticker → Coinbase *spot* equity product id (usually empty).
 
-    Current CDP universe typically has *-PERP-INTX swaps only — those are NOT
-    used for this paper equity lane. Returns empty or sparse map; callers keep Yahoo.
+    Advanced Trade does not list US equity spot for typical CDP keys. Prefer
+    :func:`resolve_coinbase_equity_perps` for live stock trading.
     """
     out: dict[str, str] = {}
     try:
@@ -154,14 +152,10 @@ def resolve_coinbase_equity_ids(wanted: list[str]) -> dict[str, str]:
         log.info("coinbase equity probe skipped", extra={"data": {"error": str(exc)}})
         return out
     want = {normalize_symbol(w) for w in wanted}
-    # Crypto spot often reuses ticker strings (AI, META, …). US equity spot is not
-    # listed on Advanced Trade for this key — only *-PERP-INTX swaps showed up in
-    # probes — so we refuse to treat any Coinbase spot market as an equity id.
     for _sym, m in markets.items():
         pid = str(m.get("id") or "")
         if "PERP" in pid.upper() or m.get("type") == "swap":
             continue
-        # Explicit equity product types only (none observed today).
         info = m.get("info") if isinstance(m.get("info"), dict) else {}
         ptype = str(info.get("product_type") or info.get("productType") or "").lower()
         if "equity" not in ptype and "stock" not in ptype:
@@ -170,3 +164,119 @@ def resolve_coinbase_equity_ids(wanted: list[str]) -> dict[str, str]:
         if base in want and m.get("spot"):
             out[base] = pid
     return out
+
+
+def resolve_coinbase_equity_perps(
+    wanted: list[str],
+    *,
+    markets: dict[str, Any] | None = None,
+    exclude_bases: set[str] | None = None,
+) -> dict[str, str]:
+    """Map watchlist ticker → ``{SYM}-PERP-INTX`` when that INTX equity perp exists.
+
+    Returns only symbols with a listed Coinbase INTX perp. Callers skip names
+    without a perp (research/watch only). ``exclude_bases`` skips tickers already
+    reserved by Future Trader (e.g. SPY/QQQ) to avoid double-trading one product.
+    """
+    out: dict[str, str] = {}
+    want = {normalize_symbol(w) for w in wanted}
+    skip = {normalize_symbol(x) for x in (exclude_bases or set())}
+    market_map = markets
+    if market_map is None:
+        try:
+            import ccxt  # lazy
+
+            ex = ccxt.coinbase({"enableRateLimit": True, "timeout": 20000})
+            market_map = ex.load_markets()
+        except Exception as exc:  # noqa: BLE001
+            log.info(
+                "coinbase INTX equity perp probe skipped",
+                extra={"data": {"error": str(exc)}},
+            )
+            return out
+    assert market_map is not None
+    for _sym, m in market_map.items():
+        pid = str(m.get("id") or "").upper()
+        if not pid.endswith("-PERP-INTX") and "PERP-INTX" not in pid:
+            # Also accept type=swap with INTX in id
+            if not (m.get("type") == "swap" and "INTX" in pid):
+                continue
+        base = normalize_symbol(str(m.get("base") or pid.split("-")[0]))
+        if base in want and base not in skip:
+            # Canonical Coinbase product id
+            canon = pid if pid.endswith("-PERP-INTX") else f"{base}-PERP-INTX"
+            out[base] = canon
+    return out
+
+
+def ticker_to_perp_product(ticker: str) -> str:
+    """``AAPL`` → ``AAPL-PERP-INTX`` (does not prove the market exists)."""
+    base = normalize_symbol(ticker)
+    if base.endswith("-PERP-INTX"):
+        return base
+    if base.endswith("-PERP"):
+        return f"{base}-INTX" if not base.endswith("-PERP-INTX") else base
+    return f"{base}-PERP-INTX"
+
+
+class StockMarkRouter:
+    """Route marks: Coinbase INTX for mapped live symbols, Yahoo otherwise.
+
+    Never places orders. Live orders go through ``CoinbaseFuturesMarket`` in the
+    stock engine (same INTX swap path as Future Trader).
+    """
+
+    def __init__(
+        self,
+        *,
+        yahoo: YahooPaperMarket | None = None,
+        coinbase: Any | None = None,
+        perp_map: dict[str, str] | None = None,
+        prefer_coinbase: bool = False,
+    ) -> None:
+        self.yahoo = yahoo or YahooPaperMarket()
+        self.coinbase = coinbase
+        self.perp_map = dict(perp_map or {})
+        self.prefer_coinbase = bool(prefer_coinbase)
+
+    @property
+    def mark_source(self) -> str:
+        if self.prefer_coinbase and self.perp_map and self.coinbase is not None:
+            return "coinbase_intx_perp"
+        return getattr(self.yahoo, "mark_source", "yahoo_paper")
+
+    def _perp_id(self, product: str) -> str | None:
+        sym = normalize_symbol(product)
+        return self.perp_map.get(sym)
+
+    def fetch_ohlcv(self, product: str, timeframe: str, limit: int) -> list[list[float]]:
+        pid = self._perp_id(product)
+        if self.prefer_coinbase and pid and self.coinbase is not None:
+            try:
+                return self.coinbase.fetch_ohlcv(pid, timeframe, limit)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "coinbase stock perp ohlcv failed; falling back to Yahoo",
+                    extra={"data": {"product": product, "perp": pid, "error": str(exc)}},
+                )
+        return self.yahoo.fetch_ohlcv(product, timeframe, limit)
+
+    def fetch_ticker(self, product: str) -> Ticker:
+        sym = normalize_symbol(product)
+        pid = self._perp_id(product)
+        if self.prefer_coinbase and pid and self.coinbase is not None:
+            try:
+                t = self.coinbase.fetch_ticker(pid)
+                return Ticker(
+                    product=sym,
+                    last=t.last,
+                    bid=t.bid,
+                    ask=t.ask,
+                    ts=t.ts,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "coinbase stock perp ticker failed; falling back to Yahoo",
+                    extra={"data": {"product": product, "perp": pid, "error": str(exc)}},
+                )
+        return self.yahoo.fetch_ticker(product)

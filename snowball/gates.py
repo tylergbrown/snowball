@@ -96,19 +96,25 @@ def strategy_exit_allowed(
     *,
     min_take_profit_pct: float,
     never_sell_red: bool,
+    fee_buffer_pct: float = 0.0,
 ) -> tuple[bool, str]:
     """Normal (non-emergency) exit gate for any strategy lot.
 
-    Never sell red when never_sell_red. min_take_profit_pct is a floor: strategy
-    exits are only allowed once unrealized >= that pct (caller must also require
-    a death-cross EXIT or momentum fade). Engine also refuses red sells on HALT/daily-kill.
+    Never sell red when never_sell_red. Effective floor is
+    min_take_profit_pct + fee_buffer_pct (default fee buffer 0 for unit tests;
+    production passes FEE_BUFFER_PCT≈0.01 so a “6% green” that would be red
+    after ~1% round-trip fees is refused). Caller must also require a
+    death-cross EXIT or momentum fade. Emergency HALT/daily-kill bypasses this.
     """
+    from snowball.allocation import effective_take_profit_floor
+
     pnl_pct = lot_unrealized_pnl_pct(lot, mark)
     if pnl_pct is None:
         return False, "swing_no_mark"
     if never_sell_red and pnl_pct < 0:
         return False, "never_sell_red"
-    if pnl_pct < float(min_take_profit_pct):
+    floor = effective_take_profit_floor(min_take_profit_pct, fee_buffer_pct)
+    if pnl_pct < floor:
         return False, "below_take_profit"
     return True, "ok"
 

@@ -437,5 +437,5 @@ def test_futures_defaults_session_day() -> None:
     assert s.futures_mode == "paper"
     assert s.futures_live_enabled is False
     assert s.futures_live_orders_permitted() is False
-    assert s.futures_account_budget_pct == 0.10
+    assert s.futures_account_budget_pct == 0.20
     assert s.futures_max_positions == 1

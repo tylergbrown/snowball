@@ -1,7 +1,7 @@
 """Future Trader — session day-trade engine (paper + dual-gated live INTX perps).
 
 Primary path is America/New_York session longs on SPY/QQQ perps:
-  • Budget = futures_account_budget_pct (default 10%) of Coinbase account value
+  • Budget = futures_account_budget_pct (default 20%) of Coinbase account value
   • 50/50 notional split across products; max 1 open lot per index
   • Entry ~09:25–09:30 ET (late catch-up until exit window if bot was down)
   • Exit ~15:55–16:00 ET only if green (mark >= entry); else hold overnight
@@ -581,6 +581,7 @@ class FuturesEngine:
                     mark,
                     min_take_profit_pct=settings.min_take_profit_pct,
                     never_sell_red=settings.never_sell_red,
+                    fee_buffer_pct=getattr(settings, "fee_buffer_pct", 0.0),
                 )
                 if ok_sw:
                     lots_to_close.append(lot)
@@ -604,6 +605,7 @@ class FuturesEngine:
                     mark,
                     min_take_profit_pct=settings.min_take_profit_pct,
                     never_sell_red=settings.never_sell_red,
+                    fee_buffer_pct=getattr(settings, "fee_buffer_pct", 0.0),
                 )
                 if ok_sw:
                     eligible.append(lot)
@@ -873,6 +875,7 @@ class FuturesEngine:
                         paper_px,
                         min_take_profit_pct=settings.min_take_profit_pct,
                         never_sell_red=settings.never_sell_red,
+                    fee_buffer_pct=getattr(settings, "fee_buffer_pct", 0.0),
                     )
                     if not ok_sw:
                         log.info(

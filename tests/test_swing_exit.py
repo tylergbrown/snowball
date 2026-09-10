@@ -21,6 +21,7 @@ def _cfg(app_state: AppState, **extra: object) -> None:
         "entry_cooldown_5m_seconds": 0,
         "slippage_bps": 0.0,
         "min_take_profit_pct": 0.05,
+        "fee_buffer_pct": 0.0,
         "never_sell_red": True,
         "daily_loss_kill_usd": 25.0,
     }
@@ -185,7 +186,8 @@ def test_5m_fade_plus_5pct_closes_one(app_state: AppState) -> None:
     assert sells[0].reason == "sma_5m:fade"
 
 
-def test_halt_flatten_closes_red_15m(app_state: AppState) -> None:
+def test_halt_flatten_holds_red_15m(app_state: AppState) -> None:
+    """NEVER_SELL_RED (+ emergency) is absolute — HALT does not sell underwater lots."""
     _cfg(app_state, strategies="sma_15m")
     app_state.ledger.open_buy(
         "BTC-USD", 100.0, 100.0, 0.0, 0.0, "seed", strategy="sma_15m"
@@ -196,10 +198,11 @@ def test_halt_flatten_closes_red_15m(app_state: AppState) -> None:
         ohlcv={("BTC-USD", "15m"): list(FLAT)},
     )
     Engine(app_state, market).tick()
-    assert app_state.ledger.open_positions() == []
+    assert app_state.ledger.open_count("BTC-USD") == 1
 
 
-def test_daily_loss_kill_closes_red_15m(app_state: AppState) -> None:
+def test_daily_loss_kill_holds_red_15m(app_state: AppState) -> None:
+    """Daily-loss kill blocks new entries but does not sell red when never_sell_red holds."""
     _cfg(app_state, strategies="sma_15m", daily_loss_kill_usd=25.0)
     market = _market(
         last={"BTC-USD": 100.0},
@@ -212,4 +215,4 @@ def test_daily_loss_kill_closes_red_15m(app_state: AppState) -> None:
     )
     market.last["BTC-USD"] = 70.0  # -30 unrealized => daily kill
     engine.tick()
-    assert app_state.ledger.open_positions() == []
+    assert app_state.ledger.open_count("BTC-USD") == 1

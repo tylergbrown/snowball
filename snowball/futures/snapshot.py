@@ -201,6 +201,8 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
                 "open_positions": len(positions),
                 "max_book_positions": settings.futures_max_positions * max(1, len(products)),
                 "min_take_profit_pct": settings.min_take_profit_pct,
+                "fee_buffer_pct": getattr(settings, "fee_buffer_pct", 0.0),
+                "effective_take_profit_floor": settings.effective_min_take_profit_pct(),
                 "never_sell_red": settings.never_sell_red,
             },
             "products": products,

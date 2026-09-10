@@ -43,6 +43,8 @@ class AppState:
     stock_universe_sources: dict = field(default_factory=dict)
     stock_coinbase_ids: dict[str, str] = field(default_factory=dict)
     stock_engine: object | None = None
+    stock_account_value_usd: float | None = None
+    stock_budget_usd: float | None = None
     # --- Future Trader (isolated; never mixes with crypto/stock ledgers) ---
     futures_ledger: PaperLedger | None = None
     futures_pairs: dict[str, PairSnapshot] = field(default_factory=dict)
