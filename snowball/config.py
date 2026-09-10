@@ -131,20 +131,29 @@ class Settings(BaseSettings):
     earnings_poll_seconds: float = 14400.0
     earnings_sqlite_path: Path = Path("./data/snowball_earnings.db")
 
-    # --- Future Trader (Coinbase equity perps paper; never live in v1) ---
+    # --- Future Trader (Coinbase equity perps; session day-trade; dual-gated live) ---
     futures_enabled: bool = True
     futures_mode: Literal["paper", "live"] = "paper"
-    # Dual gate for any future live path: FUTURES_MODE=live AND FUTURES_LIVE_ENABLED=true
+    # Dual gate for live futures: FUTURES_MODE=live AND FUTURES_LIVE_ENABLED=true
     futures_live_enabled: bool = False
     futures_sqlite_path: Path = Path("./data/snowball_futures.db")
     futures_bankroll_usd: float = 1000.0
-    futures_max_positions: int = 5
-    futures_max_notional_usd: float = 100.0
+    # Max 1 open lot per index (session engine)
+    futures_max_positions: int = 1
+    # Soft ceiling per leg; live sizing uses account budget split (see budget_pct)
+    futures_max_notional_usd: float = 500.0
     futures_daily_loss_kill_usd: float = 25.0
-    # Daily-focused; ema_15m skipped (thin 15m history on INTX perps)
-    futures_strategies: str = "sma_1d,donchian_1d"
+    # Fraction of total Coinbase account value FT may use (split 50/50 across products)
+    futures_account_budget_pct: float = 0.10
+    # session_day = ET session long-only engine; legacy sma_1d/donchian_1d still parseable
+    futures_strategies: str = "session_day"
     futures_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
-    futures_poll_seconds: float = 120.0
+    futures_poll_seconds: float = 60.0
+    # America/New_York windows (HH:MM). Entry: preferred 09:25-09:30; late catch-up until exit.
+    futures_entry_start_et: str = "09:25"
+    futures_entry_end_et: str = "09:30"
+    futures_exit_start_et: str = "15:55"
+    futures_exit_end_et: str = "16:00"
 
     coinbase_api_key: str = ""
     coinbase_api_secret: str = ""
@@ -243,23 +252,36 @@ class Settings(BaseSettings):
         items = [p.strip().upper() for p in self.futures_products.split(",") if p.strip()]
         return items or ["SPY-PERP-INTX", "QQQ-PERP-INTX"]
 
-    def assert_futures_paper_only(self) -> None:
+    def assert_futures_config(self) -> None:
+        """Refuse inconsistent dual-gate; allow paper or fully dual-gated live."""
         if not self.futures_enabled:
             return
-        if self.futures_mode != "paper":
+        if self.futures_mode == "live" and not self.futures_live_enabled:
             raise LiveTradingRefused(
-                f"Futures trading refused: FUTURES_MODE={self.futures_mode!r} "
-                "(Future Trader v1 is paper-only; never places live futures orders)."
+                "Futures trading refused: FUTURES_MODE=live but FUTURES_LIVE_ENABLED "
+                "is false (both required for live futures orders)."
             )
-        if self.futures_live_enabled:
+        if self.futures_mode != "live" and self.futures_live_enabled:
             raise LiveTradingRefused(
                 "Futures trading refused: FUTURES_LIVE_ENABLED=true while "
-                "FUTURES_MODE is not live (dual gate required for any live futures path)."
+                "FUTURES_MODE is not live (dual gate required)."
             )
+        if not (0.0 < float(self.futures_account_budget_pct) <= 1.0):
+            raise LiveTradingRefused(
+                f"FUTURES_ACCOUNT_BUDGET_PCT must be in (0,1]; got {self.futures_account_budget_pct}"
+            )
+
+    def assert_futures_paper_only(self) -> None:
+        """Back-compat alias: enforce dual-gate consistency (paper or live both OK)."""
+        self.assert_futures_config()
 
     def futures_live_orders_permitted(self) -> bool:
         """Future live path requires BOTH futures flags. Default False."""
         return self.futures_mode == "live" and self.futures_live_enabled is True
+
+    def futures_uses_session_engine(self) -> bool:
+        """True when session_day is configured (primary FT path)."""
+        return "session_day" in self.futures_strategy_list
 
     def live_orders_permitted(self) -> bool:
         """Live ccxt orders require BOTH flags. Default config returns False."""

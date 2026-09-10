@@ -7,6 +7,7 @@ SMA_5M = "sma_5m"
 SMA_1D = "sma_1d"
 EMA_15M = "ema_15m"
 DONCHIAN_1D = "donchian_1d"
+SESSION_DAY = "session_day"
 
 EMA_FAST = 12
 EMA_SLOW = 26
@@ -14,7 +15,7 @@ DONCHIAN_ENTRY = 20
 DONCHIAN_EXIT = 10
 
 KNOWN_STRATEGY_IDS: frozenset[str] = frozenset(
-    {SMA_15M, SMA_5M, SMA_1D, EMA_15M, DONCHIAN_1D}
+    {SMA_15M, SMA_5M, SMA_1D, EMA_15M, DONCHIAN_1D, SESSION_DAY}
 )
 
 TIMEFRAME_BY_STRATEGY: dict[str, str] = {
@@ -23,6 +24,7 @@ TIMEFRAME_BY_STRATEGY: dict[str, str] = {
     SMA_1D: "1d",
     EMA_15M: "15m",
     DONCHIAN_1D: "1d",
+    SESSION_DAY: "1d",  # unused by session engine; marks-only
 }
 
 

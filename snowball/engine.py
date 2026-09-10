@@ -798,7 +798,7 @@ def build_state(
     if settings.futures_enabled:
         from snowball.futures.engine import attach_futures_lane
 
-        settings.assert_futures_paper_only()
+        settings.assert_futures_config()
         attach_futures_lane(state)
     market = market or CcxtMarket(settings)
     return state, Engine(state, market)
@@ -900,7 +900,7 @@ def main() -> None:
     if settings.futures_enabled and state.futures_engine is not None:
         futures_engine = state.futures_engine
         t_f = threading.Thread(
-            target=futures_engine.run_forever, name="snowball-futures-paper", daemon=True
+            target=futures_engine.run_forever, name="snowball-futures", daemon=True
         )
         t_f.start()
         extra_threads.append(t_f)
@@ -912,6 +912,9 @@ def main() -> None:
                     "sqlite": str(settings.futures_sqlite_path),
                     "mark_source": state.futures_mark_source,
                     "strategies": settings.futures_strategy_list,
+                    "futures_mode": settings.futures_mode,
+                    "futures_live_enabled": settings.futures_live_enabled,
+                    "budget_pct": settings.futures_account_budget_pct,
                 }
             },
         )

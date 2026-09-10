@@ -49,6 +49,10 @@ class AppState:
     futures_last_tick_at: datetime | None = None
     futures_mark_source: str = "coinbase_perp"
     futures_engine: object | None = None
+    futures_session_states: dict[str, str] = field(default_factory=dict)
+    futures_account_value_usd: float | None = None
+    futures_budget_usd: float | None = None
+    futures_per_index_allotment_usd: float | None = None
 
     def marks(self) -> dict[str, float]:
         out: dict[str, float] = {}

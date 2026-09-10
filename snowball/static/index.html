@@ -209,22 +209,22 @@
     </div>
     <div class="card">
       <h2 class="section">Future Trader</h2>
-      <div class="warn-banner">PAPER ONLY · Coinbase perps (SPY/QQQ) · isolated book (data/snowball_futures.db) · never live futures</div>
-      <p class="note">Long-only daily SMA 20/50 + Donchian on Coinbase Advanced Trade perpetual futures. Crypto live ledger untouched. Dual-gated live path disabled in v1.</p>
+      <div class="warn-banner" id="futuresBanner">Session day-trade · Coinbase perps (SPY/QQQ) · isolated book · dual-gated live</div>
+      <p class="note">Long-only session engine (ET): entry ~09:25–09:30 (late catch-up OK), exit ~15:55–16:00 if green else hold overnight. Budget = 10% account value, 50/50 SPY/QQQ. Max 1 lot/index. Crypto ledger untouched.</p>
       <div class="muted" id="futuresMeta"></div>
       <div class="kpis" style="margin-top:10px">
-        <div class="card"><div class="label">Futures Equity</div><div class="value" id="futuresEquity">—</div></div>
-        <div class="card"><div class="label">Futures Cash</div><div class="value" id="futuresCash">—</div></div>
+        <div class="card"><div class="label">Futures mode / budget</div><div class="value" id="futuresModeBudget">—</div></div>
+        <div class="card"><div class="label">Account / allotment</div><div class="value" id="futuresAllot">—</div></div>
         <div class="card"><div class="label">Futures Daily PnL / kill</div><div class="value" id="futuresDpnl">—</div></div>
         <div class="card"><div class="label">Futures Open lots</div><div class="value" id="futuresOpen">—</div></div>
       </div>
-      <div class="label" style="margin-top:10px">Products (paper)</div>
+      <div class="label" style="margin-top:10px">Products / session</div>
       <table>
         <thead>
           <tr>
             <th>Product</th><th>Last</th>
-            <th>1d 20</th><th>1d 50</th><th>SMA 1d</th>
-            <th>Donchian 1d</th>
+            <th colspan="2">Session state</th><th>Signal</th>
+            <th>Allotment</th>
             <th>Lots</th><th>Src</th>
           </tr>
         </thead>
@@ -485,13 +485,23 @@
       if (fut.enabled) {
         const fr = fut.risk || {};
         const fst = fut.status || {};
+        const fses = fut.session || {};
+        const live = (fut.mode || "") === "live";
+        const ban = $("futuresBanner");
+        if (ban) ban.textContent = live
+          ? "LIVE · dual-gated · 10% budget · 50/50 SPY/QQQ · never-sell-red exits"
+          : "PAPER · session day-trade · isolated book · dual gate off";
         $("futuresMeta").textContent =
-          `${fut.label || "Future Trader"} · marks=${fut.mark_source || "?"} · products=${(fut.products||[]).join(",")}` +
+          `${fut.label || "Future Trader"} · mode=${fut.mode || "?"} · marks=${fut.mark_source || "?"} · products=${(fut.products||[]).join(",")}` +
           (fst.strategies ? ` · ${(fst.strategies||[]).join("+")}` : "") +
+          (fses.entry_window_et ? ` · entry ${fses.entry_window_et}` : "") +
+          (fses.exit_window_et ? ` · exit ${fses.exit_window_et}` : "") +
           (fut.last_tick_at ? ` · tick ${fut.last_tick_at}` : "") +
           (fst.block_reasons && fst.block_reasons.length ? ` · blocked:${fst.block_reasons.join(",")}` : "");
-        $("futuresEquity").textContent = usd(fr.equity_usd);
-        $("futuresCash").textContent = usd(fr.cash_usd);
+        const mb = $("futuresModeBudget");
+        if (mb) mb.textContent = `${fut.mode || "?"} · ${((fr.budget_pct||0)*100).toFixed(0)}% cap · eq ${usd(fr.equity_usd)}`;
+        const al = $("futuresAllot");
+        if (al) al.textContent = `acct ${usd(fr.account_value_usd)} · budget ${usd(fr.budget_usd)} · /index ${usd(fr.per_index_allotment_usd)}`;
         const fdp = fr.daily_pnl_usd;
         $("futuresDpnl").innerHTML = `<span class="${cls(fdp)}">${usd(fdp)}</span> <span class="muted">/ ${usd(fr.daily_loss_kill_usd)}</span>`;
         $("futuresOpen").textContent = `${fr.open_positions || 0}`;
@@ -499,10 +509,9 @@
           <tr>
             <td>${p.product}${p.paused ? ' <span class="tag imp3">paused</span>' : ""}</td>
             <td>${num(p.last, 4)}</td>
-            <td>${num(p.sma_fast_1d ?? p.sma_fast, 4)}</td>
-            <td>${num(p.sma_slow_1d ?? p.sma_slow, 4)}</td>
+            <td colspan="2">${p.session_state || p.signal || "—"}</td>
             <td>${p.signal_1d || p.signal || "hold"}</td>
-            <td>${p.signal_donchian_1d || "—"}</td>
+            <td>${usd(p.allotment_usd)}</td>
             <td>${p.open_count}/${p.max_open}</td>
             <td>${p.mark_source || fut.mark_source || ""}</td>
           </tr>`).join("") || `<tr><td colspan="8" class="muted">no futures marks yet</td></tr>`;

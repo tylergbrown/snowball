@@ -1,10 +1,11 @@
-"""Dashboard / API snapshot for the isolated Future Trader paper book."""
+"""Dashboard / API snapshot for the isolated Future Trader book."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from snowball.futures.market import DEFAULT_FUTURES_PRODUCTS, normalize_futures_product
+from snowball.futures.session import session_times_from_settings
 from snowball.halt import halt_active, trading_enabled
 from snowball.models import utcnow
 from snowball.risk import daily_loss_breached
@@ -40,7 +41,10 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
         utc_date, start_eq, killed = ledger.ensure_utc_day(now, equity)
         daily_pnl = equity - start_eq
         halted = halt_active(settings.halt_file)
-        can_trade = trading_enabled(settings) and settings.futures_mode == "paper"
+        live = settings.futures_live_orders_permitted()
+        can_trade = trading_enabled(settings) and (
+            settings.futures_mode == "paper" or live
+        )
 
         positions = []
         for pos in ledger.open_positions():
@@ -58,6 +62,9 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
                     "unrealized_pnl": u_pnl,
                     "opened_at": pos.opened_at.isoformat(),
                     "strategy": pos.strategy,
+                    "session_state": (state.futures_session_states or {}).get(
+                        pos.product, "open_today"
+                    ),
                 }
             )
 
@@ -89,6 +96,13 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
             snap = state.futures_pairs.get(product)
             paused_until = ledger.pair_paused_until(product, now)
             pause_info = pause_rows.get(product)
+            sess = (state.futures_session_states or {}).get(product)
+            if sess is None:
+                from snowball.futures.session import classify_session_state
+
+                sess = classify_session_state(
+                    open_lots=ledger.open_positions(product), now=now
+                )
             pairs.append(
                 {
                     "product": product,
@@ -112,14 +126,16 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
                     "paused_until": paused_until.isoformat() if paused_until else None,
                     "pause_reason": pause_info.get("reason") if pause_info else None,
                     "mark_source": state.futures_mark_source,
+                    "session_state": sess,
+                    "allotment_usd": state.futures_per_index_allotment_usd,
                 }
             )
 
         block: list[str] = []
-        if settings.futures_mode != "paper":
-            block.append("futures_mode_not_paper")
-        if settings.futures_live_enabled:
-            block.append("futures_live_enabled_refused_in_v1")
+        if settings.futures_mode == "live" and not settings.futures_live_enabled:
+            block.append("futures_live_gate_incomplete")
+        if settings.futures_mode != "live" and settings.futures_live_enabled:
+            block.append("futures_live_gate_incomplete")
         if halted:
             block.append("halt_file")
         if not can_trade:
@@ -132,17 +148,33 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
         ):
             block.append("daily_loss_kill_pending")
 
+        times = session_times_from_settings(settings)
+        mode_label = "live" if live else "paper"
+        label = (
+            "Future Trader — session day-trade LIVE (dual-gated); 10% budget 50/50 SPY/QQQ"
+            if live
+            else "Future Trader — session day-trade paper; isolated book"
+        )
+
         return {
             "enabled": True,
             "ts": now.isoformat(),
             "last_tick_at": state.futures_last_tick_at.isoformat()
             if state.futures_last_tick_at
             else None,
-            "mode": "paper",
+            "mode": mode_label,
             "futures_mode": settings.futures_mode,
             "futures_live_enabled": settings.futures_live_enabled,
-            "label": "Future Trader — Coinbase perps paper; isolated book; never live futures",
+            "label": label,
             "mark_source": state.futures_mark_source,
+            "session": {
+                "timezone": "America/New_York",
+                "entry_window_et": f"{times['entry_start'].strftime('%H:%M')}–{times['entry_end'].strftime('%H:%M')} (late catch-up until exit)",
+                "exit_window_et": f"{times['exit_start'].strftime('%H:%M')}–{times['exit_end'].strftime('%H:%M')}",
+                "states": dict(state.futures_session_states or {}),
+                "weekday_only": True,
+                "holiday_calendar": False,
+            },
             "status": {
                 "halt_active": halted,
                 "trading_enabled": can_trade,
@@ -150,6 +182,7 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
                 "utc_date": utc_date,
                 "block_reasons": block,
                 "strategies": settings.futures_strategy_list,
+                "live_orders_permitted": live,
             },
             "risk": {
                 "bankroll_usd": settings.futures_bankroll_usd,
@@ -161,6 +194,10 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
                 "unrealized_pnl_usd": ledger.unrealized_pnl(marks),
                 "max_positions_per_pair": settings.futures_max_positions,
                 "max_position_notional_usd": settings.futures_max_notional_usd,
+                "account_value_usd": state.futures_account_value_usd,
+                "budget_pct": settings.futures_account_budget_pct,
+                "budget_usd": state.futures_budget_usd,
+                "per_index_allotment_usd": state.futures_per_index_allotment_usd,
                 "open_positions": len(positions),
                 "max_book_positions": settings.futures_max_positions * max(1, len(products)),
                 "min_take_profit_pct": settings.min_take_profit_pct,

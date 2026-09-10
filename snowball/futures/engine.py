@@ -1,4 +1,14 @@
-"""Future Trader paper engine — isolated sqlite; never places live futures/crypto orders."""
+"""Future Trader — session day-trade engine (paper + dual-gated live INTX perps).
+
+Primary path is America/New_York session longs on SPY/QQQ perps:
+  • Budget = futures_account_budget_pct (default 10%) of Coinbase account value
+  • 50/50 notional split across products; max 1 open lot per index
+  • Entry ~09:25–09:30 ET (late catch-up until exit window if bot was down)
+  • Exit ~15:55–16:00 ET only if green (mark >= entry); else hold overnight
+  • Overnight losers: no new entry while lot remains open
+
+Legacy sma_1d/donchian_1d paper path remains when session_day is not configured.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +38,16 @@ from snowball.futures.market import (
     DEFAULT_FUTURES_PRODUCTS,
     CoinbaseFuturesMarket,
     normalize_futures_product,
+    parse_futures_order_fill,
+    round_amount_down,
+)
+from snowball.futures.session import (
+    classify_session_state,
+    entry_allowed,
+    et_date_str,
+    in_exit_window,
+    session_times_from_settings,
+    to_et,
 )
 from snowball.strategy import (
     DONCHIAN_1D,
@@ -42,6 +62,8 @@ from snowball.strategy import (
 
 log = logging.getLogger("snowball.futures.engine")
 
+SESSION_STRATEGY = "session_day"
+
 
 def _futures_risk_ctx(
     settings: Settings,
@@ -55,8 +77,9 @@ def _futures_risk_ctx(
     cash_usd: float,
     requested_notional: float,
     cooldown_seconds: int,
+    max_notional: float | None = None,
 ) -> RiskContext:
-    """Always paper + live_enabled=False so crypto live flags cannot leak into futures."""
+    live = settings.futures_live_orders_permitted()
     return RiskContext(
         now=now,
         trading_enabled=can_trade,
@@ -67,42 +90,57 @@ def _futures_risk_ctx(
         cash_usd=cash_usd,
         requested_notional=requested_notional,
         max_positions_per_pair=settings.futures_max_positions,
-        max_position_notional_usd=settings.futures_max_notional_usd,
+        max_position_notional_usd=(
+            float(max_notional)
+            if max_notional is not None
+            else settings.futures_max_notional_usd
+        ),
         entry_cooldown=timedelta(seconds=cooldown_seconds),
-        mode="paper",
-        live_enabled=False,
+        mode="live" if live else "paper",
+        live_enabled=True if live else False,
     )
 
 
-def _refuse_live_futures(settings: Settings) -> None:
-    """Hard gate: v1 is paper-only. Dual live gate for any future path."""
-    if settings.futures_mode != "paper":
+def _refuse_unless_paper_or_dual_live(settings: Settings) -> None:
+    """Paper always OK; live only when both futures flags true."""
+    if settings.futures_mode == "paper":
+        if settings.futures_live_enabled:
+            raise LiveTradingRefused(
+                "Futures trading refused: FUTURES_LIVE_ENABLED=true while "
+                "FUTURES_MODE is not live (dual gate required)."
+            )
+        return
+    if not settings.futures_live_orders_permitted():
         raise LiveTradingRefused(
             f"Futures trading refused: FUTURES_MODE={settings.futures_mode!r} "
-            "(Future Trader v1 is paper-only)."
-        )
-    if settings.futures_live_enabled:
-        raise LiveTradingRefused(
-            "Futures trading refused: FUTURES_LIVE_ENABLED=true but FUTURES_MODE "
-            "is not live (both required for any future live path)."
+            f"FUTURES_LIVE_ENABLED={settings.futures_live_enabled!r} "
+            "(both must be true for live futures orders)."
         )
 
 
-class FuturesPaperEngine:
-    """Long-only daily SMA/Donchian paper lane on Coinbase equity perps."""
+class FuturesEngine:
+    """Long-only session day-trade (primary) + optional legacy daily SMA paper lane."""
 
     def __init__(
         self, state: AppState, market: CoinbaseFuturesMarket | None = None
     ) -> None:
         self.state = state
+        self._entry_dates_et: dict[str, str] = {}
+        self._last_budget: dict[str, float] = {
+            "account_value_usd": 0.0,
+            "budget_usd": 0.0,
+            "per_index_usd": 0.0,
+        }
         if market is not None:
             self.market = market
         else:
             s = state.settings
+            allow = s.futures_live_orders_permitted()
             self.market = CoinbaseFuturesMarket(
                 api_key=s.coinbase_api_key,
                 api_secret=s.coinbase_api_secret,
                 api_passphrase=s.coinbase_api_passphrase,
+                allow_orders=allow,
             )
 
     def product_list(self) -> list[str]:
@@ -118,7 +156,7 @@ class FuturesPaperEngine:
         if not settings.futures_enabled:
             return
         try:
-            _refuse_live_futures(settings)
+            _refuse_unless_paper_or_dual_live(settings)
         except LiveTradingRefused as exc:
             log.error(str(exc))
             return
@@ -137,12 +175,14 @@ class FuturesPaperEngine:
         halted = halt_active(settings.halt_file)
         can_trade = trading_enabled(settings)
 
-        # Market I/O outside AppState.lock — same pattern as stocks.
         marks: dict[str, float] = {}
         for product in products:
             snap = self._update_pair(product)
             if snap.last is not None:
                 marks[product] = snap.last
+
+        # Recompute live account budget each session tick
+        self._refresh_budget(marks)
 
         equity = ledger.equity_usd(marks)
         utc_date, start_eq, killed = ledger.ensure_utc_day(now, equity)
@@ -177,27 +217,89 @@ class FuturesPaperEngine:
                 )
                 self._flatten_all(marks, reason="halt_flatten", now=now)
 
-        for product in products:
-            self._act_on_pair(
-                product=product,
-                now=now,
-                halted=halted,
-                can_trade=can_trade,
-                daily_killed=killed,
-                marks=marks,
-            )
+        if settings.futures_uses_session_engine():
+            for product in products:
+                self._act_session(
+                    product=product,
+                    now=now,
+                    halted=halted,
+                    can_trade=can_trade,
+                    daily_killed=killed,
+                    marks=marks,
+                )
+        else:
+            for product in products:
+                self._act_on_pair_legacy(
+                    product=product,
+                    now=now,
+                    halted=halted,
+                    can_trade=can_trade,
+                    daily_killed=killed,
+                    marks=marks,
+                )
 
+        # Dashboard session state
+        states: dict[str, str] = {}
+        for product in products:
+            lots = ledger.open_positions(product)
+            states[product] = classify_session_state(open_lots=lots, now=now)
+        self.state.futures_session_states = states
+        self.state.futures_account_value_usd = self._last_budget["account_value_usd"]
+        self.state.futures_budget_usd = self._last_budget["budget_usd"]
+        self.state.futures_per_index_allotment_usd = self._last_budget["per_index_usd"]
         self.state.futures_last_tick_at = now
         self.state.futures_mark_source = getattr(
             self.market, "mark_source", "coinbase_perp"
         )
+
+    def _refresh_budget(self, marks: dict[str, float]) -> None:
+        settings = self.state.settings
+        ledger = self.state.futures_ledger
+        assert ledger is not None
+        n = max(1, len(self.product_list()))
+        account_value = 0.0
+        if settings.futures_live_orders_permitted():
+            try:
+                crypto_marks = {}
+                try:
+                    crypto_marks = self.state.marks()
+                except Exception:  # noqa: BLE001
+                    crypto_marks = {}
+                account_value = float(
+                    self.market.fetch_account_value_usd(crypto_marks=crypto_marks)
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception(
+                    "futures account value fetch failed; falling back to ledger equity",
+                    extra={"data": {"error": str(exc)}},
+                )
+                account_value = float(ledger.equity_usd(marks))
+        else:
+            # Paper: use ledger equity (bankroll ± open MTM)
+            account_value = float(ledger.equity_usd(marks))
+            if account_value <= 0:
+                account_value = float(settings.futures_bankroll_usd)
+
+        pct = float(settings.futures_account_budget_pct)
+        budget = max(0.0, account_value * pct)
+        per_index = budget / float(n)
+        # Hard ceiling from FUTURES_MAX_NOTIONAL_USD
+        per_index = min(per_index, float(settings.futures_max_notional_usd))
+        self._last_budget = {
+            "account_value_usd": account_value,
+            "budget_usd": budget,
+            "per_index_usd": per_index,
+        }
+        # Sync paper cash display toward bankroll when paper; live keeps ledger as fill book
+        if not settings.futures_live_orders_permitted():
+            # Ensure paper cash can fund allotment (ledger already has bankroll)
+            pass
 
     def _update_pair(self, product: str) -> PairSnapshot:
         settings = self.state.settings
         snap = self.state.futures_pairs.get(product) or PairSnapshot(
             product=product, max_open=settings.futures_max_positions
         )
-        limit = settings.ohlcv_fetch_limit
         try:
             ticker = self.market.fetch_ticker(product)
             snap.last = ticker.last if ticker.last is not None else ticker.reference
@@ -208,58 +310,205 @@ class FuturesPaperEngine:
             log.exception("futures ticker failed", extra={"data": {"product": product}})
             snap.last_error = str(exc)
 
+        # Session engine skips SMA/Donchian as primary; still refresh if legacy strategies listed
         wanted = set(settings.futures_strategy_list)
-        frames = enabled_timeframes(settings.futures_strategy_list)
-        if not frames:
-            frames = ["1d"]
-        for timeframe in frames:
-            try:
-                rows = self.market.fetch_ohlcv(product, timeframe, limit)
-                closes = [float(r[4]) for r in rows]
-                highs = [float(r[2]) for r in rows]
-                lows = [float(r[3]) for r in rows]
-                candle_ts = None
-                if rows:
-                    candle_ts = datetime.fromtimestamp(
-                        float(rows[-1][0]) / 1000.0, tz=timezone.utc
-                    )
-                sig = crossover_signal(closes, settings.sma_fast, settings.sma_slow)
-                fast_v = sma(closes, settings.sma_fast)
-                slow_v = sma(closes, settings.sma_slow)
-                if timeframe == "1d" and SMA_1D in wanted:
-                    snap.sma_fast_1d = fast_v
-                    snap.sma_slow_1d = slow_v
-                    snap.signal_1d = sig.value
-                    snap.candle_ts_1d = candle_ts
-                    # Mirror into primary slots for display / trend gates
-                    if fast_v is not None:
-                        snap.sma_fast = fast_v
-                        snap.sma_slow = slow_v
-                        snap.signal = sig.value
-                        snap.candle_ts = candle_ts
-                if timeframe == "1d" and DONCHIAN_1D in wanted:
-                    high, low = donchian_channels(highs, lows)
-                    snap.donchian_high_1d = high
-                    snap.donchian_low_1d = low
-                    snap.signal_donchian_1d = donchian_breakout_signal(
-                        closes, highs, lows
-                    ).value
-                    if snap.candle_ts_1d is None:
+        if wanted - {SESSION_STRATEGY}:
+            limit = settings.ohlcv_fetch_limit
+            frames = enabled_timeframes(
+                [s for s in settings.futures_strategy_list if s != SESSION_STRATEGY]
+            )
+            for timeframe in frames:
+                try:
+                    rows = self.market.fetch_ohlcv(product, timeframe, limit)
+                    closes = [float(r[4]) for r in rows]
+                    highs = [float(r[2]) for r in rows]
+                    lows = [float(r[3]) for r in rows]
+                    candle_ts = None
+                    if rows:
+                        candle_ts = datetime.fromtimestamp(
+                            float(rows[-1][0]) / 1000.0, tz=timezone.utc
+                        )
+                    sig = crossover_signal(closes, settings.sma_fast, settings.sma_slow)
+                    fast_v = sma(closes, settings.sma_fast)
+                    slow_v = sma(closes, settings.sma_slow)
+                    if timeframe == "1d" and SMA_1D in wanted:
+                        snap.sma_fast_1d = fast_v
+                        snap.sma_slow_1d = slow_v
+                        snap.signal_1d = sig.value
                         snap.candle_ts_1d = candle_ts
-            except Exception as exc:  # noqa: BLE001
-                log.exception(
-                    "futures ohlcv failed",
-                    extra={"data": {"product": product, "timeframe": timeframe}},
-                )
-                snap.last_error = str(exc)
+                        if fast_v is not None:
+                            snap.sma_fast = fast_v
+                            snap.sma_slow = slow_v
+                            snap.signal = sig.value
+                            snap.candle_ts = candle_ts
+                    if timeframe == "1d" and DONCHIAN_1D in wanted:
+                        high, low = donchian_channels(highs, lows)
+                        snap.donchian_high_1d = high
+                        snap.donchian_low_1d = low
+                        snap.signal_donchian_1d = donchian_breakout_signal(
+                            closes, highs, lows
+                        ).value
+                        if snap.candle_ts_1d is None:
+                            snap.candle_ts_1d = candle_ts
+                except Exception as exc:  # noqa: BLE001
+                    log.exception(
+                        "futures ohlcv failed",
+                        extra={"data": {"product": product, "timeframe": timeframe}},
+                    )
+                    snap.last_error = str(exc)
+        elif SESSION_STRATEGY in wanted:
+            # Session: surface state in signal field for dashboard
+            ledger = self.state.futures_ledger
+            assert ledger is not None
+            lots = ledger.open_positions(product)
+            snap.signal = classify_session_state(open_lots=lots, now=utcnow())
+            snap.signal_1d = snap.signal
 
         ledger = self.state.futures_ledger
         assert ledger is not None
         snap.open_count = ledger.open_count(product)
+        snap.max_open = settings.futures_max_positions
         self.state.futures_pairs[product] = snap
         return snap
 
-    def _act_on_pair(
+    # --- Session day-trade path -------------------------------------------------
+
+    def _act_session(
+        self,
+        product: str,
+        now: datetime,
+        halted: bool,
+        can_trade: bool,
+        daily_killed: bool,
+        marks: dict[str, float],
+    ) -> None:
+        settings = self.state.settings
+        ledger = self.state.futures_ledger
+        assert ledger is not None
+        times = session_times_from_settings(settings)
+        lots = ledger.open_positions(product)
+        mark = marks.get(product)
+        snap = self.state.futures_pairs[product]
+        if mark is None and snap.last is not None:
+            mark = snap.last
+
+        # Exit window first: close green only
+        if lots and in_exit_window(
+            now, start=times["exit_start"], end=times["exit_end"]
+        ):
+            green_lots: list[Position] = []
+            for lot in lots:
+                if mark is None or mark < lot.entry_price:
+                    log.info(
+                        "futures session hold overnight (red/flat)",
+                        extra={
+                            "data": {
+                                "product": product,
+                                "position_id": lot.id,
+                                "mark": mark,
+                                "entry": lot.entry_price,
+                            }
+                        },
+                    )
+                    continue
+                # Session floor: mark >= entry. Honor never_sell_red (already green).
+                # Do NOT require min_take_profit_pct here — day-trade would never exit.
+                if settings.never_sell_red and mark < lot.entry_price:
+                    continue
+                green_lots.append(lot)
+            if green_lots:
+                ctx = _futures_risk_ctx(
+                    settings,
+                    now=now,
+                    halted=halted,
+                    can_trade=can_trade,
+                    daily_killed=daily_killed,
+                    open_count_for_pair=len(lots),
+                    last_entry_at=ledger.last_entry_at(product, SESSION_STRATEGY),
+                    cash_usd=ledger.cash_usd(),
+                    requested_notional=self._last_budget["per_index_usd"],
+                    cooldown_seconds=0,
+                    max_notional=max(
+                        self._last_budget["per_index_usd"],
+                        settings.futures_max_notional_usd,
+                    ),
+                )
+                ok, reason = allow_exit(ctx)
+                if ok:
+                    self._close_lots(
+                        product,
+                        green_lots,
+                        marks,
+                        reason=f"{SESSION_STRATEGY}:session_close",
+                        now=now,
+                    )
+                else:
+                    log.info(
+                        "futures session exit blocked",
+                        extra={"data": {"product": product, "reason": reason}},
+                    )
+            return
+
+        # Entry: only when flat (max 1 lot); overnight open lot blocks new entry
+        if lots:
+            return
+        if not entry_allowed(
+            now, entry_start=times["entry_start"], exit_start=times["exit_start"]
+        ):
+            return
+        today_et = et_date_str(now)
+        if self._entry_dates_et.get(product) == today_et:
+            return  # already entered (or attempted) this ET day
+
+        per_index = float(self._last_budget["per_index_usd"])
+        # Remaining budget after other open FT exposure
+        open_notional = sum(
+            p.notional_usd
+            for prod in self.product_list()
+            for p in ledger.open_positions(prod)
+        )
+        budget_left = max(0.0, float(self._last_budget["budget_usd"]) - open_notional)
+        notional = min(per_index, budget_left, float(settings.futures_max_notional_usd))
+        if notional <= 1.0:
+            log.info(
+                "futures session entry skipped small notional",
+                extra={"data": {"product": product, "notional": notional}},
+            )
+            return
+
+        ctx = _futures_risk_ctx(
+            settings,
+            now=now,
+            halted=halted,
+            can_trade=can_trade,
+            daily_killed=daily_killed,
+            open_count_for_pair=0,
+            last_entry_at=None,
+            cash_usd=max(ledger.cash_usd(), notional),
+            requested_notional=notional,
+            cooldown_seconds=0,
+            max_notional=max(notional, settings.futures_max_notional_usd),
+        )
+        ok, reason = allow_entry(ctx)
+        if not ok:
+            log.info(
+                "futures session entry blocked",
+                extra={"data": {"product": product, "reason": reason}},
+            )
+            return
+        self._entry_dates_et[product] = today_et
+        self._open_lot(
+            product,
+            marks,
+            reason=f"{SESSION_STRATEGY}:session_enter",
+            now=now,
+            strategy=SESSION_STRATEGY,
+            notional_usd=notional,
+        )
+
+    # --- Legacy SMA/Donchian paper path ----------------------------------------
+
+    def _act_on_pair_legacy(
         self,
         product: str,
         now: datetime,
@@ -270,6 +519,8 @@ class FuturesPaperEngine:
     ) -> None:
         settings = self.state.settings
         for strategy_id in settings.futures_strategy_list:
+            if strategy_id == SESSION_STRATEGY:
+                continue
             self._act_on_strategy(
                 product=product,
                 strategy_id=strategy_id,
@@ -295,7 +546,6 @@ class FuturesPaperEngine:
         assert ledger is not None
         snap = self.state.futures_pairs[product]
 
-        # Skip strategies that lack indicator data
         if (
             sma_fast_for_strategy(snap, strategy_id) is None
             or sma_slow_for_strategy(snap, strategy_id) is None
@@ -382,16 +632,6 @@ class FuturesPaperEngine:
             )
             ok, reason = allow_exit(ctx)
             if not ok:
-                log.info(
-                    "futures exit blocked",
-                    extra={
-                        "data": {
-                            "product": product,
-                            "strategy": strategy_id,
-                            "reason": reason,
-                        }
-                    },
-                )
                 return
             self._close_lots(product, lots_to_close, marks, reason=exit_reason, now=now)
             return
@@ -437,7 +677,12 @@ class FuturesPaperEngine:
             f"{strategy_id}:scale_in" if is_scale_in else f"{strategy_id}:enter"
         )
         self._open_lot(
-            product, marks, reason=entry_reason, now=now, strategy=strategy_id
+            product,
+            marks,
+            reason=entry_reason,
+            now=now,
+            strategy=strategy_id,
+            notional_usd=settings.futures_max_notional_usd,
         )
 
     def _open_lot(
@@ -447,23 +692,46 @@ class FuturesPaperEngine:
         reason: str,
         now: datetime,
         strategy: str,
+        notional_usd: float | None = None,
     ) -> None:
         settings = self.state.settings
-        _refuse_live_futures(settings)
+        _refuse_unless_paper_or_dual_live(settings)
         ledger = self.state.futures_ledger
         assert ledger is not None
         snap = self.state.futures_pairs[product]
         ticker = Ticker(
             product=product, last=snap.last, bid=snap.bid, ask=snap.ask, ts=now
         )
+        target = float(
+            notional_usd
+            if notional_usd is not None
+            else settings.futures_max_notional_usd
+        )
+        if settings.futures_live_orders_permitted():
+            self._open_lot_live(
+                product=product,
+                ticker=ticker,
+                reason=reason,
+                now=now,
+                strategy=strategy,
+                notional_usd=target,
+            )
+            return
         px = fill_price(ticker, "buy", settings.slippage_bps)
-        notional = min(settings.futures_max_notional_usd, ledger.cash_usd())
+        notional = min(target, ledger.cash_usd())
         if notional <= 0:
             return
+        # Top-up paper cash if budget-based notional exceeds cash (session paper)
+        if ledger.cash_usd() + 1e-9 < notional:
+            try:
+                ledger.set_cash_usd(max(ledger.cash_usd(), notional * 2), ts=now)
+            except Exception:  # noqa: BLE001
+                log.exception("futures paper cash top-up failed")
+            notional = min(target, ledger.cash_usd())
         pos, fill = ledger.open_buy(
             product=product,
             fill_px=px,
-            notional_usd=settings.futures_max_notional_usd,
+            notional_usd=notional,
             slippage_bps=settings.slippage_bps,
             fee_usd=0.0,
             reason=reason,
@@ -483,6 +751,95 @@ class FuturesPaperEngine:
                     "reason": reason,
                     "position_id": pos.id,
                     "mark_source": self.state.futures_mark_source,
+                    "et": to_et(now).isoformat(),
+                }
+            },
+        )
+
+    def _open_lot_live(
+        self,
+        product: str,
+        ticker: Ticker,
+        reason: str,
+        now: datetime,
+        strategy: str,
+        notional_usd: float,
+    ) -> None:
+        settings = self.state.settings
+        if not settings.futures_live_orders_permitted():
+            raise LiveTradingRefused("futures live open refused: dual gate not set")
+        ledger = self.state.futures_ledger
+        assert ledger is not None
+        ref = ticker.reference or ticker.last
+        if ref is None or ref <= 0:
+            log.warning(
+                "futures live buy skipped: no mark",
+                extra={"data": {"product": product}},
+            )
+            return
+        amount = round_amount_down(notional_usd / float(ref), 0.01)
+        if amount < 0.01:
+            log.info(
+                "futures live buy skipped: amount below min",
+                extra={
+                    "data": {
+                        "product": product,
+                        "notional": notional_usd,
+                        "ref": ref,
+                        "amount": amount,
+                    }
+                },
+            )
+            return
+        try:
+            order = self.market.create_swap_market_order(
+                product, "buy", amount, leverage=1.0, reduce_only=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception(
+                "futures live buy failed",
+                extra={"data": {"product": product, "error": str(exc)}},
+            )
+            return
+        fill_px, fill_qty, fee_usd = parse_futures_order_fill(order)
+        if fill_px <= 0 or fill_qty <= 0:
+            log.error(
+                "futures live buy unsettled",
+                extra={"data": {"product": product, "order_id": order.get("id")}},
+            )
+            return
+        # Ensure ledger can record (futures book is separate; top-up cash for accounting)
+        cost = fill_qty * fill_px + fee_usd
+        if ledger.cash_usd() + 1e-9 < cost:
+            try:
+                ledger.set_cash_usd(cost * 2, ts=now)
+            except Exception:  # noqa: BLE001
+                log.exception("futures live ledger cash sync failed")
+        pos, fill = ledger.open_buy(
+            product=product,
+            fill_px=fill_px,
+            notional_usd=fill_qty * fill_px,
+            slippage_bps=0.0,
+            fee_usd=fee_usd,
+            reason=reason,
+            ts=now,
+            strategy=strategy,
+        )
+        self.state.futures_pairs[product].open_count = ledger.open_count(product)
+        log.warning(
+            "futures LIVE buy",
+            extra={
+                "data": {
+                    "product": product,
+                    "strategy": strategy,
+                    "qty": fill_qty,
+                    "price": fill_px,
+                    "notional": fill.notional_usd,
+                    "fee": fee_usd,
+                    "reason": reason,
+                    "position_id": pos.id,
+                    "order_id": order.get("id"),
+                    "et": to_et(now).isoformat(),
                 }
             },
         )
@@ -496,34 +853,40 @@ class FuturesPaperEngine:
         now: datetime,
     ) -> None:
         settings = self.state.settings
-        _refuse_live_futures(settings)
+        _refuse_unless_paper_or_dual_live(settings)
         ledger = self.state.futures_ledger
         assert ledger is not None
         snap = self.state.futures_pairs[product]
         ticker = Ticker(
             product=product, last=snap.last, bid=snap.bid, ask=snap.ask, ts=now
         )
+        if settings.futures_live_orders_permitted():
+            self._close_lots_live(product, lots, ticker, reason=reason, now=now)
+            return
         paper_px = fill_price(ticker, "sell", settings.slippage_bps)
         for lot in lots:
-            # Strategy exits already gated; emergency may sell red.
             if not is_emergency_flatten_reason(reason):
-                ok_sw, reason_sw = strategy_exit_allowed(
-                    lot,
-                    paper_px,
-                    min_take_profit_pct=settings.min_take_profit_pct,
-                    never_sell_red=settings.never_sell_red,
-                )
-                if not ok_sw:
-                    log.info(
-                        "futures close skipped never_sell_red",
-                        extra={
-                            "data": {
-                                "product": product,
-                                "position_id": lot.id,
-                                "reason": reason_sw,
-                            }
-                        },
+                # Session closes already gated to green; legacy uses strategy_exit_allowed
+                if SESSION_STRATEGY not in reason:
+                    ok_sw, reason_sw = strategy_exit_allowed(
+                        lot,
+                        paper_px,
+                        min_take_profit_pct=settings.min_take_profit_pct,
+                        never_sell_red=settings.never_sell_red,
                     )
+                    if not ok_sw:
+                        log.info(
+                            "futures close skipped never_sell_red",
+                            extra={
+                                "data": {
+                                    "product": product,
+                                    "position_id": lot.id,
+                                    "reason": reason_sw,
+                                }
+                            },
+                        )
+                        continue
+                elif settings.never_sell_red and paper_px < lot.entry_price:
                     continue
             fill = ledger.close_position(
                 position_id=lot.id,
@@ -561,6 +924,85 @@ class FuturesPaperEngine:
             log.info("futures paper sell", extra={"data": sell_data})
         self.state.futures_pairs[product].open_count = ledger.open_count(product)
 
+    def _close_lots_live(
+        self,
+        product: str,
+        lots: list[Position],
+        ticker: Ticker,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        settings = self.state.settings
+        ledger = self.state.futures_ledger
+        assert ledger is not None
+        for lot in lots:
+            if not is_emergency_flatten_reason(reason):
+                ref = ticker.reference or ticker.last
+                if settings.never_sell_red and ref is not None and ref < lot.entry_price:
+                    log.info(
+                        "futures live close skipped never_sell_red",
+                        extra={"data": {"product": product, "position_id": lot.id}},
+                    )
+                    continue
+            amount = round_amount_down(lot.qty, 0.01)
+            if amount < 0.01:
+                continue
+            try:
+                order = self.market.create_swap_market_order(
+                    product, "sell", amount, leverage=1.0, reduce_only=True
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception(
+                    "futures live sell failed",
+                    extra={
+                        "data": {
+                            "product": product,
+                            "position_id": lot.id,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                continue
+            fill_px, fill_qty, fee_usd = parse_futures_order_fill(order)
+            if fill_px <= 0 or fill_qty <= 0:
+                log.error(
+                    "futures live sell unsettled",
+                    extra={
+                        "data": {
+                            "product": product,
+                            "position_id": lot.id,
+                            "order_id": order.get("id"),
+                        }
+                    },
+                )
+                continue
+            fill = ledger.close_position(
+                position_id=lot.id,
+                fill_px=fill_px,
+                slippage_bps=0.0,
+                fee_usd=fee_usd,
+                reason=reason,
+                ts=now,
+            )
+            realized = (fill.price - lot.entry_price) * fill.qty - fill.fee_usd
+            log.warning(
+                "futures LIVE sell",
+                extra={
+                    "data": {
+                        "product": product,
+                        "strategy": lot.strategy,
+                        "qty": fill.qty,
+                        "price": fill.price,
+                        "reason": reason,
+                        "position_id": lot.id,
+                        "realized": realized,
+                        "order_id": order.get("id"),
+                        "et": to_et(now).isoformat(),
+                    }
+                },
+            )
+        self.state.futures_pairs[product].open_count = ledger.open_count(product)
+
     def _flatten_all(
         self, marks: dict[str, float], reason: str, now: datetime
     ) -> None:
@@ -574,12 +1016,16 @@ class FuturesPaperEngine:
     def run_forever(self) -> None:
         interval = max(15.0, float(self.state.settings.futures_poll_seconds))
         log.info(
-            "Future Trader paper loop start",
+            "Future Trader loop start",
             extra={
                 "data": {
                     "poll_seconds": interval,
                     "products": self.product_list(),
                     "strategies": self.state.settings.futures_strategy_list,
+                    "futures_mode": self.state.settings.futures_mode,
+                    "futures_live_enabled": self.state.settings.futures_live_enabled,
+                    "session_engine": self.state.settings.futures_uses_session_engine(),
+                    "budget_pct": self.state.settings.futures_account_budget_pct,
                 }
             },
         )
@@ -596,25 +1042,34 @@ class FuturesPaperEngine:
                 time.sleep(0.2)
 
 
-def attach_futures_lane(state: AppState) -> FuturesPaperEngine | None:
+# Back-compat name used by tests / imports
+FuturesPaperEngine = FuturesEngine
+
+
+def attach_futures_lane(state: AppState) -> FuturesEngine | None:
     """Create isolated futures ledger + engine if FUTURES_ENABLED."""
     settings = state.settings
     if not settings.futures_enabled:
         log.info("Future Trader lane disabled")
         return None
-    settings.assert_futures_paper_only()
+    settings.assert_futures_config()
     ledger = PaperLedger(settings.futures_sqlite_path, settings.futures_bankroll_usd)
     state.futures_ledger = ledger
     state.futures_mark_source = "coinbase_perp"
+    state.futures_session_states = {}
+    state.futures_account_value_usd = None
+    state.futures_budget_usd = None
+    state.futures_per_index_allotment_usd = None
     for product in settings.futures_product_list or list(DEFAULT_FUTURES_PRODUCTS):
         pid = normalize_futures_product(product)
         state.futures_pairs[pid] = PairSnapshot(
             product=pid, max_open=settings.futures_max_positions
         )
-    engine = FuturesPaperEngine(state)
+    engine = FuturesEngine(state)
     state.futures_engine = engine
+    live = settings.futures_live_orders_permitted()
     log.warning(
-        "Future Trader paper lane attached",
+        "Future Trader lane attached",
         extra={
             "data": {
                 "sqlite": str(settings.futures_sqlite_path),
@@ -624,6 +1079,9 @@ def attach_futures_lane(state: AppState) -> FuturesPaperEngine | None:
                 "mark_source": "coinbase_perp",
                 "futures_mode": settings.futures_mode,
                 "futures_live_enabled": settings.futures_live_enabled,
+                "live_orders": live,
+                "budget_pct": settings.futures_account_budget_pct,
+                "session_engine": settings.futures_uses_session_engine(),
             }
         },
     )
