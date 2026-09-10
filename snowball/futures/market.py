@@ -235,7 +235,44 @@ class CoinbaseFuturesMarket:
         self, *, crypto_marks: dict[str, float] | None = None
     ) -> float:
         bal = self.fetch_balance_raw()
-        return estimate_account_value_usd(bal, crypto_marks=crypto_marks)
+        marks = dict(crypto_marks or {})
+        totals = bal.get("total") if isinstance(bal.get("total"), dict) else {}
+        # Price any non-stable balances not already marked (so FT budget
+        # includes open crypto MTM even before the crypto engine ticks).
+        for ccy, amt in (totals or {}).items():
+            if str(ccy).upper() in _STABLES:
+                continue
+            try:
+                qty = float(amt or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            product = f"{str(ccy).upper()}-USD"
+            if product in marks and marks[product] > 0:
+                continue
+            # Already matched via base in estimate; still need a price
+            have = False
+            for prod, px in marks.items():
+                if prod.split("-")[0].upper() == str(ccy).upper() and px > 0:
+                    have = True
+                    break
+            if have:
+                continue
+            try:
+                raw = self._exchange.fetch_ticker(f"{ccy}/USD")  # type: ignore[attr-defined]
+                last = raw.get("last")
+                if last is not None and float(last) > 0:
+                    marks[product] = float(last)
+            except Exception:
+                try:
+                    raw = self._exchange.fetch_ticker(f"{ccy}/USDC")  # type: ignore[attr-defined]
+                    last = raw.get("last")
+                    if last is not None and float(last) > 0:
+                        marks[product] = float(last)
+                except Exception:
+                    log.debug("no mark for balance asset %s", ccy)
+        return estimate_account_value_usd(bal, crypto_marks=marks)
 
     def create_swap_market_order(
         self,
