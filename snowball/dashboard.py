@@ -12,6 +12,7 @@ from snowball.halt import clear_halt, write_halt
 from snowball.snapshot import build_snapshot
 from snowball.stocks.snapshot import build_stocks_snapshot
 from snowball.futures.snapshot import build_futures_snapshot
+from snowball.crash.snapshot import build_crash_snapshot
 from snowball.state import AppState
 
 log = logging.getLogger("snowball.dashboard")
@@ -89,5 +90,9 @@ def create_app(state: AppState) -> FastAPI:
     @app.get("/api/futures")
     def futures() -> JSONResponse:
         return JSONResponse(build_futures_snapshot(state))
+
+    @app.get("/api/crash")
+    def crash() -> JSONResponse:
+        return JSONResponse(build_crash_snapshot(state))
 
     return app

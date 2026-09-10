@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     slippage_bps: float = 5.0
     taker_fee_bps: float = 0.0
     # Max fraction of total Coinbase account value the crypto lane may deploy (open notional).
-    crypto_account_budget_pct: float = 0.40
+    crypto_account_budget_pct: float = 0.35
 
     sqlite_path: Path = Path("./data/snowball.db")
     heartbeat_path: Path = Path("./data/heartbeat")
@@ -136,7 +136,7 @@ class Settings(BaseSettings):
     stock_max_notional_usd: float = 100.0
     stock_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value stock lane may use (INTX perps, lev=1)
-    stock_account_budget_pct: float = 0.40
+    stock_account_budget_pct: float = 0.35
     stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d,rsi_15m,bb_15m,rsi_1d,bb_1d"
     stock_poll_seconds: float = 60.0
     # Cap symbols that the engine may trade (marks universe may be larger)
@@ -173,11 +173,28 @@ class Settings(BaseSettings):
     futures_exit_start_et: str = "15:55"
     futures_exit_end_et: str = "16:00"
 
+
+    # --- Crash Guard (short hedge on SPY/QQQ INTX; dual-gated live) ---
+    crash_enabled: bool = True
+    crash_mode: Literal["paper", "live"] = "paper"
+    # Dual gate for live crash shorts: CRASH_MODE=live AND CRASH_LIVE_ENABLED=true
+    crash_live_enabled: bool = False
+    crash_sqlite_path: Path = Path("./data/snowball_crash.db")
+    crash_bankroll_usd: float = 1000.0
+    # Max 1 open short lot per index
+    crash_max_positions: int = 1
+    crash_max_notional_usd: float = 500.0
+    crash_daily_loss_kill_usd: float = 25.0
+    # Fraction of total Coinbase account value Crash Guard may use (50/50 across products)
+    crash_account_budget_pct: float = 0.10
+    crash_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
+    crash_poll_seconds: float = 60.0
+
     coinbase_api_key: str = ""
     coinbase_api_secret: str = ""
     coinbase_api_passphrase: str = ""
 
-    @field_validator("mode", "stock_mode", "futures_mode", mode="before")
+    @field_validator("mode", "stock_mode", "futures_mode", "crash_mode", mode="before")
     @classmethod
     def _norm_mode(cls, v: object) -> object:
         if isinstance(v, str):
@@ -312,6 +329,7 @@ class Settings(BaseSettings):
             crypto_pct=self.crypto_account_budget_pct,
             stock_pct=self.stock_account_budget_pct,
             futures_pct=self.futures_account_budget_pct,
+            crash_pct=self.crash_account_budget_pct,
         )
 
     @property
@@ -353,6 +371,35 @@ class Settings(BaseSettings):
     def futures_uses_session_engine(self) -> bool:
         """True when session_day is configured (primary FT path)."""
         return "session_day" in self.futures_strategy_list
+
+
+    @property
+    def crash_product_list(self) -> list[str]:
+        items = [p.strip().upper() for p in self.crash_products.split(",") if p.strip()]
+        return items or ["SPY-PERP-INTX", "QQQ-PERP-INTX"]
+
+    def assert_crash_config(self) -> None:
+        """Refuse inconsistent dual-gate; allow paper or fully dual-gated live."""
+        if not self.crash_enabled:
+            return
+        if self.crash_mode == "live" and not self.crash_live_enabled:
+            raise LiveTradingRefused(
+                "Crash Guard refused: CRASH_MODE=live but CRASH_LIVE_ENABLED "
+                "is false (both required for live crash shorts)."
+            )
+        if self.crash_mode != "live" and self.crash_live_enabled:
+            raise LiveTradingRefused(
+                "Crash Guard refused: CRASH_LIVE_ENABLED=true while "
+                "CRASH_MODE is not live (dual gate required)."
+            )
+        if not (0.0 < float(self.crash_account_budget_pct) <= 1.0):
+            raise LiveTradingRefused(
+                f"CRASH_ACCOUNT_BUDGET_PCT must be in (0,1]; got {self.crash_account_budget_pct}"
+            )
+
+    def crash_live_orders_permitted(self) -> bool:
+        """Crash live shorts require BOTH crash flags. Default False."""
+        return self.crash_mode == "live" and self.crash_live_enabled is True
 
     def live_orders_permitted(self) -> bool:
         """Live ccxt orders require BOTH flags. Default config returns False."""

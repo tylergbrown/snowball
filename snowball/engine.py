@@ -965,6 +965,11 @@ def build_state(
 
         settings.assert_futures_config()
         attach_futures_lane(state)
+    if getattr(settings, "crash_enabled", False):
+        from snowball.crash.engine import attach_crash_lane
+
+        settings.assert_crash_config()
+        attach_crash_lane(state)
     market = market or CcxtMarket(settings)
     return state, Engine(state, market)
 
@@ -1087,6 +1092,28 @@ def main() -> None:
                     "futures_mode": settings.futures_mode,
                     "futures_live_enabled": settings.futures_live_enabled,
                     "budget_pct": settings.futures_account_budget_pct,
+                }
+            },
+        )
+
+    if getattr(settings, "crash_enabled", False) and getattr(state, "crash_engine", None) is not None:
+        crash_engine = state.crash_engine
+        t_cg = threading.Thread(
+            target=crash_engine.run_forever, name="snowball-crash", daemon=True
+        )
+        t_cg.start()
+        extra_threads.append(t_cg)
+        log.info(
+            "Crash Guard thread started",
+            extra={
+                "data": {
+                    "products": settings.crash_product_list,
+                    "sqlite": str(settings.crash_sqlite_path),
+                    "mark_source": state.crash_mark_source,
+                    "crash_mode": settings.crash_mode,
+                    "crash_live_enabled": settings.crash_live_enabled,
+                    "budget_pct": settings.crash_account_budget_pct,
+                    "live_orders": settings.crash_live_orders_permitted(),
                 }
             },
         )

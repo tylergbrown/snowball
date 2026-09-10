@@ -2,7 +2,7 @@
 
 Live stock trading uses Coinbase `{SYM}-PERP-INTX` only (no US equity spot).
 Requires STOCK_MODE=live AND STOCK_LIVE_ENABLED=true. Long-only. Never sell red.
-Budget = stock_account_budget_pct (default 40%) of Coinbase account value.
+Budget = stock_account_budget_pct (default 35%) of Coinbase account value.
 """
 
 from __future__ import annotations

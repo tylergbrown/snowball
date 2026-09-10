@@ -210,7 +210,7 @@
     <div class="card">
       <h2 class="section">Future Trader</h2>
       <div class="warn-banner" id="futuresBanner">Session day-trade · Coinbase perps (SPY/QQQ) · isolated book · dual-gated live</div>
-      <p class="note">Long-only session engine (ET): entry ~09:25–09:30 (late catch-up OK), exit ~15:55–16:00 if green else hold overnight. Budget = 10% account value, 50/50 SPY/QQQ. Max 1 lot/index. Crypto ledger untouched.</p>
+      <p class="note">Long-only session engine (ET): entry ~09:25–09:30 (late catch-up OK), exit ~15:55–16:00 if green else hold overnight. Budget = FUTURES_ACCOUNT_BUDGET_PCT (default 20%) account value, 50/50 SPY/QQQ. Max 1 lot/index. Crypto ledger untouched.</p>
       <div class="muted" id="futuresMeta"></div>
       <div class="kpis" style="margin-top:10px">
         <div class="card"><div class="label">Futures mode / budget</div><div class="value" id="futuresModeBudget">—</div></div>
@@ -251,6 +251,50 @@
         <tbody id="futuresFills"></tbody>
       </table>
     </div>
+
+    <div class="card">
+      <h2 class="section">Crash Guard</h2>
+      <div class="warn-banner" id="crashBanner">Short hedge · SPY/QQQ INTX · 10% budget · dual-gated live · never cover red</div>
+      <p class="note">Short-only crash hedge (isolated <code>data/snowball_crash.db</code>). Triggers: daily ≤−2%, RSI(14)≤30 dump context, or close &lt; BB lower with expanding width. Max 1 short/index, lev 1x, maker-limit. Cover only when short PnL ≥6%+1% fee buffer. Long books untouched.</p>
+      <div class="muted" id="crashMeta"></div>
+      <div class="kpis" style="margin-top:10px">
+        <div class="card"><div class="label">Crash mode / budget</div><div class="value" id="crashModeBudget">—</div></div>
+        <div class="card"><div class="label">Account / allotment</div><div class="value" id="crashAllot">—</div></div>
+        <div class="card"><div class="label">Crash Daily PnL / kill</div><div class="value" id="crashDpnl">—</div></div>
+        <div class="card"><div class="label">Crash Open shorts</div><div class="value" id="crashOpen">—</div></div>
+      </div>
+      <div class="label" style="margin-top:10px">Crash indices</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Product</th><th>Last</th><th>Daily%</th><th>RSI 1d</th>
+            <th>Trigger</th><th>Allot</th><th>Lots</th><th>Src</th>
+          </tr>
+        </thead>
+        <tbody id="crashPairs"></tbody>
+      </table>
+      <div class="label" style="margin-top:10px">Crash open shorts</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Id</th><th>Product</th><th>Side</th><th>Qty</th>
+            <th>Entry</th><th>Mark</th><th>Unrealized</th><th>PnL%</th>
+          </tr>
+        </thead>
+        <tbody id="crashPositions"></tbody>
+      </table>
+      <div class="label" style="margin-top:10px">Crash recent fills</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Product</th><th>Strategy</th><th>Side</th>
+            <th>Price</th><th>Notional</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="crashFills"></tbody>
+      </table>
+    </div>
+
     <div class="card">
       <h2 class="section">The Watcher</h2>
       <p class="note">Official central-bank / treasury RSS and optional calendar APIs. Research log only — no orders from this panel.</p>
@@ -489,7 +533,7 @@
         const live = (fut.mode || "") === "live";
         const ban = $("futuresBanner");
         if (ban) ban.textContent = live
-          ? "LIVE · dual-gated · 10% budget · 50/50 SPY/QQQ · never-sell-red exits"
+          ? "LIVE · dual-gated · budget% · 50/50 SPY/QQQ · never-sell-red exits"
           : "PAPER · session day-trade · isolated book · dual gate off";
         $("futuresMeta").textContent =
           `${fut.label || "Future Trader"} · mode=${fut.mode || "?"} · marks=${fut.mark_source || "?"} · products=${(fut.products||[]).join(",")}` +
@@ -530,6 +574,56 @@
           </tr>`).join("") || `<tr><td colspan="7" class="muted">no fills</td></tr>`;
       } else {
         $("futuresMeta").textContent = "Future Trader lane disabled";
+      }
+
+
+      const cg = s.crash || {};
+      if (cg.enabled) {
+        const cr = cg.risk || {};
+        const cst = cg.status || {};
+        const live = (cg.mode || "") === "live";
+        const ban = $("crashBanner");
+        if (ban) ban.textContent = live
+          ? "LIVE · dual-gated · 10% budget · 50/50 SPY/QQQ shorts · never cover red"
+          : "PAPER · crash shorts · isolated book · dual gate off";
+        $("crashMeta").textContent =
+          `${cg.label || "Crash Guard"} · mode=${cg.mode || "?"} · marks=${cg.mark_source || "?"}` +
+          (cg.last_tick_at ? ` · tick ${cg.last_tick_at}` : "") +
+          (cst.block_reasons && cst.block_reasons.length ? ` · blocked:${cst.block_reasons.join(",")}` : "");
+        const mb = $("crashModeBudget");
+        if (mb) mb.textContent = `${cg.mode || "?"} · ${((cr.budget_pct||0)*100).toFixed(0)}% cap · eq ${usd(cr.equity_usd)}`;
+        const al = $("crashAllot");
+        if (al) al.textContent = `acct ${usd(cr.account_value_usd)} · budget ${usd(cr.budget_usd)} · /index ${usd(cr.per_index_allotment_usd)}`;
+        const cdp = cr.daily_pnl_usd;
+        $("crashDpnl").innerHTML = `<span class="${cls(cdp)}">${usd(cdp)}</span> <span class="muted">/ ${usd(cr.daily_loss_kill_usd)}</span>`;
+        $("crashOpen").textContent = `${cr.open_positions || 0}`;
+        $("crashPairs").innerHTML = (cg.pairs || []).map(p => `
+          <tr>
+            <td>${p.product}</td>
+            <td>${num(p.last, 4)}</td>
+            <td class="${cls(p.daily_return)}">${p.daily_return == null ? "—" : (p.daily_return*100).toFixed(2)+"%"}</td>
+            <td>${p.rsi_1d == null ? "—" : num(p.rsi_1d, 1)}</td>
+            <td>${p.trigger_fire ? '<span class="tag imp3">'+(p.trigger_reasons||[]).join(",")+'</span>' : "flat"}</td>
+            <td>${usd(p.allotment_usd)}</td>
+            <td>${p.open_count}/${p.max_open}</td>
+            <td>${p.mark_source || cg.mark_source || ""}</td>
+          </tr>`).join("") || `<tr><td colspan="8" class="muted">no crash marks yet</td></tr>`;
+        $("crashPositions").innerHTML = (cg.positions || []).map(p => `
+          <tr>
+            <td>${p.id}</td><td>${p.product}</td><td>${p.side || "short"}</td>
+            <td>${num(p.qty, 6)}</td><td>${num(p.entry_price, 4)}</td>
+            <td>${num(p.mark, 4)}</td>
+            <td class="${cls(p.unrealized_pnl)}">${usd(p.unrealized_pnl)}</td>
+            <td class="${cls(p.short_pnl_pct)}">${p.short_pnl_pct == null ? "—" : (p.short_pnl_pct*100).toFixed(2)+"%"}</td>
+          </tr>`).join("") || `<tr><td colspan="8" class="muted">flat</td></tr>`;
+        $("crashFills").innerHTML = (cg.fills || []).map(f => `
+          <tr>
+            <td>${(f.ts || "").replace("T"," ").slice(0,19)}</td>
+            <td>${f.product}</td><td>${f.strategy || ""}</td><td>${f.side}</td>
+            <td>${num(f.price, 4)}</td><td>${usd(f.notional_usd)}</td><td>${f.reason}</td>
+          </tr>`).join("") || `<tr><td colspan="7" class="muted">no fills</td></tr>`;
+      } else {
+        $("crashMeta").textContent = "Crash Guard lane disabled";
       }
 
       const w = s.watcher || {};

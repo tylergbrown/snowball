@@ -55,6 +55,16 @@ class AppState:
     futures_account_value_usd: float | None = None
     futures_budget_usd: float | None = None
     futures_per_index_allotment_usd: float | None = None
+    # --- Crash Guard (isolated shorts; never mixes with long books) ---
+    crash_ledger: object | None = None
+    crash_pairs: dict[str, PairSnapshot] = field(default_factory=dict)
+    crash_last_tick_at: datetime | None = None
+    crash_mark_source: str = "coinbase_perp"
+    crash_engine: object | None = None
+    crash_account_value_usd: float | None = None
+    crash_budget_usd: float | None = None
+    crash_per_index_allotment_usd: float | None = None
+    crash_last_triggers: dict = field(default_factory=dict)
 
     def marks(self) -> dict[str, float]:
         out: dict[str, float] = {}

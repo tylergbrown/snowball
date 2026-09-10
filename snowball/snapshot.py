@@ -8,6 +8,7 @@ from snowball.watcher.store import event_to_dict
 from snowball.yolo_demon.store import idea_to_dict
 from snowball.stocks.snapshot import build_stocks_snapshot
 from snowball.futures.snapshot import build_futures_snapshot
+from snowball.crash.snapshot import build_crash_snapshot
 
 
 def build_snapshot(state: AppState) -> dict:
@@ -175,6 +176,7 @@ def build_snapshot(state: AppState) -> dict:
             "earnings": _earnings_payload(state),
             "stocks": build_stocks_snapshot(state),
             "futures": build_futures_snapshot(state),
+            "crash": build_crash_snapshot(state),
         }
 
 
