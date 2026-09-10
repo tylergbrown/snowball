@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     products: str = "BTC-USD,SOL-USD,ETH-USD,DOGE-USD"
     timeframe: str = "15m"
 
-    strategies: str = "sma_15m,sma_5m,rsi_15m,bb_15m,rsi_1d,bb_1d"
+    strategies: str = "sma_15m,sma_5m"
 
     sma_fast: int = 20
     sma_slow: int = 50
@@ -63,11 +63,6 @@ class Settings(BaseSettings):
     never_sell_red_emergency: bool = True
     # Trend filter: require last > SMA slow before any new entry / scale-in.
     trend_filter_enabled: bool = True
-    # RSI/BB lean-on filters for entries (block RSI>=70 and close > BB upper).
-    indicator_filters_enabled: bool = True
-    rsi_period: int = 14
-    bb_period: int = 20
-    bb_std_mult: float = 2.0
     # Per-product pause after consecutive closed losers.
     pair_pause_enabled: bool = True
     pair_pause_losses: int = 3
@@ -137,7 +132,7 @@ class Settings(BaseSettings):
     stock_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value stock lane may use (INTX perps, lev=1)
     stock_account_budget_pct: float = 0.40
-    stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d,rsi_15m,bb_15m,rsi_1d,bb_1d"
+    stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d"
     stock_poll_seconds: float = 60.0
     # Cap symbols that the engine may trade (marks universe may be larger)
     stock_max_active: int = 60
@@ -245,9 +240,9 @@ class Settings(BaseSettings):
     def cooldown_seconds_for(self, strategy_id: str) -> int:
         if strategy_id == "sma_5m":
             return self.entry_cooldown_5m_seconds
-        if strategy_id in ("sma_1d", "donchian_1d", "rsi_1d", "bb_1d"):
+        if strategy_id in ("sma_1d", "donchian_1d"):
             return self.entry_cooldown_1d_seconds
-        # sma_15m, ema_15m, rsi_15m, bb_15m share the 15m candle cooldown
+        # sma_15m and ema_15m share the 15m candle cooldown
         return self.entry_cooldown_seconds
 
     @property
