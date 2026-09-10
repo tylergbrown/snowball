@@ -102,6 +102,23 @@ class PairSnapshot:
     donchian_high_1d: float | None = None
     donchian_low_1d: float | None = None
     signal_donchian_1d: str = Signal.HOLD.value
+    # RSI (Wilder) + Bollinger per timeframe (filters + rsi_*/bb_* strategies)
+    rsi_15m: float | None = None
+    rsi_5m: float | None = None
+    rsi_1d: float | None = None
+    bb_upper_15m: float | None = None
+    bb_mid_15m: float | None = None
+    bb_lower_15m: float | None = None
+    bb_upper_5m: float | None = None
+    bb_mid_5m: float | None = None
+    bb_lower_5m: float | None = None
+    bb_upper_1d: float | None = None
+    bb_mid_1d: float | None = None
+    bb_lower_1d: float | None = None
+    signal_rsi_15m: str = Signal.HOLD.value
+    signal_rsi_1d: str = Signal.HOLD.value
+    signal_bb_15m: str = Signal.HOLD.value
+    signal_bb_1d: str = Signal.HOLD.value
     open_count: int = 0
     max_open: int = 2
     last_error: str | None = None

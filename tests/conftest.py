@@ -30,6 +30,11 @@ def tmp_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
         products="BTC-USD,SOL-USD,ETH-USD,DOGE-USD",
         stock_enabled=False,
         futures_enabled=False,
+        # Isolation tests use synthetic spikes; keep RSI/BB lean-on filters off
+        # unless a test explicitly enables them. Production default remains true.
+        indicator_filters_enabled=False,
+        # Keep strategy list narrow for legacy engine tests.
+        strategies="sma_15m,sma_5m",
     )
 
 

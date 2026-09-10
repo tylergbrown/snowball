@@ -54,6 +54,7 @@ def sma_slow_for_strategy(snap: object, strategy_id: str) -> float | None:
 
     SMA strategies use SMA slow. ema_15m uses EMA 26. donchian_1d uses the
     prior 10-day low (exit channel) so fade/trend gates stay on the same path.
+    rsi_*/bb_* use Bollinger middle on that timeframe for fade reference.
     """
     if strategy_id == "sma_5m":
         return getattr(snap, "sma_slow_5m", None)
@@ -63,6 +64,10 @@ def sma_slow_for_strategy(snap: object, strategy_id: str) -> float | None:
         return getattr(snap, "ema_slow_15m", None)
     if strategy_id == "donchian_1d":
         return getattr(snap, "donchian_low_1d", None)
+    if strategy_id in ("rsi_15m", "bb_15m"):
+        return getattr(snap, "bb_mid_15m", None)
+    if strategy_id in ("rsi_1d", "bb_1d"):
+        return getattr(snap, "bb_mid_1d", None)
     return getattr(snap, "sma_slow", None)
 
 
@@ -71,6 +76,7 @@ def sma_fast_for_strategy(snap: object, strategy_id: str) -> float | None:
 
     SMA strategies use SMA fast. ema_15m uses EMA 12. donchian_1d uses the
     prior 20-day high (entry channel) so fade is a pullback off the breakout.
+    rsi_*/bb_* use Bollinger upper as the "fast" fade reference.
     """
     if strategy_id == "sma_5m":
         return getattr(snap, "sma_fast_5m", None)
@@ -80,7 +86,67 @@ def sma_fast_for_strategy(snap: object, strategy_id: str) -> float | None:
         return getattr(snap, "ema_fast_15m", None)
     if strategy_id == "donchian_1d":
         return getattr(snap, "donchian_high_1d", None)
+    if strategy_id in ("rsi_15m", "bb_15m"):
+        return getattr(snap, "bb_upper_15m", None)
+    if strategy_id in ("rsi_1d", "bb_1d"):
+        return getattr(snap, "bb_upper_1d", None)
     return getattr(snap, "sma_fast", None)
+
+
+def indicator_snapshot_for_strategy(
+    snap: object, strategy_id: str
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Return (rsi, bb_upper, bb_mid, bb_lower) for the strategy's timeframe."""
+    from snowball.strategy import TIMEFRAME_BY_STRATEGY
+
+    tf = TIMEFRAME_BY_STRATEGY.get(strategy_id, "15m")
+    if tf == "5m":
+        return (
+            getattr(snap, "rsi_5m", None),
+            getattr(snap, "bb_upper_5m", None),
+            getattr(snap, "bb_mid_5m", None),
+            getattr(snap, "bb_lower_5m", None),
+        )
+    if tf == "1d":
+        return (
+            getattr(snap, "rsi_1d", None),
+            getattr(snap, "bb_upper_1d", None),
+            getattr(snap, "bb_mid_1d", None),
+            getattr(snap, "bb_lower_1d", None),
+        )
+    return (
+        getattr(snap, "rsi_15m", None),
+        getattr(snap, "bb_upper_15m", None),
+        getattr(snap, "bb_mid_15m", None),
+        getattr(snap, "bb_lower_15m", None),
+    )
+
+
+def indicator_filters_allow(
+    *,
+    last: float | None,
+    rsi: float | None,
+    bb_upper: float | None,
+    bb_mid: float | None = None,
+    enabled: bool = True,
+    overbought: float = 70.0,
+) -> tuple[bool, str]:
+    """Lean-on RSI/BB entry filter for existing (and new) strategies.
+
+    When enabled:
+    - Block if RSI >= overbought (default 70) — overbought chase.
+    - Block if last > Bollinger upper — buying the relative high.
+    Missing RSI/BB values do not block (history still warming up).
+    ``bb_mid`` is accepted for API symmetry / soft preference callers.
+    """
+    _ = bb_mid  # soft preference (close <= mid) is advisory only
+    if not enabled:
+        return True, "ok"
+    if rsi is not None and float(rsi) >= float(overbought):
+        return False, "indicator_rsi_overbought"
+    if last is not None and bb_upper is not None and float(last) > float(bb_upper):
+        return False, "indicator_above_bb_upper"
+    return True, "ok"
 
 
 def lot_unrealized_pnl_pct(lot: Position, mark: float | None) -> float | None:

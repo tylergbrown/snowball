@@ -19,6 +19,8 @@ from snowball.paper import PaperLedger
 from snowball.risk import allow_entry, allow_exit, context_from_settings, daily_loss_breached
 from snowball.state import AppState
 from snowball.gates import (
+    indicator_filters_allow,
+    indicator_snapshot_for_strategy,
     is_emergency_flatten_reason,
     lot_unrealized_pnl_pct,
     momentum_fading,
@@ -31,6 +33,7 @@ from snowball.gates import (
 from snowball.strategy import (
     DONCHIAN_1D,
     EMA_15M,
+    MEAN_REVERSION_STRATEGY_IDS,
     SMA_15M,
     SMA_1D,
     SMA_5M,
@@ -40,6 +43,7 @@ from snowball.strategy import (
     ema,
     ema_crossover_signal,
     enabled_timeframes,
+    populate_rsi_bb,
     signal_for_strategy,
     sma,
 )
@@ -186,6 +190,18 @@ class Engine:
                     ).value
                     if snap.candle_ts_1d is None:
                         snap.candle_ts_1d = candle_ts
+                populate_rsi_bb(
+                    snap,
+                    closes,
+                    timeframe,
+                    wanted=wanted,
+                    filters_enabled=bool(
+                        getattr(settings, "indicator_filters_enabled", True)
+                    ),
+                    rsi_period=int(getattr(settings, "rsi_period", 14) or 14),
+                    bb_period=int(getattr(settings, "bb_period", 20) or 20),
+                    bb_std_mult=float(getattr(settings, "bb_std_mult", 2.0) or 2.0),
+                )
             except Exception as exc:  # noqa: BLE001 — keep the loop alive
                 log.exception(
                     "ohlcv update failed",
@@ -234,8 +250,7 @@ class Engine:
         marks: dict[str, float],
     ) -> None:
         settings = self.state.settings
-        # New strategies stay stock-paper only. Do not place live crypto orders
-        # for them even if STRATEGIES is misconfigured.
+        # ema_15m / donchian_1d stay stock-only. rsi_*/bb_* are live on crypto.
         if strategy_id in (EMA_15M, DONCHIAN_1D):
             return
         signal, uptrend = signal_for_strategy(snap, strategy_id)
@@ -384,10 +399,11 @@ class Engine:
                 )
                 return
 
+        use_trend = settings.trend_filter_enabled and strategy_id not in MEAN_REVERSION_STRATEGY_IDS
         ok_tf, reason_tf = trend_filter_allows(
             snap.last,
             sma_slow_for_strategy(snap, strategy_id),
-            enabled=settings.trend_filter_enabled,
+            enabled=use_trend,
         )
         if not ok_tf:
             log.info(
@@ -396,6 +412,20 @@ class Engine:
             )
             return
 
+        rsi_v, bb_up, bb_mid, _bb_lo = indicator_snapshot_for_strategy(snap, strategy_id)
+        ok_ind, reason_ind = indicator_filters_allow(
+            last=snap.last if snap.last is not None else mark,
+            rsi=rsi_v,
+            bb_upper=bb_up,
+            bb_mid=bb_mid,
+            enabled=bool(getattr(settings, "indicator_filters_enabled", True)),
+        )
+        if not ok_ind:
+            log.info(
+                "entry blocked",
+                extra={"data": {"product": product, "strategy": strategy_id, "reason": reason_ind}},
+            )
+            return
 
         # Cap new lots so crypto open notional stays within CRYPTO_ACCOUNT_BUDGET_PCT.
         crypto_notional = self._crypto_leg_notional(marks)

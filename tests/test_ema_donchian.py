@@ -78,10 +78,18 @@ def test_signal_for_strategy_reads_ema_and_donchian_fields() -> None:
 
 def test_stock_defaults_enable_new_strategies_crypto_does_not() -> None:
     s = Settings(_env_file=None)
-    assert s.strategy_list == ["sma_15m", "sma_5m"]
+    # Crypto goes live with SMA + RSI/BB; ema/donchian remain stock-only.
+    assert "sma_15m" in s.strategy_list and "sma_5m" in s.strategy_list
+    assert "rsi_15m" in s.strategy_list and "bb_15m" in s.strategy_list
+    assert "ema_15m" not in s.strategy_list
+    assert "donchian_1d" not in s.strategy_list
     assert "ema_15m" in s.stock_strategy_list
     assert "donchian_1d" in s.stock_strategy_list
+    assert "rsi_15m" in s.stock_strategy_list
+    assert "bb_15m" in s.stock_strategy_list
     assert s.cooldown_seconds_for("ema_15m") == s.entry_cooldown_seconds
     assert s.cooldown_seconds_for("donchian_1d") == s.entry_cooldown_1d_seconds
     assert s.cooldown_seconds_for("sma_15m") == s.entry_cooldown_seconds
     assert s.cooldown_seconds_for("sma_1d") == s.entry_cooldown_1d_seconds
+    assert s.cooldown_seconds_for("rsi_15m") == s.entry_cooldown_seconds
+    assert s.cooldown_seconds_for("bb_1d") == s.entry_cooldown_1d_seconds

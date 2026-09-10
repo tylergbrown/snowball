@@ -109,6 +109,7 @@ def test_stock_paper_entry_isolated_from_crypto(
         stock_mode="paper",
         stock_sqlite_path=tmp_path / "stocks.db",
         stock_strategies="sma_15m",
+        indicator_filters_enabled=False,
         stock_max_active=8,
         stock_dynamic_max=0,
         stock_poll_seconds=0.05,
@@ -197,6 +198,7 @@ def test_crypto_live_flags_do_not_enable_stock_live(
         stock_dynamic_max=0,
         stock_max_active=5,
         stock_strategies="sma_15m",
+        indicator_filters_enabled=False,
     )
     # Don't call build_state (would construct live broker). Attach stock only.
     state = AppState(settings=settings, ledger=PaperLedger(settings.sqlite_path, 1000.0))

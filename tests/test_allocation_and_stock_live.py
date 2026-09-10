@@ -300,6 +300,7 @@ def test_stock_live_uses_perp_not_yahoo_for_orders(
         stock_live_enabled=True,
         stock_sqlite_path=tmp_path / "stocks.db",
         stock_strategies="sma_15m",
+        indicator_filters_enabled=False,
         stock_max_active=8,
         stock_dynamic_max=0,
         stock_account_budget_pct=0.40,

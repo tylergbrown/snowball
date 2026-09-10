@@ -116,7 +116,9 @@ def test_live_mode_without_flag_blocked_in_risk() -> None:
 def test_default_strategies_are_15m_and_5m(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("STRATEGIES", raising=False)
     s = Settings(_env_file=None)
-    assert s.strategy_list == ["sma_15m", "sma_5m"]
+    # Crypto defaults: SMA + live RSI/BB (ema/donchian remain stock-only).
+    assert s.strategy_list[:2] == ["sma_15m", "sma_5m"]
+    assert "rsi_15m" in s.strategy_list and "bb_15m" in s.strategy_list
     assert s.entry_cooldown_5m_seconds == 300
     assert s.ohlcv_fetch_limit >= s.sma_slow + 1
 
