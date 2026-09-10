@@ -18,6 +18,7 @@ def _both_enabled(app_state: AppState, **extra: object) -> None:
         # Isolation tests use a clean 5% floor (no fee buffer) so strategy
         # scoping stays independent of production 6%+1% settings.
         "min_take_profit_pct": 0.05,
+        "sma_min_take_profit_pct": 0.05,
         "fee_buffer_pct": 0.0,
     }
     update.update(extra)

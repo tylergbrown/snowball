@@ -217,6 +217,9 @@ class FakeIntxMarket:
     def fetch_account_value_usd(self, *, crypto_marks=None) -> float:
         return 1000.0
 
+    def fetch_bba(self, product):
+        return 199.0, 201.0
+
     def create_swap_market_order(self, product, side, amount, *, leverage=1.0, reduce_only=False):
         assert product.endswith("-PERP-INTX") or "PERP" in product
         assert "yahoo" not in str(product).lower()
@@ -228,7 +231,51 @@ class FakeIntxMarket:
             "fee": {"cost": 0.1, "currency": "USDC"},
         }
         self.orders.append(
-            {"product": product, "side": side, "amount": amount, "reduce_only": reduce_only}
+            {
+                "product": product,
+                "side": side,
+                "amount": amount,
+                "reduce_only": reduce_only,
+                "type": "market",
+            }
+        )
+        return order
+
+    def create_swap_maker_limit_order(
+        self,
+        product,
+        side,
+        amount,
+        *,
+        price=None,
+        bid=None,
+        ask=None,
+        leverage=1.0,
+        reduce_only=False,
+        timeout_sec=None,
+        post_only=True,
+    ):
+        assert product.endswith("-PERP-INTX") or "PERP" in product
+        assert price is not None and float(price) > 0
+        px = float(price)
+        order = {
+            "id": f"ord-{len(self.orders)+1}",
+            "filled": float(amount),
+            "average": px,
+            "price": px,
+            "remaining": 0.0,
+            "status": "closed",
+            "fee": {"cost": 0.1, "currency": "USDC"},
+        }
+        self.orders.append(
+            {
+                "product": product,
+                "side": side,
+                "amount": amount,
+                "reduce_only": reduce_only,
+                "type": "limit",
+                "price": px,
+            }
         )
         return order
 
@@ -309,3 +356,90 @@ def test_leg_notional_respects_budget() -> None:
         )
         == 0.0
     )
+
+
+def test_sma_min_take_profit_floor() -> None:
+    """SMA strategies need 9% effective (8% + 1% fee); non-SMA stay at 7%."""
+    from snowball.maker import min_take_profit_for_strategy
+
+    s = Settings(_env_file=None, stock_enabled=False, futures_enabled=False)
+    assert s.sma_min_take_profit_pct == pytest.approx(0.08)
+    assert s.min_take_profit_pct_for("sma_5m") == pytest.approx(0.08)
+    assert s.min_take_profit_pct_for("sma_15m") == pytest.approx(0.08)
+    assert s.min_take_profit_pct_for("sma_1d") == pytest.approx(0.08)
+    assert s.min_take_profit_pct_for("ema_15m") == pytest.approx(0.06)
+    assert s.effective_min_take_profit_pct_for("sma_15m") == pytest.approx(0.09)
+    assert s.effective_min_take_profit_pct_for("ema_15m") == pytest.approx(0.07)
+    assert min_take_profit_for_strategy(
+        "donchian_1d", min_take_profit_pct=0.06, sma_min_take_profit_pct=0.08
+    ) == pytest.approx(0.06)
+
+    lot_sma = Position(
+        id=10,
+        product="BTC-USD",
+        side="long",
+        qty=1.0,
+        entry_price=100.0,
+        notional_usd=100.0,
+        opened_at=datetime.now(timezone.utc),
+        status=PositionStatus.OPEN,
+        strategy="sma_5m",
+    )
+    # 7% green refused for SMA (needs 9%)
+    ok, reason = strategy_exit_allowed(
+        lot_sma,
+        107.0,
+        min_take_profit_pct=s.min_take_profit_pct_for(lot_sma.strategy),
+        never_sell_red=True,
+        fee_buffer_pct=0.01,
+    )
+    assert ok is False and reason == "below_take_profit"
+    # 9% allowed
+    ok, reason = strategy_exit_allowed(
+        lot_sma,
+        109.0,
+        min_take_profit_pct=s.min_take_profit_pct_for(lot_sma.strategy),
+        never_sell_red=True,
+        fee_buffer_pct=0.01,
+    )
+    assert ok is True and reason == "ok"
+
+    lot_other = Position(
+        id=11,
+        product="BTC-USD",
+        side="long",
+        qty=1.0,
+        entry_price=100.0,
+        notional_usd=100.0,
+        opened_at=datetime.now(timezone.utc),
+        status=PositionStatus.OPEN,
+        strategy="ema_15m",
+    )
+    ok, reason = strategy_exit_allowed(
+        lot_other,
+        107.0,
+        min_take_profit_pct=s.min_take_profit_pct_for(lot_other.strategy),
+        never_sell_red=True,
+        fee_buffer_pct=0.01,
+    )
+    assert ok is True and reason == "ok"
+    # Never sell below entry
+    ok, reason = strategy_exit_allowed(
+        lot_sma,
+        99.0,
+        min_take_profit_pct=s.min_take_profit_pct_for(lot_sma.strategy),
+        never_sell_red=True,
+        fee_buffer_pct=0.01,
+    )
+    assert ok is False and reason == "never_sell_red"
+
+
+def test_maker_buy_price_rests_at_or_inside_bid() -> None:
+    from snowball.maker import maker_buy_price, maker_sell_price
+
+    assert maker_buy_price(100.0, 101.0) is not None
+    px = maker_buy_price(100.0, 101.0)
+    assert px is not None and 100.0 <= px < 101.0
+    assert maker_buy_price(None, 101.0) is None
+    sp = maker_sell_price(100.0, 101.0)
+    assert sp is not None and 100.0 < sp <= 101.0

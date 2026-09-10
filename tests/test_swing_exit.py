@@ -21,6 +21,7 @@ def _cfg(app_state: AppState, **extra: object) -> None:
         "entry_cooldown_5m_seconds": 0,
         "slippage_bps": 0.0,
         "min_take_profit_pct": 0.05,
+        "sma_min_take_profit_pct": 0.05,
         "fee_buffer_pct": 0.0,
         "never_sell_red": True,
         "daily_loss_kill_usd": 25.0,

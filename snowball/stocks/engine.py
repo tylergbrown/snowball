@@ -473,7 +473,7 @@ class StockPaperEngine:
                 ok_sw, reason_sw = strategy_exit_allowed(
                     lot,
                     mark,
-                    min_take_profit_pct=settings.min_take_profit_pct,
+                    min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                     never_sell_red=settings.never_sell_red,
                     fee_buffer_pct=fee_buf,
                 )
@@ -497,7 +497,7 @@ class StockPaperEngine:
                 ok_sw, _reason = strategy_exit_allowed(
                     lot,
                     mark,
-                    min_take_profit_pct=settings.min_take_profit_pct,
+                    min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                     never_sell_red=settings.never_sell_red,
                     fee_buffer_pct=fee_buf,
                 )
@@ -710,9 +710,41 @@ class StockPaperEngine:
             )
             return
         live_reason = reason if reason.endswith(LIVE_REASON_TAG) else f"{reason}{LIVE_REASON_TAG}"
+        bid = getattr(snap, "bid", None)
+        ask = getattr(snap, "ask", None)
         try:
-            order = self._cb_market.create_swap_market_order(
-                perp, "buy", amount, leverage=1.0, reduce_only=False
+            from snowball.maker import maker_buy_price
+
+            limit_px = maker_buy_price(bid, ask, ref)
+            if limit_px is None or limit_px <= 0:
+                bid2, ask2 = self._cb_market.fetch_bba(perp)
+                bid = bid if bid is not None else bid2
+                ask = ask if ask is not None else ask2
+                limit_px = maker_buy_price(bid, ask, ref)
+            if limit_px is None or limit_px <= 0:
+                log.info(
+                    "stock live buy skipped: no book bid for maker",
+                    extra={"data": {"product": product, "perp": perp, "bid": bid, "ask": ask}},
+                )
+                return
+            amount = round_amount_down(notional_usd / float(limit_px), 0.01)
+            if amount < 0.01:
+                log.info(
+                    "stock live buy skipped: amount below min",
+                    extra={"data": {"product": product, "perp": perp, "limit_px": limit_px}},
+                )
+                return
+            timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
+            order = self._cb_market.create_swap_maker_limit_order(
+                perp,
+                "buy",
+                amount,
+                price=limit_px,
+                bid=bid,
+                ask=ask,
+                leverage=1.0,
+                reduce_only=False,
+                timeout_sec=timeout,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception(
@@ -723,7 +755,7 @@ class StockPaperEngine:
         fill_px, fill_qty, fee_usd = parse_futures_order_fill(order)
         if fill_px <= 0 or fill_qty <= 0:
             log.error(
-                "stock live buy unsettled",
+                "stock live buy unfilled/canceled maker limit",
                 extra={"data": {"product": product, "perp": perp, "order_id": order.get("id")}},
             )
             return
@@ -905,7 +937,7 @@ class StockPaperEngine:
                 ok_sw, reason_sw = strategy_exit_allowed(
                     lot,
                     ref,
-                    min_take_profit_pct=settings.min_take_profit_pct,
+                    min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                     never_sell_red=settings.never_sell_red,
                     fee_buffer_pct=fee_buf,
                 )
@@ -932,9 +964,48 @@ class StockPaperEngine:
             if amount < 0.01:
                 continue
             try:
-                order = self._cb_market.create_swap_market_order(
-                    perp, "sell", amount, leverage=1.0, reduce_only=True
-                )
+                from snowball.gates import is_emergency_flatten_reason
+                from snowball.maker import maker_sell_price
+
+                if is_emergency_flatten_reason(reason):
+                    order = self._cb_market.create_swap_market_order(
+                        perp, "sell", amount, leverage=1.0, reduce_only=True
+                    )
+                else:
+                    snap_s = self.state.stock_pairs.get(product)
+                    bid = getattr(snap_s, "bid", None) if snap_s else None
+                    ask = getattr(snap_s, "ask", None) if snap_s else None
+                    last = getattr(snap_s, "last", None) if snap_s else None
+                    sell_px = maker_sell_price(bid, ask, last)
+                    if sell_px is None:
+                        bid2, ask2 = self._cb_market.fetch_bba(perp)
+                        bid = bid if bid is not None else bid2
+                        ask = ask if ask is not None else ask2
+                        sell_px = maker_sell_price(bid, ask, last)
+                    if sell_px is None:
+                        log.info(
+                            "stock live sell skipped: no ask for maker",
+                            extra={
+                                "data": {
+                                    "product": product,
+                                    "perp": perp,
+                                    "position_id": lot.id,
+                                }
+                            },
+                        )
+                        continue
+                    timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
+                    order = self._cb_market.create_swap_maker_limit_order(
+                        perp,
+                        "sell",
+                        amount,
+                        price=sell_px,
+                        bid=bid,
+                        ask=ask,
+                        leverage=1.0,
+                        reduce_only=True,
+                        timeout_sec=timeout,
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.exception(
                     "stock live sell failed",
@@ -944,7 +1015,7 @@ class StockPaperEngine:
             fill_px, fill_qty, fee_usd = parse_futures_order_fill(order)
             if fill_px <= 0 or fill_qty <= 0:
                 log.error(
-                    "stock live sell unsettled",
+                    "stock live sell unfilled/canceled maker limit",
                     extra={"data": {"product": product, "order_id": order.get("id")}},
                 )
                 continue

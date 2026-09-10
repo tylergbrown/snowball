@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     products: str = "BTC-USD,SOL-USD,ETH-USD,DOGE-USD"
     timeframe: str = "15m"
 
-    strategies: str = "sma_15m,sma_5m"
+    strategies: str = "sma_15m,sma_5m,rsi_15m,bb_15m,rsi_1d,bb_1d"
 
     sma_fast: int = 20
     sma_slow: int = 50
@@ -52,12 +52,22 @@ class Settings(BaseSettings):
     # HALT / daily-loss kill still flatten including losers (emergency).
     # Effective strategy/fade floor ≈ MIN_TAKE_PROFIT_PCT + FEE_BUFFER_PCT (0.06+0.01=0.07).
     min_take_profit_pct: float = 0.06
+    # SMA strategies (sma_5m / sma_15m / sma_1d): higher floor before strategy/fade exits.
+    # Effective ≈ SMA_MIN_TAKE_PROFIT_PCT + FEE_BUFFER_PCT (0.08+0.01=0.09).
+    sma_min_take_profit_pct: float = 0.08
     # Round-trip fee estimate (~1%). Exits that would be red after fees are refused.
     fee_buffer_pct: float = 0.01
+    # Maker-limit entry/exit settle timeout (seconds). Stale limits are canceled.
+    maker_timeout_seconds: float = 90.0
     never_sell_red: bool = True
     never_sell_red_emergency: bool = True
     # Trend filter: require last > SMA slow before any new entry / scale-in.
     trend_filter_enabled: bool = True
+    # RSI/BB lean-on filters for entries (block RSI>=70 and close > BB upper).
+    indicator_filters_enabled: bool = True
+    rsi_period: int = 14
+    bb_period: int = 20
+    bb_std_mult: float = 2.0
     # Per-product pause after consecutive closed losers.
     pair_pause_enabled: bool = True
     pair_pause_losses: int = 3
@@ -127,7 +137,7 @@ class Settings(BaseSettings):
     stock_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value stock lane may use (INTX perps, lev=1)
     stock_account_budget_pct: float = 0.40
-    stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d"
+    stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d,rsi_15m,bb_15m,rsi_1d,bb_1d"
     stock_poll_seconds: float = 60.0
     # Cap symbols that the engine may trade (marks universe may be larger)
     stock_max_active: int = 60
@@ -235,9 +245,9 @@ class Settings(BaseSettings):
     def cooldown_seconds_for(self, strategy_id: str) -> int:
         if strategy_id == "sma_5m":
             return self.entry_cooldown_5m_seconds
-        if strategy_id in ("sma_1d", "donchian_1d"):
+        if strategy_id in ("sma_1d", "donchian_1d", "rsi_1d", "bb_1d"):
             return self.entry_cooldown_1d_seconds
-        # sma_15m and ema_15m share the 15m candle cooldown
+        # sma_15m, ema_15m, rsi_15m, bb_15m share the 15m candle cooldown
         return self.entry_cooldown_seconds
 
     @property
@@ -271,11 +281,29 @@ class Settings(BaseSettings):
         """Stock live INTX path requires BOTH stock flags. Default False."""
         return self.stock_mode == "live" and self.stock_live_enabled is True
 
+    def min_take_profit_pct_for(self, strategy_id: str) -> float:
+        """Per-strategy min TP: SMA ids use sma_min_take_profit_pct; else global."""
+        from snowball.maker import min_take_profit_for_strategy
+
+        return min_take_profit_for_strategy(
+            strategy_id,
+            min_take_profit_pct=self.min_take_profit_pct,
+            sma_min_take_profit_pct=self.sma_min_take_profit_pct,
+        )
+
     def effective_min_take_profit_pct(self) -> float:
-        """min_take_profit_pct + fee_buffer_pct (strategy/fade exit floor vs entry)."""
+        """Global (non-SMA) floor: min_take_profit_pct + fee_buffer_pct."""
         from snowball.allocation import effective_take_profit_floor
 
         return effective_take_profit_floor(self.min_take_profit_pct, self.fee_buffer_pct)
+
+    def effective_min_take_profit_pct_for(self, strategy_id: str) -> float:
+        """Strategy/fade exit floor vs entry including fee buffer."""
+        from snowball.allocation import effective_take_profit_floor
+
+        return effective_take_profit_floor(
+            self.min_take_profit_pct_for(strategy_id), self.fee_buffer_pct
+        )
 
     def lane_budget_pcts(self) -> dict[str, float]:
         from snowball.allocation import lane_budget_pcts

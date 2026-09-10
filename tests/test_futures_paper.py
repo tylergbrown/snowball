@@ -173,6 +173,9 @@ class FakeFuturesMarket:
     def fetch_account_value_usd(self, *, crypto_marks=None) -> float:
         return float(self.account_value)
 
+    def fetch_bba(self, product):
+        return self.last - 0.1, self.last + 0.1
+
     def create_swap_market_order(self, product, side, amount, *, leverage=1.0, reduce_only=False):
         if not self._allow_orders:
             raise RuntimeError("orders not allowed")
@@ -185,7 +188,46 @@ class FakeFuturesMarket:
             "fee": {"cost": 0.0, "currency": "USDC"},
             "status": "closed",
         }
-        self.orders.append({"product": product, "side": side, "amount": amount, **order})
+        self.orders.append({"product": product, "side": side, "amount": amount, "type": "market", **order})
+        return order
+
+    def create_swap_maker_limit_order(
+        self,
+        product,
+        side,
+        amount,
+        *,
+        price=None,
+        bid=None,
+        ask=None,
+        leverage=1.0,
+        reduce_only=False,
+        timeout_sec=None,
+        post_only=True,
+    ):
+        if not self._allow_orders:
+            raise RuntimeError("orders not allowed")
+        px = float(price) if price is not None else float(self.last)
+        order = {
+            "id": f"ord-{len(self.orders)+1}",
+            "filled": float(amount),
+            "average": px,
+            "price": px,
+            "cost": float(amount) * px,
+            "remaining": 0.0,
+            "fee": {"cost": 0.0, "currency": "USDC"},
+            "status": "closed",
+        }
+        self.orders.append(
+            {
+                "product": product,
+                "side": side,
+                "amount": amount,
+                "type": "limit",
+                "limit_price": px,
+                **order,
+            }
+        )
         return order
 
 
@@ -212,6 +254,7 @@ def _paper_settings(tmp_path: Path, **kwargs) -> Settings:
         futures_bankroll_usd=1000.0,
         never_sell_red=True,
         min_take_profit_pct=0.05,
+        sma_min_take_profit_pct=0.05,
         slippage_bps=0.0,
         pair_pause_enabled=False,
     )

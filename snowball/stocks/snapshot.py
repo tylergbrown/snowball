@@ -175,6 +175,8 @@ def build_stocks_snapshot(state: AppState) -> dict[str, Any]:
                 "min_take_profit_pct": settings.min_take_profit_pct,
                 "fee_buffer_pct": settings.fee_buffer_pct,
                 "effective_take_profit_floor": settings.effective_min_take_profit_pct(),
+                "sma_min_take_profit_pct": getattr(settings, "sma_min_take_profit_pct", 0.08),
+                "effective_sma_take_profit_floor": settings.effective_min_take_profit_pct_for("sma_15m"),
                 "never_sell_red": settings.never_sell_red,
             },
             "universe": {

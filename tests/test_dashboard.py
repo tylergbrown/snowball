@@ -102,9 +102,12 @@ def test_engine_respects_halt_and_pair_cap(app_state: AppState) -> None:
     assert app_state.ledger.open_count("SOL-USD") == 1
 
     write_halt(app_state.settings.halt_file)
-    # HALT emergency-flattens open lots, then blocks new entries.
+    # HALT flattens open lots when mark >= entry (never_sell_red_emergency still holds red).
+    # Paper entries include buy slippage (~200.1), so marks must be green vs entry.
+    market.last["BTC-USD"] = 201.0
+    market.last["SOL-USD"] = 201.0
     app_state.pairs["BTC-USD"] = PairSnapshot(
-        product="BTC-USD", last=200.0, sma_fast=120.0, sma_slow=100.0, signal="enter", max_open=2
+        product="BTC-USD", last=201.0, sma_fast=120.0, sma_slow=100.0, signal="enter", max_open=2
     )
     engine.tick()
     assert app_state.ledger.open_count("BTC-USD") == 0

@@ -58,7 +58,9 @@ class FakeExchange:
             "id": f"buy-{len(self.orders)}",
             "filled": filled,
             "average": px,
+            "price": px,
             "cost": float(cost),
+            "remaining": 0.0,
             "fee": {"cost": 0.1, "currency": "USD"},
             "status": "closed",
         }
@@ -73,6 +75,18 @@ class FakeExchange:
             return out
         return dict(getattr(self, "_last_order", {"id": order_id, "filled": 0, "average": 0}))
 
+    def fetch_order_book(self, symbol: str, limit: int = 5) -> dict[str, Any]:
+        mid = 200.0
+        return {
+            "bids": [[mid * 0.9999, 10.0]],
+            "asks": [[mid * 1.0001, 10.0]],
+        }
+
+    def cancel_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
+        self.cancels = getattr(self, "cancels", [])
+        self.cancels.append((order_id, symbol))
+        return {"id": order_id, "status": "canceled"}
+
     def create_order(
         self,
         symbol: str,
@@ -82,15 +96,19 @@ class FakeExchange:
         price: float | None = None,
         params: dict | None = None,
     ) -> dict[str, Any]:
-        via = "price" if (side == "buy" and price is not None) else "amount"
+        via = "price" if price is not None else "amount"
         if side == "buy" and params and params.get("createMarketBuyOrderRequiresPrice") is False:
             via = "cost_param"
+        if type_ == "limit":
+            via = "limit"
         self.orders.append((symbol, type_, side, amount, price, via))
         if side == "buy":
             if self.buy_error is not None:
                 raise self.buy_error
             if self.buy_order is not None:
-                return dict(self.buy_order)
+                out = dict(self.buy_order)
+                self._last_order = dict(out)
+                return out
             if price is not None and float(price) > 0:
                 cost = amount * float(price)
                 filled = amount
@@ -104,24 +122,39 @@ class FakeExchange:
                 filled = amount
                 avg = 200.0
             self.free_usd = max(0.0, self.free_usd - cost)
-            return {
+            order = {
+                "id": f"buy-{len(self.orders)}",
                 "filled": filled,
                 "average": avg,
+                "price": avg,
                 "cost": cost,
+                "remaining": 0.0,
+                "status": "closed",
                 "fee": {"cost": 0.1, "currency": "USD"},
             }
+            self._last_order = dict(order)
+            return order
         if self.sell_error is not None:
             raise self.sell_error
         if self.sell_order is not None:
-            return dict(self.sell_order)
-        proceeds = amount * 210.0
+            out = dict(self.sell_order)
+            self._last_order = dict(out)
+            return out
+        px = float(price) if price is not None and float(price) > 0 else 210.0
+        proceeds = amount * px
         self.free_usd += proceeds
-        return {
+        order = {
+            "id": f"sell-{len(self.orders)}",
             "filled": amount,
-            "average": 210.0,
+            "average": px,
+            "price": px,
             "cost": proceeds,
+            "remaining": 0.0,
+            "status": "closed",
             "fee": {"cost": 0.05, "currency": "USD"},
         }
+        self._last_order = dict(order)
+        return order
 
 
 def _live_settings(tmp_path: Path, **kwargs: object) -> Settings:
@@ -257,8 +290,8 @@ def test_live_buy_records_exchange_fill(tmp_path: Path) -> None:
     assert ex.orders[0][2] == "buy"
     assert ledger.open_count("BTC-USD") == 1
     lot = ledger.open_positions("BTC-USD")[0]
-    assert lot.entry_price == pytest.approx(200.0)
-    assert lot.qty == pytest.approx(0.5)  # 100 notional / 200
+    assert lot.entry_price == pytest.approx(ex.orders[0][4], rel=1e-6)
+    assert lot.qty * lot.entry_price == pytest.approx(100.0, rel=1e-4)
     fills = ledger.recent_fills(1)
     assert fills[0].side == "buy"
     assert fills[0].fee_usd == pytest.approx(0.1)
@@ -272,9 +305,15 @@ def test_live_sell_records_exchange_fill(tmp_path: Path) -> None:
     state = AppState(settings=settings, ledger=ledger, broker=broker)
     for product in settings.product_list:
         state.pairs[product] = PairSnapshot(product=product, max_open=2)
-    # Seed an open lot as if previously bought live
+    # Seed an open lot as if previously bought live (SMA needs 9% effective floor)
     pos, _ = ledger.open_buy(
-        "BTC-USD", fill_px=200.0, notional_usd=100.0, slippage_bps=0.0, fee_usd=0.0, reason="seed"
+        "BTC-USD",
+        fill_px=200.0,
+        notional_usd=100.0,
+        slippage_bps=0.0,
+        fee_usd=0.0,
+        reason="seed",
+        strategy="sma_15m",
     )
     # Death cross: high then low
     death = [200.0] * 50 + [100.0]
@@ -283,7 +322,7 @@ def test_live_sell_records_exchange_fill(tmp_path: Path) -> None:
         last={p: 100.0 for p in PAIRS},
         ohlcv={("BTC-USD", "15m"): death},
     )
-    market.last["BTC-USD"] = 214.0  # >= 7% floor (6% TP + 1% fee buffer)
+    market.last["BTC-USD"] = 218.0  # >= 9% SMA floor (8% TP + 1% fee buffer)
     Engine(state, market).tick()
     assert any(o[2] == "sell" for o in ex.orders)
     assert ledger.open_count("BTC-USD") == 0
@@ -399,8 +438,8 @@ def test_create_market_order_sell_amount_only(tmp_path: Path) -> None:
     assert price is None
 
 
-def test_live_buy_passes_cost_into_broker(tmp_path: Path) -> None:
-    """Engine live entry uses quote cost so Coinbase InvalidOrder cannot fire."""
+def test_live_buy_uses_maker_limit_with_price(tmp_path: Path) -> None:
+    """Engine live entry posts a limit buy with price (maker), not a market/cost buy."""
     settings = _live_settings(tmp_path)
     ex = FakeExchange(free_usd=1000.0)
     ledger = PaperLedger(settings.sqlite_path, settings.bankroll_usd)
@@ -415,11 +454,13 @@ def test_live_buy_passes_cost_into_broker(tmp_path: Path) -> None:
     market.last["BTC-USD"] = 200.0
     Engine(state, market).tick()
     assert len(ex.orders) == 1
-    _sym, _typ, side, amount, price, via = ex.orders[0]
+    _sym, typ, side, amount, price, via = ex.orders[0]
     assert side == "buy"
-    assert via == "cost"
-    assert amount == pytest.approx(100.0)  # max_position_notional_usd
-    assert price is None
+    assert typ == "limit"
+    assert via == "limit"
+    assert price is not None and float(price) > 0
+    assert amount == pytest.approx(100.0 / float(price))
+    assert ledger.open_count("BTC-USD") == 1
 
 
 def test_settle_order_fetches_when_create_omits_fill(tmp_path: Path) -> None:
@@ -457,3 +498,22 @@ def test_settle_order_fetches_when_create_omits_fill(tmp_path: Path) -> None:
     assert order["filled"] == pytest.approx(0.5)
     assert order["average"] == pytest.approx(200.0)
     assert getattr(ex, "fetch_order_calls", 0) >= 1
+
+
+def test_create_maker_limit_order_buy_requires_price(tmp_path: Path) -> None:
+    """Maker entry path requests limit with an explicit price on buy."""
+    settings = _live_settings(tmp_path)
+    ex = FakeExchange(free_usd=500.0)
+    broker = LiveBroker(settings, exchange=ex)
+    order = broker.create_maker_limit_order(
+        "BTC-USD", "buy", 0.5, price=199.98, bid=199.98, ask=200.02, timeout_sec=1.0
+    )
+    assert order["filled"] == pytest.approx(0.5)
+    assert len(ex.orders) == 1
+    symbol, typ, side, amount, price, via = ex.orders[0]
+    assert symbol == "BTC/USD"
+    assert typ == "limit"
+    assert side == "buy"
+    assert price == pytest.approx(199.98)
+    assert amount == pytest.approx(0.5)
+    assert via == "limit"

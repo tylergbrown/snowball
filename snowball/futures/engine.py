@@ -579,7 +579,7 @@ class FuturesEngine:
                 ok_sw, reason_sw = strategy_exit_allowed(
                     lot,
                     mark,
-                    min_take_profit_pct=settings.min_take_profit_pct,
+                    min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                     never_sell_red=settings.never_sell_red,
                     fee_buffer_pct=getattr(settings, "fee_buffer_pct", 0.0),
                 )
@@ -603,7 +603,7 @@ class FuturesEngine:
                 ok_sw, _reason = strategy_exit_allowed(
                     lot,
                     mark,
-                    min_take_profit_pct=settings.min_take_profit_pct,
+                    min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                     never_sell_red=settings.never_sell_red,
                     fee_buffer_pct=getattr(settings, "fee_buffer_pct", 0.0),
                 )
@@ -793,9 +793,41 @@ class FuturesEngine:
                 },
             )
             return
+        bid = ticker.bid
+        ask = ticker.ask
         try:
-            order = self.market.create_swap_market_order(
-                product, "buy", amount, leverage=1.0, reduce_only=False
+            from snowball.maker import maker_buy_price
+
+            limit_px = maker_buy_price(bid, ask, ref)
+            if limit_px is None or limit_px <= 0:
+                bid2, ask2 = self.market.fetch_bba(product)
+                bid = bid if bid is not None else bid2
+                ask = ask if ask is not None else ask2
+                limit_px = maker_buy_price(bid, ask, ref)
+            if limit_px is None or limit_px <= 0:
+                log.info(
+                    "futures live buy skipped: no book bid for maker",
+                    extra={"data": {"product": product, "bid": bid, "ask": ask}},
+                )
+                return
+            amount = round_amount_down(notional_usd / float(limit_px), 0.01)
+            if amount < 0.01:
+                log.info(
+                    "futures live buy skipped: amount below min",
+                    extra={"data": {"product": product, "limit_px": limit_px}},
+                )
+                return
+            timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
+            order = self.market.create_swap_maker_limit_order(
+                product,
+                "buy",
+                amount,
+                price=limit_px,
+                bid=bid,
+                ask=ask,
+                leverage=1.0,
+                reduce_only=False,
+                timeout_sec=timeout,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception(
@@ -806,7 +838,7 @@ class FuturesEngine:
         fill_px, fill_qty, fee_usd = parse_futures_order_fill(order)
         if fill_px <= 0 or fill_qty <= 0:
             log.error(
-                "futures live buy unsettled",
+                "futures live buy unfilled/canceled maker limit",
                 extra={"data": {"product": product, "order_id": order.get("id")}},
             )
             return
@@ -873,7 +905,7 @@ class FuturesEngine:
                     ok_sw, reason_sw = strategy_exit_allowed(
                         lot,
                         paper_px,
-                        min_take_profit_pct=settings.min_take_profit_pct,
+                        min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                         never_sell_red=settings.never_sell_red,
                     fee_buffer_pct=getattr(settings, "fee_buffer_pct", 0.0),
                     )
@@ -951,9 +983,89 @@ class FuturesEngine:
             if amount < 0.01:
                 continue
             try:
-                order = self.market.create_swap_market_order(
-                    product, "sell", amount, leverage=1.0, reduce_only=True
+                from snowball.maker import (
+                    URGENT_MAKER_TIMEOUT_SEC,
+                    maker_sell_price,
+                    session_close_urgent,
                 )
+                from snowball.futures.session import session_times_from_settings
+
+                emergency = is_emergency_flatten_reason(reason)
+                times = session_times_from_settings(settings)
+                urgent = (not emergency) and (
+                    ":session_close" in reason
+                    and session_close_urgent(
+                        now,
+                        exit_start=times["exit_start"],
+                        exit_end=times["exit_end"],
+                    )
+                )
+                if emergency:
+                    order = self.market.create_swap_market_order(
+                        product, "sell", amount, leverage=1.0, reduce_only=True
+                    )
+                else:
+                    bid, ask = ticker.bid, ticker.ask
+                    sell_px = maker_sell_price(bid, ask, ticker.last)
+                    if sell_px is None:
+                        bid2, ask2 = self.market.fetch_bba(product)
+                        bid = bid if bid is not None else bid2
+                        ask = ask if ask is not None else ask2
+                        sell_px = maker_sell_price(bid, ask, ticker.last)
+                    if sell_px is None:
+                        if urgent:
+                            # Session would miss close — careful market fallback.
+                            log.warning(
+                                "futures session close maker skipped; market fallback",
+                                extra={"data": {"product": product, "position_id": lot.id}},
+                            )
+                            order = self.market.create_swap_market_order(
+                                product, "sell", amount, leverage=1.0, reduce_only=True
+                            )
+                        else:
+                            log.info(
+                                "futures live sell skipped: no ask for maker",
+                                extra={
+                                    "data": {
+                                        "product": product,
+                                        "position_id": lot.id,
+                                    }
+                                },
+                            )
+                            continue
+                    else:
+                        timeout = (
+                            URGENT_MAKER_TIMEOUT_SEC
+                            if urgent
+                            else float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
+                        )
+                        order = self.market.create_swap_maker_limit_order(
+                            product,
+                            "sell",
+                            amount,
+                            price=sell_px,
+                            bid=bid,
+                            ask=ask,
+                            leverage=1.0,
+                            reduce_only=True,
+                            timeout_sec=timeout,
+                        )
+                        fill_px_chk, fill_qty_chk, _ = parse_futures_order_fill(order)
+                        if (fill_px_chk <= 0 or fill_qty_chk <= 0) and urgent:
+                            # One cancel/replace already done inside settle; market fallback.
+                            log.warning(
+                                "futures session close maker unfilled; market fallback",
+                                extra={
+                                    "data": {
+                                        "product": product,
+                                        "position_id": lot.id,
+                                        "order_id": order.get("id"),
+                                    }
+                                },
+                            )
+                            order = self.market.create_swap_market_order(
+                                product, "sell", amount, leverage=1.0, reduce_only=True
+                            )
             except Exception as exc:  # noqa: BLE001
                 log.exception(
                     "futures live sell failed",
@@ -969,7 +1081,7 @@ class FuturesEngine:
             fill_px, fill_qty, fee_usd = parse_futures_order_fill(order)
             if fill_px <= 0 or fill_qty <= 0:
                 log.error(
-                    "futures live sell unsettled",
+                    "futures live sell unfilled/canceled maker limit",
                     extra={
                         "data": {
                             "product": product,

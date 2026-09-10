@@ -271,7 +271,7 @@ class Engine:
                 ok_sw, reason_sw = strategy_exit_allowed(
                     lot,
                     mark,
-                    min_take_profit_pct=settings.min_take_profit_pct,
+                    min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                     never_sell_red=settings.never_sell_red,
                     fee_buffer_pct=settings.fee_buffer_pct,
                 )
@@ -300,7 +300,7 @@ class Engine:
                 ok_sw, reason_sw = strategy_exit_allowed(
                     lot,
                     mark,
-                    min_take_profit_pct=settings.min_take_profit_pct,
+                    min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                     never_sell_red=settings.never_sell_red,
                     fee_buffer_pct=settings.fee_buffer_pct,
                 )
@@ -395,6 +395,7 @@ class Engine:
                 extra={"data": {"product": product, "strategy": strategy_id, "reason": reason_tf}},
             )
             return
+
 
         # Cap new lots so crypto open notional stays within CRYPTO_ACCOUNT_BUDGET_PCT.
         crypto_notional = self._crypto_leg_notional(marks)
@@ -545,7 +546,7 @@ class Engine:
         strategy: str,
         notional_usd: float | None = None,
     ) -> None:
-        """Place a Coinbase market buy and record the exchange fill into the ledger."""
+        """Place a Coinbase maker-limit buy and record the exchange fill into the ledger."""
         from snowball.live import parse_order_fill
 
         settings = self.state.settings
@@ -594,10 +595,36 @@ class Engine:
         if est_px <= 0:
             return
         amount = notional / est_px
+        # Maker-limit entry: rest at/near best bid (post-only). No market buys.
+        bid = getattr(ticker, "bid", None)
+        ask = getattr(ticker, "ask", None)
         try:
-            # Coinbase spot market buys need quote notional (cost) or price.
-            order = broker.create_market_order(
-                product, "buy", amount, price=est_px, cost=notional
+            from snowball.maker import maker_buy_price
+
+            limit_px = maker_buy_price(bid, ask, est_px)
+            if limit_px is None or limit_px <= 0:
+                log.info(
+                    "live buy skipped",
+                    extra={
+                        "data": {
+                            "product": product,
+                            "reason": "no_book_bid_for_maker",
+                            "bid": bid,
+                            "ask": ask,
+                        }
+                    },
+                )
+                return
+            amount = notional / limit_px
+            timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
+            order = broker.create_maker_limit_order(
+                product,
+                "buy",
+                amount,
+                price=limit_px,
+                bid=bid,
+                ask=ask,
+                timeout_sec=timeout,
             )
         except Exception as exc:  # noqa: BLE001 — insufficient funds / API errors
             log.exception(
@@ -608,7 +635,7 @@ class Engine:
         fill_px, fill_qty, fee_usd = parse_order_fill(order if isinstance(order, dict) else {})
         if fill_qty <= 0 or fill_px <= 0:
             log.warning(
-                "live buy returned empty fill; skip ledger",
+                "live buy unfilled/canceled maker limit; skip ledger",
                 extra={"data": {"product": product, "order": order}},
             )
             return
@@ -690,7 +717,38 @@ class Engine:
             if live:
                 assert broker is not None
                 try:
-                    order = broker.create_market_order(product, "sell", float(lot.qty))
+                    # Emergency flatten may use market; normal exits prefer maker at/near ask.
+                    if is_emergency_flatten_reason(reason):
+                        order = broker.create_market_order(product, "sell", float(lot.qty))
+                    else:
+                        from snowball.maker import maker_sell_price
+
+                        sell_px = maker_sell_price(ticker.bid, ticker.ask, ticker.last)
+                        if sell_px is None:
+                            log.info(
+                                "live sell skipped no ask for maker",
+                                extra={
+                                    "data": {
+                                        "product": product,
+                                        "position_id": lot.id,
+                                        "bid": ticker.bid,
+                                        "ask": ticker.ask,
+                                    }
+                                },
+                            )
+                            continue
+                        timeout = float(
+                            getattr(settings, "maker_timeout_seconds", 90.0) or 90.0
+                        )
+                        order = broker.create_maker_limit_order(
+                            product,
+                            "sell",
+                            float(lot.qty),
+                            price=sell_px,
+                            bid=ticker.bid,
+                            ask=ticker.ask,
+                            timeout_sec=timeout,
+                        )
                 except Exception as exc:  # noqa: BLE001 — keep loop alive
                     log.exception(
                         "live sell failed; skip lot",
@@ -706,9 +764,9 @@ class Engine:
                 fill_px, fill_qty, fee_usd = parse_order_fill(
                     order if isinstance(order, dict) else {}
                 )
-                if fill_px <= 0:
+                if fill_px <= 0 or fill_qty <= 0:
                     log.warning(
-                        "live sell empty fill; skip ledger",
+                        "live sell unfilled/canceled maker limit; skip ledger",
                         extra={"data": {"product": product, "position_id": lot.id, "order": order}},
                     )
                     continue
@@ -898,7 +956,10 @@ def main() -> None:
                 "stock_live_enabled": settings.stock_live_enabled,
                 "lane_budgets": settings.lane_budget_pcts(),
                 "min_take_profit_pct": settings.min_take_profit_pct,
+                "sma_min_take_profit_pct": settings.sma_min_take_profit_pct,
                 "fee_buffer_pct": settings.fee_buffer_pct,
+                "effective_take_profit_floor": settings.effective_min_take_profit_pct(),
+                "effective_sma_take_profit_floor": settings.effective_min_take_profit_pct_for("sma_15m"),
                 "futures_enabled": settings.futures_enabled,
                 "futures_mode": settings.futures_mode,
             }

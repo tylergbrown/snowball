@@ -157,6 +157,6 @@ def test_exits_still_allowed_while_paused(app_state: AppState, monkeypatch) -> N
         last={p: 100.0 for p in PAIRS},
         ohlcv={("BTC-USD", "15m"): list(DEATH)},
     )
-    market.last["BTC-USD"] = 105.0  # strategy exit still needs >=5% TP while paused
+    market.last["BTC-USD"] = 109.0  # SMA strategy exit needs >=9% effective (8%+1% fee) while paused
     Engine(app_state, market).tick()
     assert app_state.ledger.open_count("BTC-USD") == 0
