@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     slippage_bps: float = 5.0
     taker_fee_bps: float = 0.0
     # Max fraction of total Coinbase account value the crypto lane may deploy (open notional).
-    crypto_account_budget_pct: float = 0.35
+    crypto_account_budget_pct: float = 0.33
 
     sqlite_path: Path = Path("./data/snowball.db")
     heartbeat_path: Path = Path("./data/heartbeat")
@@ -136,7 +136,7 @@ class Settings(BaseSettings):
     stock_max_notional_usd: float = 100.0
     stock_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value stock lane may use (INTX perps, lev=1)
-    stock_account_budget_pct: float = 0.35
+    stock_account_budget_pct: float = 0.32
     stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d,rsi_15m,bb_15m,rsi_1d,bb_1d"
     stock_poll_seconds: float = 60.0
     # Cap symbols that the engine may trade (marks universe may be larger)
@@ -190,11 +190,29 @@ class Settings(BaseSettings):
     crash_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
     crash_poll_seconds: float = 60.0
 
+    # --- Fed Desk (CME FedWatch research + FOMC skew bets; dual-gated live) ---
+    fed_enabled: bool = True
+    fed_mode: Literal["paper", "live"] = "paper"
+    # Dual gate for live Fed Desk: FED_MODE=live AND FED_LIVE_ENABLED=true
+    fed_live_enabled: bool = False
+    fed_sqlite_path: Path = Path("./data/snowball_fed.db")
+    fed_bankroll_usd: float = 1000.0
+    # Max 1 open lot per index
+    fed_max_positions: int = 1
+    fed_max_notional_usd: float = 250.0
+    fed_daily_loss_kill_usd: float = 25.0
+    # Fraction of total Coinbase account value Fed Desk may use (50/50 across products)
+    fed_account_budget_pct: float = 0.05
+    fed_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
+    fed_poll_seconds: float = 60.0
+    # Research poll cadence (FedWatch); trading loop uses fed_poll_seconds
+    fed_research_poll_seconds: float = 10800.0
+
     coinbase_api_key: str = ""
     coinbase_api_secret: str = ""
     coinbase_api_passphrase: str = ""
 
-    @field_validator("mode", "stock_mode", "futures_mode", "crash_mode", mode="before")
+    @field_validator("mode", "stock_mode", "futures_mode", "crash_mode", "fed_mode", mode="before")
     @classmethod
     def _norm_mode(cls, v: object) -> object:
         if isinstance(v, str):
@@ -330,6 +348,7 @@ class Settings(BaseSettings):
             stock_pct=self.stock_account_budget_pct,
             futures_pct=self.futures_account_budget_pct,
             crash_pct=self.crash_account_budget_pct,
+            fed_pct=self.fed_account_budget_pct,
         )
 
     @property
@@ -400,6 +419,35 @@ class Settings(BaseSettings):
     def crash_live_orders_permitted(self) -> bool:
         """Crash live shorts require BOTH crash flags. Default False."""
         return self.crash_mode == "live" and self.crash_live_enabled is True
+
+
+    @property
+    def fed_product_list(self) -> list[str]:
+        items = [p.strip().upper() for p in self.fed_products.split(",") if p.strip()]
+        return items or ["SPY-PERP-INTX", "QQQ-PERP-INTX"]
+
+    def assert_fed_config(self) -> None:
+        """Refuse inconsistent dual-gate; allow paper or fully dual-gated live."""
+        if not self.fed_enabled:
+            return
+        if self.fed_mode == "live" and not self.fed_live_enabled:
+            raise LiveTradingRefused(
+                "Fed Desk refused: FED_MODE=live but FED_LIVE_ENABLED "
+                "is false (both required for live Fed Desk orders)."
+            )
+        if self.fed_mode != "live" and self.fed_live_enabled:
+            raise LiveTradingRefused(
+                "Fed Desk refused: FED_LIVE_ENABLED=true while "
+                "FED_MODE is not live (dual gate required)."
+            )
+        if not (0.0 < float(self.fed_account_budget_pct) <= 1.0):
+            raise LiveTradingRefused(
+                f"FED_ACCOUNT_BUDGET_PCT must be in (0,1]; got {self.fed_account_budget_pct}"
+            )
+
+    def fed_live_orders_permitted(self) -> bool:
+        """Fed Desk live orders require BOTH fed flags. Default False."""
+        return self.fed_mode == "live" and self.fed_live_enabled is True
 
     def live_orders_permitted(self) -> bool:
         """Live ccxt orders require BOTH flags. Default config returns False."""

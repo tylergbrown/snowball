@@ -386,7 +386,29 @@
       </table>
     </div>
   </main>
-  <script>
+  
+    <div class="panel" id="fedPanel">
+      <h2>Fed Desk</h2>
+      <div class="warn-banner" id="fedBanner">FOMC FedWatch · 5% budget · dual-gated · ≥70% skew bets</div>
+      <p class="note">Research always on via <code>cme-fedwatch</code>. Educated SPY/QQQ bets only inside 14-day FOMC window when max(P_hold,P_hike,P_cut)≥70%. Cut→long, hike→short, hold→flat. Isolated <code>data/snowball_fed.db</code>.</p>
+      <div class="muted" id="fedMeta"></div>
+      <div class="grid">
+        <div class="card"><div class="label">Next FOMC / days</div><div class="value" id="fedMeeting">—</div></div>
+        <div class="card"><div class="label">P(hold) / cut / hike</div><div class="value" id="fedProbs">—</div></div>
+        <div class="card"><div class="label">Bet eligible / status</div><div class="value" id="fedBet">—</div></div>
+        <div class="card"><div class="label">Mode / budget / halt</div><div class="value" id="fedMode">—</div></div>
+      </div>
+      <table>
+        <thead><tr><th>Product</th><th>Last</th><th>Open</th><th>Allot</th></tr></thead>
+        <tbody id="fedPairs"></tbody>
+      </table>
+      <table>
+        <thead><tr><th>Side</th><th>Product</th><th>Qty</th><th>Entry</th><th>Mark</th><th>uPnL</th></tr></thead>
+        <tbody id="fedPositions"></tbody>
+      </table>
+    </div>
+
+<script>
     const $ = (id) => document.getElementById(id);
     const usd = (n) => n == null ? "—" : Number(n).toLocaleString(undefined, {style:"currency", currency:"USD", maximumFractionDigits: 2});
     const num = (n, d=4) => n == null ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d});
@@ -624,6 +646,30 @@
           </tr>`).join("") || `<tr><td colspan="7" class="muted">no fills</td></tr>`;
       } else {
         $("crashMeta").textContent = "Crash Guard lane disabled";
+      }
+      const fd = s.fed || {};
+      if (fd.enabled) {
+        const ban = $("fedBanner");
+        if (ban) ban.textContent = fd.mode === "live"
+          ? "LIVE · Fed Desk · 5% · dual-gated · FOMC skew"
+          : "PAPER · Fed Desk · research on · dual gate off";
+        $("fedMeta").textContent = fd.label || "";
+        $("fedMeeting").textContent = `${fd.next_meeting_date || "—"} · ${fd.days_left ?? "?"}d · window=${fd.in_window}`;
+        const ph = fd.p_hold != null ? (fd.p_hold*100).toFixed(0) : "?";
+        const pc = fd.p_cut != null ? (fd.p_cut*100).toFixed(0) : "?";
+        const pk = fd.p_hike != null ? (fd.p_hike*100).toFixed(0) : "?";
+        $("fedProbs").textContent = `H${ph}% / C${pc}% / K${pk}% · skew=${fd.skew || "?"}`;
+        $("fedBet").textContent = `eligible=${fd.bet_eligible} · ${fd.bet_status || "idle"} · dir=${fd.direction || "flat"}`;
+        const fr = fd.risk || {};
+        $("fedMode").textContent = `${fd.mode} · ${((fr.budget_pct||0)*100).toFixed(0)}% · halt_fomc=${fd.watcher_halt_around_fomc}`;
+        $("fedPairs").innerHTML = (fd.pairs || []).map(p => `
+          <tr><td>${p.product}</td><td>${p.last ?? "—"}</td><td>${p.open_count}/${p.max_open}</td><td>${p.allotment_usd ?? "—"}</td></tr>`).join("")
+          || `<tr><td colspan="4" class="muted">no fed marks yet</td></tr>`;
+        $("fedPositions").innerHTML = (fd.positions || []).map(p => `
+          <tr><td>${p.side}</td><td>${p.product}</td><td>${p.qty}</td><td>${p.entry_price}</td><td>${p.mark}</td><td>${p.unrealized_pnl}</td></tr>`).join("")
+          || `<tr><td colspan="6" class="muted">flat</td></tr>`;
+      } else if ($("fedMeta")) {
+        $("fedMeta").textContent = "Fed Desk lane disabled";
       }
 
       const w = s.watcher || {};

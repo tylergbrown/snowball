@@ -1,10 +1,11 @@
 """Cross-lane capital allocation from total Coinbase account value.
 
 Default split (recomputed each tick/session from live account value):
-  • Crypto live trader: 35%
-  • Stock trader:       35%
+  • Crypto live trader: 33%
+  • Stock trader:       32%
   • Future Trader:      20%
   • Crash Guard:        10%
+  • Fed Desk:            5%
 
 Philosophy: hold underwater; never sell red. These helpers only size *new*
 entries / max open notional — they never force loss exits.
@@ -15,10 +16,11 @@ from __future__ import annotations
 from typing import Any
 
 
-DEFAULT_CRYPTO_BUDGET_PCT = 0.35
-DEFAULT_STOCK_BUDGET_PCT = 0.35
+DEFAULT_CRYPTO_BUDGET_PCT = 0.33
+DEFAULT_STOCK_BUDGET_PCT = 0.32
 DEFAULT_FUTURES_BUDGET_PCT = 0.20
 DEFAULT_CRASH_BUDGET_PCT = 0.10
+DEFAULT_FED_BUDGET_PCT = 0.05
 
 
 def lane_budget_pcts(
@@ -27,6 +29,7 @@ def lane_budget_pcts(
     stock_pct: float = DEFAULT_STOCK_BUDGET_PCT,
     futures_pct: float = DEFAULT_FUTURES_BUDGET_PCT,
     crash_pct: float = DEFAULT_CRASH_BUDGET_PCT,
+    fed_pct: float = DEFAULT_FED_BUDGET_PCT,
 ) -> dict[str, float]:
     """Return normalized lane fractions (does not force sum==1; callers own knobs)."""
     return {
@@ -34,6 +37,7 @@ def lane_budget_pcts(
         "stock": float(stock_pct),
         "futures": float(futures_pct),
         "crash": float(crash_pct),
+        "fed": float(fed_pct),
     }
 
 
@@ -44,6 +48,7 @@ def lane_budgets_usd(
     stock_pct: float = DEFAULT_STOCK_BUDGET_PCT,
     futures_pct: float = DEFAULT_FUTURES_BUDGET_PCT,
     crash_pct: float = DEFAULT_CRASH_BUDGET_PCT,
+    fed_pct: float = DEFAULT_FED_BUDGET_PCT,
 ) -> dict[str, float]:
     """Dollar budgets per lane from total account value."""
     av = max(0.0, float(account_value_usd))
@@ -53,6 +58,7 @@ def lane_budgets_usd(
         "stock_usd": av * float(stock_pct),
         "futures_usd": av * float(futures_pct),
         "crash_usd": av * float(crash_pct),
+        "fed_usd": av * float(fed_pct),
     }
 
 

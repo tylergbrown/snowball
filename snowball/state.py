@@ -65,6 +65,17 @@ class AppState:
     crash_budget_usd: float | None = None
     crash_per_index_allotment_usd: float | None = None
     crash_last_triggers: dict = field(default_factory=dict)
+    # --- Fed Desk (isolated FOMC research + directional bets) ---
+    fed_ledger: object | None = None
+    fed_pairs: dict[str, PairSnapshot] = field(default_factory=dict)
+    fed_last_tick_at: datetime | None = None
+    fed_mark_source: str = "coinbase_perp"
+    fed_engine: object | None = None
+    fed_account_value_usd: float | None = None
+    fed_budget_usd: float | None = None
+    fed_per_index_allotment_usd: float | None = None
+    fed_last_research: dict = field(default_factory=dict)
+    fed_bet_status: str = "idle"
 
     def marks(self) -> dict[str, float]:
         out: dict[str, float] = {}

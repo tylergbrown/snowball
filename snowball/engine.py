@@ -970,6 +970,11 @@ def build_state(
 
         settings.assert_crash_config()
         attach_crash_lane(state)
+    if getattr(settings, "fed_enabled", False):
+        from snowball.fed.engine import attach_fed_lane
+
+        settings.assert_fed_config()
+        attach_fed_lane(state)
     market = market or CcxtMarket(settings)
     return state, Engine(state, market)
 
@@ -1114,6 +1119,28 @@ def main() -> None:
                     "crash_live_enabled": settings.crash_live_enabled,
                     "budget_pct": settings.crash_account_budget_pct,
                     "live_orders": settings.crash_live_orders_permitted(),
+                }
+            },
+        )
+
+    if getattr(settings, "fed_enabled", False) and getattr(state, "fed_engine", None) is not None:
+        fed_engine = state.fed_engine
+        t_fd = threading.Thread(
+            target=fed_engine.run_forever, name="snowball-fed", daemon=True
+        )
+        t_fd.start()
+        extra_threads.append(t_fd)
+        log.info(
+            "Fed Desk thread started",
+            extra={
+                "data": {
+                    "products": settings.fed_product_list,
+                    "sqlite": str(settings.fed_sqlite_path),
+                    "mark_source": state.fed_mark_source,
+                    "fed_mode": settings.fed_mode,
+                    "fed_live_enabled": settings.fed_live_enabled,
+                    "budget_pct": settings.fed_account_budget_pct,
+                    "live_orders": settings.fed_live_orders_permitted(),
                 }
             },
         )

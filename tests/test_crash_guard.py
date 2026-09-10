@@ -110,12 +110,14 @@ def test_allocation_includes_crash_10() -> None:
 
     pcts = lane_budget_pcts()
     assert pcts["crash"] == 0.10
-    assert pcts["crypto"] == 0.35
-    assert pcts["stock"] == 0.35
+    assert pcts["crypto"] == 0.33
+    assert pcts["stock"] == 0.32
     assert pcts["futures"] == 0.20
+    assert pcts["fed"] == 0.05
     assert abs(sum(pcts.values()) - 1.0) < 1e-9
     b = lane_budgets_usd(10_000.0)
     assert b["crash_usd"] == 1000.0
+    assert b["fed_usd"] == 500.0
 
 
 class FakeCrashMarket:
