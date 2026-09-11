@@ -137,7 +137,7 @@ def build_crash_snapshot(state: AppState) -> dict[str, Any]:
 
         mode_label = "live" if live else "paper"
         label = (
-            "Crash Guard — LIVE shorts (dual-gated); 10% budget 50/50 SPY/QQQ; never cover red"
+            "Crash Guard — LIVE shorts (dual-gated); CFM US500/TECH; never cover red"
             if live
             else "Crash Guard — paper shorts; isolated book; never cover red"
         )
@@ -190,7 +190,11 @@ def build_crash_snapshot(state: AppState) -> dict[str, Any]:
                 "fee_buffer_pct": getattr(settings, "fee_buffer_pct", 0.0),
                 "effective_take_profit_floor": settings.effective_min_take_profit_pct(),
                 "never_cover_red": True,
-                "leverage": 1.0,
+                "cfm_max_contracts": settings.cfm_max_contracts,
+                "cfm_leverage": settings.cfm_leverage,
+                "cfm_margin_rate": settings.cfm_margin_rate,
+                "venue": "CFM_CDE",
+                "leverage": settings.cfm_leverage,
             },
             "products": products,
             "pairs": pairs,

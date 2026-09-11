@@ -209,7 +209,7 @@
     </div>
     <div class="card">
       <h2 class="section">Future Trader</h2>
-      <div class="warn-banner" id="futuresBanner">Session day-trade · Coinbase perps (SPY/QQQ) · isolated book · dual-gated live</div>
+      <div class="warn-banner" id="futuresBanner">Session day-trade · CFM CDE (US500/TECH) · isolated book · dual-gated live</div>
       <p class="note">Long-only session engine (ET): entry ~09:25–09:30 (late catch-up OK), exit ~15:55–16:00 if green else hold overnight. Budget = FUTURES_ACCOUNT_BUDGET_PCT (default 20%) account value, 50/50 SPY/QQQ. Max 1 lot/index. Crypto ledger untouched.</p>
       <div class="muted" id="futuresMeta"></div>
       <div class="kpis" style="margin-top:10px">
@@ -254,7 +254,7 @@
 
     <div class="card">
       <h2 class="section">Crash Guard</h2>
-      <div class="warn-banner" id="crashBanner">Short hedge · SPY/QQQ INTX · 10% budget · dual-gated live · never cover red</div>
+      <div class="warn-banner" id="crashBanner">Short hedge · CFM US500/TECH · 10% budget · dual-gated live · never cover red</div>
       <p class="note">Short-only crash hedge (isolated <code>data/snowball_crash.db</code>). Triggers: daily ≤−2%, RSI(14)≤30 dump context, or close &lt; BB lower with expanding width. Max 1 short/index, lev 1x, maker-limit. Cover only when short PnL ≥6%+1% fee buffer. Long books untouched.</p>
       <div class="muted" id="crashMeta"></div>
       <div class="kpis" style="margin-top:10px">
@@ -555,8 +555,8 @@
         const live = (fut.mode || "") === "live";
         const ban = $("futuresBanner");
         if (ban) ban.textContent = live
-          ? "LIVE · dual-gated · budget% · 50/50 SPY/QQQ · never-sell-red exits"
-          : "PAPER · session day-trade · isolated book · dual gate off";
+          ? "LIVE · dual-gated · CFM CDE US500/TECH · never-sell-red exits"
+          : "PAPER · session day-trade · CFM product ids · dual gate off";
         $("futuresMeta").textContent =
           `${fut.label || "Future Trader"} · mode=${fut.mode || "?"} · marks=${fut.mark_source || "?"} · products=${(fut.products||[]).join(",")}` +
           (fst.strategies ? ` · ${(fst.strategies||[]).join("+")}` : "") +

@@ -143,7 +143,7 @@ def build_fed_snapshot(state: AppState) -> dict[str, Any]:
 
         mode_label = "live" if live else "paper"
         label = (
-            "Fed Desk — LIVE dual-gated; 5% budget 50/50 SPY/QQQ; FOMC skew bets"
+            "Fed Desk — LIVE dual-gated; CFM US500/TECH; FOMC skew bets"
             if live
             else "Fed Desk — paper; research always on; dual gate off"
         )
@@ -213,7 +213,11 @@ def build_fed_snapshot(state: AppState) -> dict[str, Any]:
                 "effective_take_profit_floor": settings.effective_min_take_profit_pct(),
                 "never_sell_red": True,
                 "never_cover_red": True,
-                "leverage": 1.0,
+                "cfm_max_contracts": settings.cfm_max_contracts,
+                "cfm_leverage": settings.cfm_leverage,
+                "cfm_margin_rate": settings.cfm_margin_rate,
+                "venue": "CFM_CDE",
+                "leverage": settings.cfm_leverage,
             },
             "products": products,
             "pairs": pairs,

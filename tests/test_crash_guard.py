@@ -170,7 +170,7 @@ def _paper_settings(tmp_path: Path, **kwargs) -> Settings:
         crash_mode="paper",
         crash_live_enabled=False,
         crash_sqlite_path=tmp_path / "crash.db",
-        crash_products="SPY-PERP-INTX,QQQ-PERP-INTX",
+        crash_products="US5-19DEC30-CDE,TEK-19DEC30-CDE",
         crash_poll_seconds=0.05,
         crash_max_positions=1,
         crash_max_notional_usd=500.0,
@@ -187,8 +187,7 @@ def _paper_settings(tmp_path: Path, **kwargs) -> Settings:
 def test_trigger_fires_paper_short(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CRASH_MODE", raising=False)
     monkeypatch.delenv("CRASH_LIVE_ENABLED", raising=False)
-    # Paper budget from bankroll equity: 10_000 * 10% / 2 = 500 per index,
-    # but shared per-leg autoscale caps at 100 + floor(10000/100) = 200.
+    # CFM: full lane budget/n (no per-leg soft cap); size floors to 1 contract.
     settings = _paper_settings(tmp_path, crash_bankroll_usd=10_000.0)
     state = AppState(settings=settings, ledger=PaperLedger(settings.sqlite_path, 1000.0))
     attach_crash_lane(state)
@@ -196,11 +195,11 @@ def test_trigger_fires_paper_short(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     engine = CrashEngine(state, market=market)  # type: ignore[arg-type]
     engine.tick()
     assert state.crash_ledger is not None
-    assert state.crash_ledger.open_count("SPY-PERP-INTX") == 1
-    assert state.crash_ledger.open_count("QQQ-PERP-INTX") == 1
-    spy = state.crash_ledger.open_positions("SPY-PERP-INTX")[0]
+    assert state.crash_ledger.open_count("US5-19DEC30-CDE") == 1
+    assert state.crash_ledger.open_count("TEK-19DEC30-CDE") == 1
+    spy = state.crash_ledger.open_positions("US5-19DEC30-CDE")[0]
     assert spy.side == "short"
-    assert spy.notional_usd == pytest.approx(200.0, rel=0.05)
+    assert spy.notional_usd == pytest.approx(97.5, rel=0.05)  # 1 CFM contract * mark
 
 
 def test_second_entry_blocked_while_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -216,9 +215,9 @@ def test_second_entry_blocked_while_open(tmp_path: Path, monkeypatch: pytest.Mon
         "per_index_usd": 500.0,
     }
     engine.tick()
-    assert state.crash_ledger.open_count("SPY-PERP-INTX") == 1
+    assert state.crash_ledger.open_count("US5-19DEC30-CDE") == 1
     engine.tick()
-    assert state.crash_ledger.open_count("SPY-PERP-INTX") == 1  # no pyramid
+    assert state.crash_ledger.open_count("US5-19DEC30-CDE") == 1  # no pyramid
 
 
 def test_cover_refused_when_red_allowed_when_green(
@@ -230,7 +229,7 @@ def test_cover_refused_when_red_allowed_when_green(
     attach_crash_lane(state)
     assert state.crash_ledger is not None
     state.crash_ledger.open_short(
-        product="SPY-PERP-INTX",
+        product="US5-19DEC30-CDE",
         fill_px=100.0,
         notional_usd=100.0,
         slippage_bps=0.0,
@@ -241,40 +240,40 @@ def test_cover_refused_when_red_allowed_when_green(
     # Red short (mark above entry) — hold
     market = FakeCrashMarket(last=105.0, closes=[100.0] * 40)  # no new trigger needed
     engine = CrashEngine(state, market=market)  # type: ignore[arg-type]
-    state.crash_pairs["SPY-PERP-INTX"] = PairSnapshot(
-        product="SPY-PERP-INTX", last=105.0, bid=104.9, ask=105.1, max_open=1
+    state.crash_pairs["US5-19DEC30-CDE"] = PairSnapshot(
+        product="US5-19DEC30-CDE", last=105.0, bid=104.9, ask=105.1, max_open=1
     )
     engine._maybe_cover(
-        "SPY-PERP-INTX",
-        state.crash_ledger.open_positions("SPY-PERP-INTX"),
-        {"SPY-PERP-INTX": 105.0},
+        "US5-19DEC30-CDE",
+        state.crash_ledger.open_positions("US5-19DEC30-CDE"),
+        {"US5-19DEC30-CDE": 105.0},
         datetime.now(timezone.utc),
     )
-    assert state.crash_ledger.open_count("SPY-PERP-INTX") == 1
+    assert state.crash_ledger.open_count("US5-19DEC30-CDE") == 1
 
     # 6% green refused (needs 7%)
     market.last = 94.0
-    state.crash_pairs["SPY-PERP-INTX"].last = 94.0
+    state.crash_pairs["US5-19DEC30-CDE"].last = 94.0
     engine._maybe_cover(
-        "SPY-PERP-INTX",
-        state.crash_ledger.open_positions("SPY-PERP-INTX"),
-        {"SPY-PERP-INTX": 94.0},
+        "US5-19DEC30-CDE",
+        state.crash_ledger.open_positions("US5-19DEC30-CDE"),
+        {"US5-19DEC30-CDE": 94.0},
         datetime.now(timezone.utc),
     )
-    assert state.crash_ledger.open_count("SPY-PERP-INTX") == 1
+    assert state.crash_ledger.open_count("US5-19DEC30-CDE") == 1
 
     # ≥7% short profit → cover
     market.last = 93.0
-    state.crash_pairs["SPY-PERP-INTX"].last = 93.0
-    state.crash_pairs["SPY-PERP-INTX"].bid = 92.9
-    state.crash_pairs["SPY-PERP-INTX"].ask = 93.1
+    state.crash_pairs["US5-19DEC30-CDE"].last = 93.0
+    state.crash_pairs["US5-19DEC30-CDE"].bid = 92.9
+    state.crash_pairs["US5-19DEC30-CDE"].ask = 93.1
     engine._maybe_cover(
-        "SPY-PERP-INTX",
-        state.crash_ledger.open_positions("SPY-PERP-INTX"),
-        {"SPY-PERP-INTX": 93.0},
+        "US5-19DEC30-CDE",
+        state.crash_ledger.open_positions("US5-19DEC30-CDE"),
+        {"US5-19DEC30-CDE": 93.0},
         datetime.now(timezone.utc),
     )
-    assert state.crash_ledger.open_count("SPY-PERP-INTX") == 0
+    assert state.crash_ledger.open_count("US5-19DEC30-CDE") == 0
 
 
 def test_live_orders_refused_when_paper_mode(
@@ -284,13 +283,13 @@ def test_live_orders_refused_when_paper_mode(
     settings = _paper_settings(tmp_path)  # paper
     state = AppState(settings=settings, ledger=PaperLedger(settings.sqlite_path, 1000.0))
     state.crash_ledger = CrashStore(tmp_path / "cg.db", 1000.0)
-    state.crash_pairs["SPY-PERP-INTX"] = PairSnapshot(
-        product="SPY-PERP-INTX", last=100.0, max_open=1
+    state.crash_pairs["US5-19DEC30-CDE"] = PairSnapshot(
+        product="US5-19DEC30-CDE", last=100.0, max_open=1
     )
     engine = CrashEngine(state, market=FakeCrashMarket())  # type: ignore[arg-type]
     with pytest.raises(LiveTradingRefused):
         engine._open_short_live(
-            "SPY-PERP-INTX",
+            "US5-19DEC30-CDE",
             reason="test",
             now=datetime.now(timezone.utc),
             notional_usd=50.0,

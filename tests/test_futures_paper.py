@@ -38,13 +38,21 @@ def _et(y, m, d, hh, mm) -> datetime:
 
 
 def test_product_symbol_mapping() -> None:
-    assert normalize_futures_product("spy-perp-intx") == "SPY-PERP-INTX"
-    assert normalize_futures_product("QQQ") == "QQQ-PERP-INTX"
-    assert to_futures_ccxt_symbol("SPY-PERP-INTX") == "SPY/USDC:USDC"
-    assert to_futures_ccxt_symbol("QQQ-PERP-INTX") == "QQQ/USDC:USDC"
+    from snowball.futures.market import is_cfm_product
+
+    assert normalize_futures_product("spy-perp-intx") == "US5-19DEC30-CDE"
+    assert normalize_futures_product("QQQ") == "TEK-19DEC30-CDE"
+    assert normalize_futures_product("US5-19DEC30-CDE") == "US5-19DEC30-CDE"
+    assert normalize_futures_product("TEK") == "TEK-19DEC30-CDE"
+    assert to_futures_ccxt_symbol("US5-19DEC30-CDE") == "CDEUS5/USD:USD-301219"
+    assert to_futures_ccxt_symbol("TEK-19DEC30-CDE") == "CDETEK/USD:USD-301219"
+    # Stock-lane INTX single names still map to USDC swaps
     assert to_futures_ccxt_symbol("AAPL-PERP-INTX") == "AAPL/USDC:USDC"
     assert to_futures_ccxt_symbol("NVDA") == "NVDA/USDC:USDC"
-    assert DEFAULT_FUTURES_PRODUCTS == ("SPY-PERP-INTX", "QQQ-PERP-INTX")
+    assert is_cfm_product("US5-19DEC30-CDE")
+    assert is_cfm_product("SPY")
+    assert not is_cfm_product("AAPL-PERP-INTX")
+    assert DEFAULT_FUTURES_PRODUCTS == ("US5-19DEC30-CDE", "TEK-19DEC30-CDE")
 
 
 def test_sma_1d_signal_on_synthetic_daily() -> None:
@@ -110,7 +118,7 @@ def test_live_gate_requires_both_flags(tmp_path: Path, monkeypatch: pytest.Monke
 def test_never_sell_red_blocks_red_exit() -> None:
     lot = Position(
         id=1,
-        product="SPY-PERP-INTX",
+        product="US5-19DEC30-CDE",
         side="long",
         qty=0.1,
         entry_price=100.0,
@@ -246,7 +254,7 @@ def _paper_settings(tmp_path: Path, **kwargs) -> Settings:
         futures_live_enabled=False,
         futures_sqlite_path=tmp_path / "futures.db",
         futures_strategies="session_day",
-        futures_products="SPY-PERP-INTX,QQQ-PERP-INTX",
+        futures_products="US5-19DEC30-CDE,TEK-19DEC30-CDE",
         futures_poll_seconds=0.05,
         futures_max_positions=1,
         futures_max_notional_usd=500.0,
@@ -278,9 +286,9 @@ def test_session_entry_and_no_second_entry(tmp_path: Path, monkeypatch: pytest.M
         "per_index_usd": 50.0,
     }
     # Manually drive session act with frozen budget refresh bypass via tick pieces
-    for product in ("SPY-PERP-INTX", "QQQ-PERP-INTX"):
+    for product in ("US5-19DEC30-CDE", "TEK-19DEC30-CDE"):
         engine._update_pair(product)
-        marks = {product: 200.0 for product in ("SPY-PERP-INTX", "QQQ-PERP-INTX")}
+        marks = {product: 200.0 for product in ("US5-19DEC30-CDE", "TEK-19DEC30-CDE")}
         engine._refresh_budget(marks)
         engine._act_session(
             product=product,
@@ -290,23 +298,23 @@ def test_session_entry_and_no_second_entry(tmp_path: Path, monkeypatch: pytest.M
             daily_killed=False,
             marks=marks,
         )
-    assert state.futures_ledger.open_count("SPY-PERP-INTX") == 1
-    assert state.futures_ledger.open_count("QQQ-PERP-INTX") == 1
+    assert state.futures_ledger.open_count("US5-19DEC30-CDE") == 1
+    assert state.futures_ledger.open_count("TEK-19DEC30-CDE") == 1
 
     # Second entry same day while open — blocked
     engine._act_session(
-        product="SPY-PERP-INTX",
+        product="US5-19DEC30-CDE",
         now=entry_now + timedelta(minutes=2),
         halted=False,
         can_trade=True,
         daily_killed=False,
-        marks={"SPY-PERP-INTX": 200.0, "QQQ-PERP-INTX": 200.0},
+        marks={"US5-19DEC30-CDE": 200.0, "TEK-19DEC30-CDE": 200.0},
     )
-    assert state.futures_ledger.open_count("SPY-PERP-INTX") == 1
+    assert state.futures_ledger.open_count("US5-19DEC30-CDE") == 1
 
     # 50/50-ish notionals (paper uses per_index from bankroll*10%/2)
-    spy = state.futures_ledger.open_positions("SPY-PERP-INTX")[0]
-    qqq = state.futures_ledger.open_positions("QQQ-PERP-INTX")[0]
+    spy = state.futures_ledger.open_positions("US5-19DEC30-CDE")[0]
+    qqq = state.futures_ledger.open_positions("TEK-19DEC30-CDE")[0]
     assert spy.notional_usd == pytest.approx(qqq.notional_usd, rel=0.05)
 
 
@@ -319,7 +327,7 @@ def test_no_entry_when_holding_overnight_red(tmp_path: Path, monkeypatch: pytest
     # Seed overnight loser opened prior ET day
     prior = _et(2026, 9, 9, 9, 26)
     state.futures_ledger.open_buy(
-        product="SPY-PERP-INTX",
+        product="US5-19DEC30-CDE",
         fill_px=200.0,
         notional_usd=50.0,
         slippage_bps=0.0,
@@ -330,21 +338,21 @@ def test_no_entry_when_holding_overnight_red(tmp_path: Path, monkeypatch: pytest
     )
     market = FakeFuturesMarket(last=190.0)  # still red
     engine = FuturesPaperEngine(state, market=market)  # type: ignore[arg-type]
-    state.futures_pairs["SPY-PERP-INTX"] = PairSnapshot(
-        product="SPY-PERP-INTX", last=190.0, max_open=1
+    state.futures_pairs["US5-19DEC30-CDE"] = PairSnapshot(
+        product="US5-19DEC30-CDE", last=190.0, max_open=1
     )
     next_morning = _et(2026, 9, 10, 9, 26).astimezone(timezone.utc)
-    lots = state.futures_ledger.open_positions("SPY-PERP-INTX")
+    lots = state.futures_ledger.open_positions("US5-19DEC30-CDE")
     assert classify_session_state(open_lots=lots, now=next_morning) == "holding_overnight"
     engine._act_session(
-        product="SPY-PERP-INTX",
+        product="US5-19DEC30-CDE",
         now=next_morning,
         halted=False,
         can_trade=True,
         daily_killed=False,
-        marks={"SPY-PERP-INTX": 190.0},
+        marks={"US5-19DEC30-CDE": 190.0},
     )
-    assert state.futures_ledger.open_count("SPY-PERP-INTX") == 1  # no second lot
+    assert state.futures_ledger.open_count("US5-19DEC30-CDE") == 1  # no second lot
 
 
 def test_close_only_if_green_at_close_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -355,7 +363,7 @@ def test_close_only_if_green_at_close_window(tmp_path: Path, monkeypatch: pytest
     assert state.futures_ledger is not None
     opened = _et(2026, 9, 10, 9, 26).astimezone(timezone.utc)
     state.futures_ledger.open_buy(
-        product="SPY-PERP-INTX",
+        product="US5-19DEC30-CDE",
         fill_px=200.0,
         notional_usd=50.0,
         slippage_bps=0.0,
@@ -366,33 +374,33 @@ def test_close_only_if_green_at_close_window(tmp_path: Path, monkeypatch: pytest
     )
     market = FakeFuturesMarket(last=195.0)
     engine = FuturesPaperEngine(state, market=market)  # type: ignore[arg-type]
-    state.futures_pairs["SPY-PERP-INTX"] = PairSnapshot(
-        product="SPY-PERP-INTX", last=195.0, bid=194.9, ask=195.1, max_open=1
+    state.futures_pairs["US5-19DEC30-CDE"] = PairSnapshot(
+        product="US5-19DEC30-CDE", last=195.0, bid=194.9, ask=195.1, max_open=1
     )
     close_now = _et(2026, 9, 10, 15, 56).astimezone(timezone.utc)
     # Red → hold
     engine._act_session(
-        product="SPY-PERP-INTX",
+        product="US5-19DEC30-CDE",
         now=close_now,
         halted=False,
         can_trade=True,
         daily_killed=False,
-        marks={"SPY-PERP-INTX": 195.0},
+        marks={"US5-19DEC30-CDE": 195.0},
     )
-    assert state.futures_ledger.open_count("SPY-PERP-INTX") == 1
+    assert state.futures_ledger.open_count("US5-19DEC30-CDE") == 1
 
     # Green → close
     market.last = 201.0
-    state.futures_pairs["SPY-PERP-INTX"].last = 201.0
+    state.futures_pairs["US5-19DEC30-CDE"].last = 201.0
     engine._act_session(
-        product="SPY-PERP-INTX",
+        product="US5-19DEC30-CDE",
         now=close_now,
         halted=False,
         can_trade=True,
         daily_killed=False,
-        marks={"SPY-PERP-INTX": 201.0},
+        marks={"US5-19DEC30-CDE": 201.0},
     )
-    assert state.futures_ledger.open_count("SPY-PERP-INTX") == 0
+    assert state.futures_ledger.open_count("US5-19DEC30-CDE") == 0
 
 
 def test_paper_still_works_and_api_shows_caps(
@@ -411,8 +419,8 @@ def test_paper_still_works_and_api_shows_caps(
     state.futures_budget_usd = 1000.0
     state.futures_per_index_allotment_usd = 500.0
     state.futures_session_states = {
-        "SPY-PERP-INTX": "flat",
-        "QQQ-PERP-INTX": "flat",
+        "US5-19DEC30-CDE": "flat",
+        "TEK-19DEC30-CDE": "flat",
     }
 
     client = TestClient(create_app(state))
@@ -424,7 +432,7 @@ def test_paper_still_works_and_api_shows_caps(
     assert body["risk"]["budget_pct"] == 0.10
     assert body["risk"]["per_index_allotment_usd"] == 500.0
     assert body["session"]["entry_window_et"].startswith("09:25")
-    assert "SPY-PERP-INTX" in body["products"]
+    assert "US5-19DEC30-CDE" in body["products"]
     page = client.get("/")
     assert b"Future Trader" in page.content
     snap = build_snapshot(state)
@@ -460,14 +468,14 @@ def test_open_lot_refuses_without_dual_gate(
         settings=settings2, ledger=PaperLedger(tmp_path / "c2.db", 1000.0)
     )
     state.futures_ledger = PaperLedger(tmp_path / "f2.db", 1000.0)
-    state.futures_pairs["SPY-PERP-INTX"] = PairSnapshot(
-        product="SPY-PERP-INTX", last=100.0, max_open=1
+    state.futures_pairs["US5-19DEC30-CDE"] = PairSnapshot(
+        product="US5-19DEC30-CDE", last=100.0, max_open=1
     )
     engine = FuturesPaperEngine(state, market=FakeFuturesMarket())  # type: ignore[arg-type]
     with pytest.raises(LiveTradingRefused):
         engine._open_lot(
-            "SPY-PERP-INTX",
-            {"SPY-PERP-INTX": 100.0},
+            "US5-19DEC30-CDE",
+            {"US5-19DEC30-CDE": 100.0},
             reason="session_day:session_enter",
             now=datetime.now(timezone.utc),
             strategy="session_day",
@@ -521,7 +529,7 @@ def test_swap_order_leverage_is_string_for_coinbase() -> None:
             }
 
     mkt = CoinbaseFuturesMarket(exchange=Ex(), allow_orders=True)
-    mkt.create_swap_market_order("SPY-PERP-INTX", "sell", 1.0, leverage=1.0)
+    mkt.create_swap_market_order("US5-19DEC30-CDE", "sell", 1.0, leverage=1.0)
     assert captured[-1]["leverage"] == "1"
     assert isinstance(captured[-1]["leverage"], str)
 

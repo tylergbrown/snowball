@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     # Empty = current calendar year and the prior year (conditional GET, cached).
     clerk_years: str = ""
 
-    # --- STOCK lane (isolated book; live = Coinbase INTX equity perps only) ---
+    # --- STOCK lane (isolated book; live INTX equity perps gated off by default) ---
     stock_enabled: bool = True
     # Dual gate for live stock: STOCK_MODE=live AND STOCK_LIVE_ENABLED=true
     stock_mode: Literal["paper", "live"] = "paper"
@@ -154,7 +154,7 @@ class Settings(BaseSettings):
     earnings_poll_seconds: float = 14400.0
     earnings_sqlite_path: Path = Path("./data/snowball_earnings.db")
 
-    # --- Future Trader (Coinbase equity perps; session day-trade; dual-gated live) ---
+    # --- Future Trader (Coinbase CFM CDE index perps; session day-trade; dual-gated live) ---
     futures_enabled: bool = True
     futures_mode: Literal["paper", "live"] = "paper"
     # Dual gate for live futures: FUTURES_MODE=live AND FUTURES_LIVE_ENABLED=true
@@ -163,14 +163,15 @@ class Settings(BaseSettings):
     futures_bankroll_usd: float = 1000.0
     # Max 1 open lot per index (session engine)
     futures_max_positions: int = 1
-    # Soft ceiling per leg; live sizing uses account budget split (see budget_pct)
+    # Soft ceiling per leg (INTX-era); CFM uses integer contracts + margin gates instead
     futures_max_notional_usd: float = 500.0
     futures_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value FT may use (split 50/50 across products)
     futures_account_budget_pct: float = 0.20
     # session_day = ET session long-only engine; legacy sma_1d/donchian_1d still parseable
     futures_strategies: str = "session_day"
-    futures_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
+    # CFM CDE: US 500 PERP + TECH PERP (not INTX *-PERP-INTX)
+    futures_products: str = "US5-19DEC30-CDE,TEK-19DEC30-CDE"
     futures_poll_seconds: float = 60.0
     # America/New_York windows (HH:MM). Entry: preferred 09:25-09:30; late catch-up until exit.
     futures_entry_start_et: str = "09:25"
@@ -179,7 +180,7 @@ class Settings(BaseSettings):
     futures_exit_end_et: str = "16:00"
 
 
-    # --- Crash Guard (short hedge on SPY/QQQ INTX; dual-gated live) ---
+    # --- Crash Guard (short hedge on CFM US500/TECH; dual-gated live) ---
     crash_enabled: bool = True
     crash_mode: Literal["paper", "live"] = "paper"
     # Dual gate for live crash shorts: CRASH_MODE=live AND CRASH_LIVE_ENABLED=true
@@ -192,7 +193,7 @@ class Settings(BaseSettings):
     crash_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value Crash Guard may use (50/50 across products)
     crash_account_budget_pct: float = 0.10
-    crash_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
+    crash_products: str = "US5-19DEC30-CDE,TEK-19DEC30-CDE"
     crash_poll_seconds: float = 60.0
 
     # --- Fed Desk (CME FedWatch research + FOMC skew bets; dual-gated live) ---
@@ -208,10 +209,18 @@ class Settings(BaseSettings):
     fed_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value Fed Desk may use (50/50 across products)
     fed_account_budget_pct: float = 0.05
-    fed_products: str = "SPY-PERP-INTX,QQQ-PERP-INTX"
+    fed_products: str = "US5-19DEC30-CDE,TEK-19DEC30-CDE"
     fed_poll_seconds: float = 60.0
     # Research poll cadence (FedWatch); trading loop uses fed_poll_seconds
     fed_research_poll_seconds: float = 10800.0
+
+    # --- CFM CDE contract sizing (FT / Crash / Fed) ---
+    # Max integer contracts per index until Tb raises it. Large notionals (~$3k US500).
+    cfm_max_contracts: int = 1
+    # API leverage string for Advanced Trade FUTURE orders (keep low; do not force 20x).
+    cfm_leverage: float = 1.0
+    # Conservative margin estimate vs overnight CFM rates (~7%); used for affordability gates.
+    cfm_margin_rate: float = 0.10
 
     coinbase_api_key: str = ""
     coinbase_api_secret: str = ""
@@ -374,7 +383,7 @@ class Settings(BaseSettings):
     @property
     def futures_product_list(self) -> list[str]:
         items = [p.strip().upper() for p in self.futures_products.split(",") if p.strip()]
-        return items or ["SPY-PERP-INTX", "QQQ-PERP-INTX"]
+        return items or ["US5-19DEC30-CDE", "TEK-19DEC30-CDE"]
 
     def assert_futures_config(self) -> None:
         """Refuse inconsistent dual-gate; allow paper or fully dual-gated live."""
@@ -403,6 +412,13 @@ class Settings(BaseSettings):
         """Future live path requires BOTH futures flags. Default False."""
         return self.futures_mode == "live" and self.futures_live_enabled is True
 
+    def cfm_order_leverage(self) -> float:
+        """Conservative CFM leverage for Advanced Trade FUTURE orders (default 1x)."""
+        return max(1.0, float(getattr(self, "cfm_leverage", 1.0) or 1.0))
+
+    def cfm_max_contracts_per_index(self) -> int:
+        return max(1, int(getattr(self, "cfm_max_contracts", 1) or 1))
+
     def futures_uses_session_engine(self) -> bool:
         """True when session_day is configured (primary FT path)."""
         return "session_day" in self.futures_strategy_list
@@ -411,7 +427,7 @@ class Settings(BaseSettings):
     @property
     def crash_product_list(self) -> list[str]:
         items = [p.strip().upper() for p in self.crash_products.split(",") if p.strip()]
-        return items or ["SPY-PERP-INTX", "QQQ-PERP-INTX"]
+        return items or ["US5-19DEC30-CDE", "TEK-19DEC30-CDE"]
 
     def assert_crash_config(self) -> None:
         """Refuse inconsistent dual-gate; allow paper or fully dual-gated live."""
@@ -440,7 +456,7 @@ class Settings(BaseSettings):
     @property
     def fed_product_list(self) -> list[str]:
         items = [p.strip().upper() for p in self.fed_products.split(",") if p.strip()]
-        return items or ["SPY-PERP-INTX", "QQQ-PERP-INTX"]
+        return items or ["US5-19DEC30-CDE", "TEK-19DEC30-CDE"]
 
     def assert_fed_config(self) -> None:
         """Refuse inconsistent dual-gate; allow paper or fully dual-gated live."""

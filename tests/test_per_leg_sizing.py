@@ -170,31 +170,31 @@ def test_futures_crash_fed_budget_ceiling_uses_helper(
     state.crash_ledger = CrashStore(tmp_path / "cg.db", 1000.0)
     state.fed_ledger = FedStore(tmp_path / "fd.db", 1000.0)
 
-    marks = {"SPY-PERP-INTX": 500.0, "QQQ-PERP-INTX": 400.0}
+    marks = {"US5-19DEC30-CDE": 500.0, "TEK-19DEC30-CDE": 400.0}
     ft = FuturesEngine(state, market=_AvMarket(1000.0))  # type: ignore[arg-type]
     ft._refresh_budget(marks)
-    # paper equity ~1000; budget 200 / 2 = 100; per_leg 110 → min = 100
+    # CFM: paper equity ~1000; budget 200 / 2 = 100 (no PER_LEG soft cap)
     assert ft._last_budget["per_leg_notional_usd"] == 110.0
     assert ft._last_budget["per_index_usd"] == 100.0
 
-    # High equity: budget/2 exceeds per_leg → ceiling binds
+    # High equity: CFM keeps full budget/n (PER_LEG does not bind)
     state.futures_ledger = PaperLedger(tmp_path / "ft2.db", 5000.0)
     ft = FuturesEngine(state, market=_AvMarket(5000.0))  # type: ignore[arg-type]
     ft._refresh_budget(marks)
     av = ft._last_budget["account_value_usd"]
     per_leg = settings.effective_per_leg_notional_usd(av)
     assert ft._last_budget["per_leg_notional_usd"] == per_leg
-    assert ft._last_budget["per_index_usd"] == pytest.approx(min(av * 0.20 / 2.0, per_leg))
+    assert ft._last_budget["per_index_usd"] == pytest.approx(av * 0.20 / 2.0)
 
     cg = CrashEngine(state, market=_AvMarket(1000.0))  # type: ignore[arg-type]
     cg._refresh_budget(marks)
     assert cg._last_budget["per_leg_notional_usd"] == 110.0
-    assert cg._last_budget["per_index_usd"] <= 110.0 + 1e-9
+    assert cg._last_budget["per_index_usd"] == pytest.approx(1000.0 * 0.10 / 2.0)
 
     fd = FedEngine(state, market=_AvMarket(1000.0))  # type: ignore[arg-type]
     fd._refresh_budget(marks)
     assert fd._last_budget["per_leg_notional_usd"] == 110.0
-    assert fd._last_budget["per_index_usd"] <= 110.0 + 1e-9
+    assert fd._last_budget["per_index_usd"] == pytest.approx(1000.0 * 0.05 / 2.0)
 
 
 def test_snapshot_shows_effective_per_leg(app_state: AppState) -> None:

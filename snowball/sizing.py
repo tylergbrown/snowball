@@ -49,3 +49,65 @@ def effective_per_leg_from_settings(
         ),
         autoscale=bool(getattr(settings, "per_leg_autoscale", True)),
     )
+
+
+def cfm_required_margin_usd(
+    price: float,
+    *,
+    contracts: int = 1,
+    leverage: float = 1.0,
+    contract_size: float = 1.0,
+    margin_rate: float = 0.10,
+) -> float:
+    """USD margin needed for CFM CDE contracts.
+
+    CFM posts exchange margin (~5–7% overnight). We use ``margin_rate`` (default
+    10% buffer) when leverage<=1. When leverage>1, require notional/leverage
+    (never less than margin_rate * notional).
+    """
+    px = abs(float(price))
+    n = max(0, int(contracts))
+    if px <= 0 or n <= 0:
+        return 0.0
+    notional = px * float(contract_size) * float(n)
+    rate = max(0.0, float(margin_rate))
+    lev = max(1.0, float(leverage))
+    by_rate = notional * rate
+    by_lev = notional / lev
+    # Conservative: post at least the CFM-style rate, and notional/lev when levered.
+    return max(by_rate, by_lev if lev > 1.0 else by_rate)
+
+
+def cfm_contract_count(
+    *,
+    price: float,
+    budget_usd: float,
+    available_margin_usd: float,
+    max_contracts: int = 1,
+    leverage: float = 1.0,
+    contract_size: float = 1.0,
+    margin_rate: float = 0.10,
+) -> int:
+    """Integer CFM contracts (0..max) that fit budget + available margin.
+
+    Floors at whole contracts — never opens a fractional CDE size. Returns 0 when
+    a single contract's required margin exceeds either gate.
+    """
+    import math
+
+    max_c = max(0, int(max_contracts))
+    if max_c < 1 or float(price) <= 0:
+        return 0
+    req1 = cfm_required_margin_usd(
+        price,
+        contracts=1,
+        leverage=leverage,
+        contract_size=contract_size,
+        margin_rate=margin_rate,
+    )
+    if req1 <= 0:
+        return 0
+    aff_budget = math.floor(float(budget_usd) / req1 + 1e-12)
+    aff_margin = math.floor(float(available_margin_usd) / req1 + 1e-12)
+    return max(0, min(max_c, int(aff_budget), int(aff_margin)))
+

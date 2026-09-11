@@ -1,4 +1,4 @@
-"""Future Trader — session day-trade engine (paper + dual-gated live INTX perps).
+"""Future Trader — session day-trade engine (paper + dual-gated live CFM CDE).
 
 Primary path is America/New_York session longs on SPY/QQQ perps:
   • Budget = futures_account_budget_pct (default 20%) of Coinbase account value
@@ -37,7 +37,9 @@ from snowball.state import AppState
 from snowball.futures.market import (
     DEFAULT_FUTURES_PRODUCTS,
     CoinbaseFuturesMarket,
+    is_cfm_product,
     normalize_futures_product,
+    order_size_for_product,
     parse_futures_order_fill,
     round_amount_down,
 )
@@ -283,9 +285,11 @@ class FuturesEngine:
         pct = float(settings.futures_account_budget_pct)
         budget = max(0.0, account_value * pct)
         per_index = budget / float(n)
-        # Shared per-leg autoscale ceiling (PER_LEG_*); still respects lane budget split.
+        # Shared per-leg autoscale ceiling (PER_LEG_*); INTX-era soft cap only.
         per_leg = settings.effective_per_leg_notional_usd(account_value)
-        per_index = min(per_index, per_leg)
+        prods = [normalize_futures_product(p) for p in self.product_list()]
+        if not (prods and all(is_cfm_product(p) for p in prods)):
+            per_index = min(per_index, per_leg)
         self._last_budget = {
             "account_value_usd": account_value,
             "budget_usd": budget,
@@ -468,20 +472,37 @@ class FuturesEngine:
             return  # already entered (or attempted) this ET day
 
         per_index = float(self._last_budget["per_index_usd"])
-        # Remaining budget after other open FT exposure
-        open_notional = sum(
-            p.notional_usd
-            for prod in self.product_list()
-            for p in ledger.open_positions(prod)
-        )
-        budget_left = max(0.0, float(self._last_budget["budget_usd"]) - open_notional)
+        # Remaining lane budget after open exposure. CFM consumes margin estimate,
+        # not full contract notional (~$3k), so a second index can still open.
+        from snowball.sizing import cfm_required_margin_usd
+
+        margin_rate = float(getattr(settings, "cfm_margin_rate", 0.10))
+        lev = settings.cfm_order_leverage()
+        open_used = 0.0
+        for prod in self.product_list():
+            for p in ledger.open_positions(prod):
+                if is_cfm_product(prod):
+                    qty = max(1, int(round(float(p.qty))))
+                    open_used += cfm_required_margin_usd(
+                        float(p.entry_price),
+                        contracts=qty,
+                        leverage=lev,
+                        margin_rate=margin_rate,
+                    )
+                else:
+                    open_used += float(p.notional_usd)
+        budget_left = max(0.0, float(self._last_budget["budget_usd"]) - open_used)
         per_leg = float(
             self._last_budget.get("per_leg_notional_usd")
             or settings.effective_per_leg_notional_usd(
                 float(self._last_budget.get("account_value_usd") or 0.0)
             )
         )
-        notional = min(per_index, budget_left, per_leg)
+        if is_cfm_product(product):
+            # Lane budget remaining is the affordability budget for 1 CFM contract.
+            notional = min(per_index, budget_left)
+        else:
+            notional = min(per_index, budget_left, per_leg)
         if notional <= 1.0:
             log.info(
                 "futures session entry skipped small notional",
@@ -744,16 +765,35 @@ class FuturesEngine:
             )
             return
         px = fill_price(ticker, "buy", settings.slippage_bps)
-        notional = min(target, ledger.cash_usd())
-        if notional <= 0:
-            return
+        if is_cfm_product(product):
+            contracts = order_size_for_product(
+                product,
+                notional_usd=target,
+                price=float(px),
+                available_margin_usd=max(float(ledger.cash_usd()), float(target)),
+                max_contracts=settings.cfm_max_contracts_per_index(),
+                leverage=settings.cfm_order_leverage(),
+                margin_rate=float(settings.cfm_margin_rate),
+            )
+            if contracts < 1:
+                log.info(
+                    "futures paper buy skipped: cannot fund 1 CFM contract",
+                    extra={"data": {"product": product, "target": target, "px": px}},
+                )
+                return
+            notional = float(contracts) * float(px)
+        else:
+            notional = min(target, ledger.cash_usd())
+            if notional <= 0:
+                return
         # Top-up paper cash if budget-based notional exceeds cash (session paper)
         if ledger.cash_usd() + 1e-9 < notional:
             try:
                 ledger.set_cash_usd(max(ledger.cash_usd(), notional * 2), ts=now)
             except Exception:  # noqa: BLE001
                 log.exception("futures paper cash top-up failed")
-            notional = min(target, ledger.cash_usd())
+            if not is_cfm_product(product):
+                notional = min(target, ledger.cash_usd())
         pos, fill = ledger.open_buy(
             product=product,
             fill_px=px,
@@ -803,8 +843,21 @@ class FuturesEngine:
                 extra={"data": {"product": product}},
             )
             return
-        amount = round_amount_down(notional_usd / float(ref), 0.01)
-        if amount < 0.01:
+        lev = settings.cfm_order_leverage() if is_cfm_product(product) else 1.0
+        max_c = settings.cfm_max_contracts_per_index()
+        margin_rate = float(getattr(settings, "cfm_margin_rate", 0.10))
+        avail = max(float(ledger.cash_usd()), float(notional_usd))
+        amount = order_size_for_product(
+            product,
+            notional_usd=notional_usd,
+            price=float(ref),
+            available_margin_usd=avail,
+            max_contracts=max_c,
+            leverage=lev,
+            margin_rate=margin_rate,
+        )
+        min_amt = 1.0 if is_cfm_product(product) else 0.01
+        if amount < min_amt:
             log.info(
                 "futures live buy skipped: amount below min",
                 extra={
@@ -813,6 +866,7 @@ class FuturesEngine:
                         "notional": notional_usd,
                         "ref": ref,
                         "amount": amount,
+                        "cfm": is_cfm_product(product),
                     }
                 },
             )
@@ -834,8 +888,16 @@ class FuturesEngine:
                     extra={"data": {"product": product, "bid": bid, "ask": ask}},
                 )
                 return
-            amount = round_amount_down(notional_usd / float(limit_px), 0.01)
-            if amount < 0.01:
+            amount = order_size_for_product(
+                product,
+                notional_usd=notional_usd,
+                price=float(limit_px),
+                available_margin_usd=avail,
+                max_contracts=max_c,
+                leverage=lev,
+                margin_rate=margin_rate,
+            )
+            if amount < min_amt:
                 log.info(
                     "futures live buy skipped: amount below min",
                     extra={"data": {"product": product, "limit_px": limit_px}},
@@ -849,7 +911,7 @@ class FuturesEngine:
                 price=limit_px,
                 bid=bid,
                 ask=ask,
-                leverage=1.0,
+                leverage=lev,
                 reduce_only=False,
                 timeout_sec=timeout,
             )
@@ -1003,9 +1065,12 @@ class FuturesEngine:
                         extra={"data": {"product": product, "position_id": lot.id}},
                     )
                     continue
-            amount = round_amount_down(lot.qty, 0.01)
-            if amount < 0.01:
-                continue
+            if is_cfm_product(product):
+                amount = float(max(1, int(round(float(lot.qty)))))
+            else:
+                amount = round_amount_down(lot.qty, 0.01)
+                if amount < 0.01:
+                    continue
             try:
                 from snowball.maker import (
                     URGENT_MAKER_TIMEOUT_SEC,
@@ -1026,7 +1091,7 @@ class FuturesEngine:
                 )
                 if emergency:
                     order = self.market.create_swap_market_order(
-                        product, "sell", amount, leverage=1.0, reduce_only=True
+                        product, "sell", amount, leverage=(settings.cfm_order_leverage() if is_cfm_product(product) else 1.0), reduce_only=True
                     )
                 else:
                     bid, ask = ticker.bid, ticker.ask
@@ -1044,7 +1109,7 @@ class FuturesEngine:
                                 extra={"data": {"product": product, "position_id": lot.id}},
                             )
                             order = self.market.create_swap_market_order(
-                                product, "sell", amount, leverage=1.0, reduce_only=True
+                                product, "sell", amount, leverage=(settings.cfm_order_leverage() if is_cfm_product(product) else 1.0), reduce_only=True
                             )
                         else:
                             log.info(
@@ -1070,7 +1135,7 @@ class FuturesEngine:
                             price=sell_px,
                             bid=bid,
                             ask=ask,
-                            leverage=1.0,
+                            leverage=(settings.cfm_order_leverage() if is_cfm_product(product) else 1.0),
                             reduce_only=True,
                             timeout_sec=timeout,
                         )
@@ -1088,7 +1153,7 @@ class FuturesEngine:
                                 },
                             )
                             order = self.market.create_swap_market_order(
-                                product, "sell", amount, leverage=1.0, reduce_only=True
+                                product, "sell", amount, leverage=(settings.cfm_order_leverage() if is_cfm_product(product) else 1.0), reduce_only=True
                             )
             except Exception as exc:  # noqa: BLE001
                 log.exception(

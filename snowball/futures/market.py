@@ -1,4 +1,9 @@
-"""Coinbase perpetual futures marks + dual-gated INTX swap orders for Future Trader."""
+"""Coinbase CFM CDE futures marks + dual-gated Advanced Trade FUTURE orders.
+
+Future Trader / Crash Guard / Fed Desk trade CFM index perps on Coinbase
+Derivatives Exchange (product ids ``*-CDE``). Stock lane may still share the
+INTX ``*-PERP-INTX`` helpers below for single-name equity perps.
+"""
 
 from __future__ import annotations
 
@@ -12,13 +17,40 @@ from snowball.models import Ticker
 
 log = logging.getLogger("snowball.futures.market")
 
-# Coinbase Advanced Trade product_id → ccxt unified symbol
+# CFM CDE index perps (verified via public product_type=FUTURE list).
+# ccxt unified symbols include the Dec-2030 expiry suffix Coinbase currently lists.
 PRODUCT_TO_CCXT: dict[str, str] = {
-    "SPY-PERP-INTX": "SPY/USDC:USDC",
-    "QQQ-PERP-INTX": "QQQ/USDC:USDC",
+    "US5-19DEC30-CDE": "CDEUS5/USD:USD-301219",  # display: US 500 PERP
+    "TEK-19DEC30-CDE": "CDETEK/USD:USD-301219",  # display: TECH PERP / Tech100
 }
 
-DEFAULT_FUTURES_PRODUCTS: tuple[str, ...] = ("SPY-PERP-INTX", "QQQ-PERP-INTX")
+# Human / legacy aliases → canonical CFM product id
+PRODUCT_ALIASES: dict[str, str] = {
+    "SPY": "US5-19DEC30-CDE",
+    "SPY-PERP": "US5-19DEC30-CDE",
+    "SPY-PERP-INTX": "US5-19DEC30-CDE",
+    "US5": "US5-19DEC30-CDE",
+    "US500": "US5-19DEC30-CDE",
+    "US-500": "US5-19DEC30-CDE",
+    "US500PERP": "US5-19DEC30-CDE",
+    "QQQ": "TEK-19DEC30-CDE",
+    "QQQ-PERP": "TEK-19DEC30-CDE",
+    "QQQ-PERP-INTX": "TEK-19DEC30-CDE",
+    "TEK": "TEK-19DEC30-CDE",
+    "TECH": "TEK-19DEC30-CDE",
+    "TECH100": "TEK-19DEC30-CDE",
+    "TECH-PERP": "TEK-19DEC30-CDE",
+}
+
+DEFAULT_FUTURES_PRODUCTS: tuple[str, ...] = (
+    "US5-19DEC30-CDE",
+    "TEK-19DEC30-CDE",
+)
+
+CFM_DISPLAY_NAMES: dict[str, str] = {
+    "US5-19DEC30-CDE": "US 500 PERP",
+    "TEK-19DEC30-CDE": "TECH PERP",
+}
 
 _STABLES = ("USD", "USDC", "USDT")
 
@@ -27,55 +59,111 @@ def _expand_env_newlines(value: str) -> str:
     """Turn .env-style \\n escapes into real newlines (CDP PEM). Local copy — no live import."""
     return (value or "").replace("\\n", "\n").replace("\\r", "\r")
 
+
 def leverage_param(leverage: float | int | str) -> str:
-    """Coinbase INTX create_order expects leverage as a string (e.g. "1"), not float 1.0."""
+    """Coinbase create_order expects leverage as a string (e.g. "1"), not float 1.0."""
     return str(int(float(leverage)))
 
 
+def is_cfm_product(product: str) -> bool:
+    """True for Coinbase Financial Markets CDE futures (``*-CDE``)."""
+    p = (product or "").strip().upper().replace("_", "-")
+    if p in PRODUCT_ALIASES:
+        p = PRODUCT_ALIASES[p]
+    if p in PRODUCT_TO_CCXT:
+        return True
+    return p.endswith("-CDE")
+
+
+def cfm_display_name(product: str) -> str:
+    pid = normalize_futures_product(product)
+    return CFM_DISPLAY_NAMES.get(pid, pid)
+
 
 def normalize_futures_product(product: str) -> str:
-    """Normalize to Coinbase product id (e.g. SPY-PERP-INTX / AAPL-PERP-INTX)."""
+    """Normalize to Coinbase product id (CFM ``*-CDE`` or INTX ``*-PERP-INTX``)."""
     p = product.strip().upper().replace("_", "-")
+    if p in PRODUCT_ALIASES:
+        return PRODUCT_ALIASES[p]
     if p in PRODUCT_TO_CCXT:
         return p
     for pid, unified in PRODUCT_TO_CCXT.items():
         if p == unified.upper() or p.replace("/", "-") == unified.upper().replace("/", "-"):
             return pid
+        # CDEUS5 / CDETEK base forms
         base = unified.split("/")[0].upper()
-        if p in (base, f"{base}-PERP", f"{base}-PERP-INTX"):
+        if p == base or p == base.replace("CDE", ""):
             return pid
-    # Generic INTX equity/crypto perps: BASE or BASE-PERP → BASE-PERP-INTX
+    if p.endswith("-CDE"):
+        return p
+    # Generic INTX equity/crypto perps (stock lane): BASE or BASE-PERP → BASE-PERP-INTX
     if p.endswith("-PERP-INTX"):
         return p
     if p.endswith("-PERP"):
         return f"{p}-INTX"
     if "/" in p:
-        # Already unified-ish; leave for to_futures_ccxt_symbol
         return p
     if p.isalpha() or (p.replace("-", "").isalnum() and "-" not in p):
+        # Bare tickers that are index aliases already handled; others → INTX stock form
         return f"{p}-PERP-INTX"
     return p
 
 
 def to_futures_ccxt_symbol(product: str) -> str:
-    """Map Coinbase INTX product id to ccxt unified swap symbol.
+    """Map Coinbase product id to ccxt unified symbol.
 
-    Known aliases (SPY/QQQ) use PRODUCT_TO_CCXT. Any other ``{BASE}-PERP-INTX``
-    becomes ``{BASE}/USDC:USDC`` so stock equity perps can share this market.
+    CFM CDE ids use ``CDE*/USD:USD-YYMMDD``. INTX ``{BASE}-PERP-INTX`` stays
+    ``{BASE}/USDC:USDC`` for the stock lane.
     """
     pid = normalize_futures_product(product)
     if pid in PRODUCT_TO_CCXT:
         return PRODUCT_TO_CCXT[pid]
     if "/" in pid:
         return pid
+    if pid.endswith("-CDE"):
+        # Fallback: try id as-is via markets later; synthesize common form
+        code = pid.split("-")[0]
+        return f"CDE{code}/USD:USD-301219"
     if pid.endswith("-PERP-INTX"):
         base = pid[: -len("-PERP-INTX")]
         if base:
             return f"{base}/USDC:USDC"
     raise ValueError(
-        f"unknown futures product {product!r}; expected *-PERP-INTX "
-        f"(known aliases: {sorted(PRODUCT_TO_CCXT)})"
+        f"unknown futures product {product!r}; expected *-CDE or *-PERP-INTX "
+        f"(known CFM: {sorted(PRODUCT_TO_CCXT)})"
     )
+
+
+def order_size_for_product(
+    product: str,
+    *,
+    notional_usd: float,
+    price: float,
+    available_margin_usd: float,
+    max_contracts: int = 1,
+    leverage: float = 1.0,
+    margin_rate: float = 0.10,
+) -> float:
+    """Return order amount: integer CFM contracts, else INTX base-coin size."""
+    from snowball.sizing import cfm_contract_count
+
+    if price <= 0:
+        return 0.0
+    if is_cfm_product(product):
+        # Budget gate uses the larger of notional allotment and available margin
+        # so a tiny per-leg soft cap cannot fractionalize CDE size.
+        budget = max(0.0, float(notional_usd))
+        return float(
+            cfm_contract_count(
+                price=float(price),
+                budget_usd=budget,
+                available_margin_usd=float(available_margin_usd),
+                max_contracts=int(max_contracts),
+                leverage=float(leverage),
+                margin_rate=float(margin_rate),
+            )
+        )
+    return round_amount_down(float(notional_usd) / float(price), 0.01)
 
 
 def parse_futures_order_fill(order: dict[str, Any]) -> tuple[float, float, float]:
@@ -186,7 +274,7 @@ def round_amount_down(amount: float, precision: float = 0.01) -> float:
 
 
 class CoinbaseFuturesMarket:
-    """Coinbase perp OHLCV/tickers; live swap orders only when caller dual-gates."""
+    """Coinbase CFM/INTX OHLCV/tickers; live FUTURE orders only when caller dual-gates."""
 
     mark_source = "coinbase_perp"
 
@@ -348,23 +436,29 @@ class CoinbaseFuturesMarket:
         leverage: float = 1.0,
         reduce_only: bool = False,
     ) -> dict[str, Any]:
-        """Place INTX/perp market order via ccxt (base_size). Requires allow_orders.
+        """Place FUTURE/perp market order via ccxt (base_size). Requires allow_orders.
 
-        Prefer ``create_swap_maker_limit_order`` for new entries / green exits.
-        Market remains for emergency flatten and urgent FT session-close fallback.
+        CFM ``*-CDE`` uses integer contracts. Prefer maker limit for entries;
+        market remains for emergency flatten and urgent FT session-close fallback.
         """
         if not self._allow_orders:
             raise RuntimeError("futures create_swap_market_order refused: allow_orders=False")
         if amount <= 0:
             raise ValueError("amount must be positive")
-        symbol = to_futures_ccxt_symbol(product)
+        pid = normalize_futures_product(product)
+        symbol = to_futures_ccxt_symbol(pid)
         side_l = (side or "").lower()
+        cfm = is_cfm_product(pid)
+        # CFM CDE: integer contracts. INTX swaps: fractional base_size OK.
+        qty = float(int(round(float(amount)))) if cfm else float(amount)
+        if qty <= 0:
+            raise ValueError("amount must be positive")
         params: dict[str, Any] = {"leverage": leverage_param(leverage)}
-        if reduce_only:
+        # reduceOnly is INTX-oriented; FCM often rejects REDUCE_ONLY_NOT_ALLOWED_ON_VENUE
+        if reduce_only and not cfm:
             params["reduceOnly"] = True
-        # Prefer plain create_order with base amount for swaps (not spot quote_size quirks)
         order = self._exchange.create_order(  # type: ignore[attr-defined]
-            symbol, "market", side_l, float(amount), None, params
+            symbol, "market", side_l, qty, None, params
         )
         return self._settle_order(order if isinstance(order, dict) else {}, symbol)
 
@@ -382,7 +476,7 @@ class CoinbaseFuturesMarket:
         timeout_sec: float | None = None,
         post_only: bool = True,
     ) -> dict[str, Any]:
-        """INTX/perp GTC post-only limit (price required). Settle or cancel on timeout."""
+        """FUTURE/perp GTC post-only limit (price required). Settle or cancel on timeout."""
         from snowball.maker import (
             DEFAULT_MAKER_TIMEOUT_SEC,
             maker_buy_price,
@@ -426,18 +520,23 @@ class CoinbaseFuturesMarket:
             if limit_px <= float(bid):
                 raise ValueError("maker swap sell would cross bid; refused")
 
-        symbol = to_futures_ccxt_symbol(product)
+        pid = normalize_futures_product(product)
+        symbol = to_futures_ccxt_symbol(pid)
+        cfm = is_cfm_product(pid)
+        qty = float(int(round(float(amount)))) if cfm else float(amount)
+        if qty <= 0:
+            raise ValueError("amount must be positive")
         params: dict[str, Any] = {
             "leverage": leverage_param(leverage),
             "timeInForce": "GTC",
         }
-        if reduce_only:
+        if reduce_only and not cfm:
             params["reduceOnly"] = True
         if post_only:
             params["postOnly"] = True
-        # INTX swaps require price on limit create_order (unlike spot quote_size market buys)
+        # Limit create_order requires price (CFM contracts + INTX swaps)
         order = self._exchange.create_order(  # type: ignore[attr-defined]
-            symbol, "limit", side_l, float(amount), float(limit_px), params
+            symbol, "limit", side_l, qty, float(limit_px), params
         )
         wait = (
             DEFAULT_MAKER_TIMEOUT_SEC

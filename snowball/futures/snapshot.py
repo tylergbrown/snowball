@@ -151,7 +151,7 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
         times = session_times_from_settings(settings)
         mode_label = "live" if live else "paper"
         label = (
-            "Future Trader — session day-trade LIVE (dual-gated); 10% budget 50/50 SPY/QQQ"
+            "Future Trader — session day-trade LIVE (dual-gated); CFM US500/TECH; never-sell-red"
             if live
             else "Future Trader — session day-trade paper; isolated book"
         )
@@ -214,6 +214,10 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
                 "sma_min_take_profit_pct": getattr(settings, "sma_min_take_profit_pct", 0.08),
                 "effective_sma_take_profit_floor": settings.effective_min_take_profit_pct_for("sma_15m"),
                 "never_sell_red": settings.never_sell_red,
+                "cfm_max_contracts": settings.cfm_max_contracts,
+                "cfm_leverage": settings.cfm_leverage,
+                "cfm_margin_rate": settings.cfm_margin_rate,
+                "venue": "CFM_CDE",
             },
             "products": products,
             "pairs": pairs,

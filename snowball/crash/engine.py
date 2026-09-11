@@ -11,7 +11,9 @@ from snowball.config import LiveTradingRefused, Settings
 from snowball.crash.market import (
     DEFAULT_CRASH_PRODUCTS,
     CrashMarket,
+    is_cfm_product,
     normalize_futures_product,
+    order_size_for_product,
     parse_futures_order_fill,
     round_amount_down,
 )
@@ -186,7 +188,9 @@ class CrashEngine:
         budget = max(0.0, account_value * pct)
         per_index = budget / float(n)
         per_leg = settings.effective_per_leg_notional_usd(account_value)
-        per_index = min(per_index, per_leg)
+        prods = [normalize_futures_product(p) for p in self.product_list()]
+        if not (prods and all(is_cfm_product(p) for p in prods)):
+            per_index = min(per_index, per_leg)
         self._last_budget = {
             "account_value_usd": account_value,
             "budget_usd": budget,
@@ -391,6 +395,28 @@ class CrashEngine:
         if paper_px is None or paper_px <= 0:
             log.warning("crash paper short skipped: no mark", extra={"data": {"product": product}})
             return
+        if is_cfm_product(product):
+            contracts = order_size_for_product(
+                product,
+                notional_usd=notional_usd,
+                price=float(paper_px),
+                available_margin_usd=max(float(store.cash_usd()), float(notional_usd)),
+                max_contracts=settings.cfm_max_contracts_per_index(),
+                leverage=settings.cfm_order_leverage(),
+                margin_rate=float(settings.cfm_margin_rate),
+            )
+            if contracts < 1:
+                log.info(
+                    "crash paper short skipped: cannot fund 1 CFM contract",
+                    extra={"data": {"product": product, "notional": notional_usd, "px": paper_px}},
+                )
+                return
+            notional_usd = float(contracts) * float(paper_px)
+            if store.cash_usd() + 1e-9 < notional_usd:
+                try:
+                    store.set_cash_usd(max(store.cash_usd(), notional_usd * 2), ts=now)
+                except Exception:  # noqa: BLE001
+                    log.exception("crash paper cash top-up failed")
         try:
             pos, fill = store.open_short(
                 product=product,
@@ -444,11 +470,24 @@ class CrashEngine:
         if ref is None or ref <= 0:
             log.warning("crash live short skipped: no mark", extra={"data": {"product": product}})
             return
-        amount = round_amount_down(notional_usd / float(ref), 0.01)
-        if amount < 0.01:
+        lev = settings.cfm_order_leverage() if is_cfm_product(product) else 1.0
+        max_c = settings.cfm_max_contracts_per_index()
+        margin_rate = float(getattr(settings, "cfm_margin_rate", 0.10))
+        avail = max(float(store.cash_usd()), float(notional_usd))
+        amount = order_size_for_product(
+            product,
+            notional_usd=notional_usd,
+            price=float(ref),
+            available_margin_usd=avail,
+            max_contracts=max_c,
+            leverage=lev,
+            margin_rate=margin_rate,
+        )
+        min_amt = 1.0 if is_cfm_product(product) else 0.01
+        if amount < min_amt:
             log.info(
                 "crash live short skipped: amount below min",
-                extra={"data": {"product": product, "notional": notional_usd, "ref": ref}},
+                extra={"data": {"product": product, "notional": notional_usd, "ref": ref, "amount": amount}},
             )
             return
         bid = ticker.bid
@@ -468,8 +507,16 @@ class CrashEngine:
                     extra={"data": {"product": product, "bid": bid, "ask": ask}},
                 )
                 return
-            amount = round_amount_down(notional_usd / float(limit_px), 0.01)
-            if amount < 0.01:
+            amount = order_size_for_product(
+                product,
+                notional_usd=notional_usd,
+                price=float(limit_px),
+                available_margin_usd=avail,
+                max_contracts=max_c,
+                leverage=lev,
+                margin_rate=margin_rate,
+            )
+            if amount < min_amt:
                 return
             timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
             order = self.market.create_swap_maker_limit_order(
@@ -479,7 +526,7 @@ class CrashEngine:
                 price=limit_px,
                 bid=bid,
                 ask=ask,
-                leverage=1.0,
+                leverage=lev,
                 reduce_only=False,
                 timeout_sec=timeout,
             )
@@ -619,9 +666,13 @@ class CrashEngine:
         ticker = Ticker(
             product=product, last=snap.last, bid=snap.bid, ask=snap.ask, ts=now
         )
-        amount = round_amount_down(float(lot.qty), 0.01)
-        if amount < 0.01:
-            return
+        if is_cfm_product(product):
+            amount = float(max(1, int(round(float(lot.qty)))))
+        else:
+            amount = round_amount_down(float(lot.qty), 0.01)
+            if amount < 0.01:
+                return
+        lev = settings.cfm_order_leverage() if is_cfm_product(product) else 1.0
         bid = ticker.bid
         ask = ticker.ask
         try:
@@ -661,7 +712,7 @@ class CrashEngine:
                 price=limit_px,
                 bid=bid,
                 ask=ask,
-                leverage=1.0,
+                leverage=lev,
                 reduce_only=True,
                 timeout_sec=timeout,
             )
