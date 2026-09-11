@@ -181,18 +181,28 @@ class Settings(BaseSettings):
     futures_max_notional_usd: float = 4000.0
     futures_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value FT may use (split 50/50 across products)
-    futures_account_budget_pct: float = 0.20
-    # session_day = ET session long-only engine; legacy sma_1d/donchian_1d still parseable
-    futures_strategies: str = "session_day"
+    futures_account_budget_pct: float = 0.30
+    # session_day = overnight-capable ET session; momentum_15m = intraday impulse (shared ~30% budget)
+    futures_strategies: str = "session_day,momentum_15m"
     # CFM CDE: US 500 PERP + TECH PERP (not INTX *-PERP-INTX)
     futures_products: str = "US5-19DEC30-CDE,TEK-19DEC30-CDE"
     futures_poll_seconds: float = 60.0
-    # America/New_York windows (HH:MM). Entry: preferred 09:25-09:30; late catch-up until exit.
+    # America/New_York windows (HH:MM). Entry: preferred 09:25-09:30; late catch-up until exit
+    # when momentum is OFF. With momentum_15m enabled, session entry is preferred-window only.
     futures_entry_start_et: str = "09:25"
     futures_entry_end_et: str = "09:30"
     futures_exit_start_et: str = "15:55"
     futures_exit_end_et: str = "16:00"
-
+    # Intraday momentum knobs (used when momentum_15m is in FUTURES_STRATEGIES)
+    futures_momentum_timeframe: str = "15m"  # 5m or 15m
+    futures_momentum_lookback_bars: int = 8
+    futures_momentum_min_pct: float = 0.003  # breakout above prior lookback high
+    futures_momentum_take_profit_pct: float = 0.008  # bank green impulse
+    futures_momentum_stall_exit_enabled: bool = True
+    futures_momentum_stall_lookback_bars: int = 4
+    futures_momentum_stall_exit_pct: float = 0.004  # stall bank if >= this green
+    # Aspirational FT KPI (log/report only — never overrides risk gates / CFM_MAX_CONTRACTS)
+    futures_daily_pnl_target_usd: float = 100.0
 
     # --- Crash Guard (short hedge on CFM US500/TECH; dual-gated live) ---
     crash_enabled: bool = True
@@ -443,8 +453,16 @@ class Settings(BaseSettings):
         return max(1, int(getattr(self, "cfm_max_contracts", 1) or 1))
 
     def futures_uses_session_engine(self) -> bool:
-        """True when session_day is configured (primary FT path)."""
+        """True when session_day is configured (overnight roll path)."""
         return "session_day" in self.futures_strategy_list
+
+    def futures_uses_momentum(self) -> bool:
+        """True when momentum_15m is configured (intraday impulse path)."""
+        return "momentum_15m" in self.futures_strategy_list
+
+    def futures_session_entry_preferred_only(self) -> bool:
+        """When momentum shares the lane, session enters only in the preferred window."""
+        return self.futures_uses_session_engine() and self.futures_uses_momentum()
 
 
     @property

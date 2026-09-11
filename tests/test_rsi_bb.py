@@ -191,7 +191,8 @@ def test_defaults_enable_rsi_bb_on_crypto_and_stock_not_futures() -> None:
     assert "bb_15m" in s.stock_strategy_list
     assert "rsi_1d" in s.stock_strategy_list
     assert "bb_1d" in s.stock_strategy_list
-    assert s.futures_strategy_list == ["session_day"]
+    assert s.futures_strategy_list == ["session_day", "momentum_15m"]
     assert "rsi_15m" not in s.futures_strategy_list
+    assert "bb_15m" not in s.futures_strategy_list
     assert s.indicator_filters_enabled is True
     assert RSI_15M and BB_15M and RSI_1D and BB_1D

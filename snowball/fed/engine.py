@@ -320,6 +320,12 @@ class FedEngine:
 
             # Tag FOMC/SEP headlines from Watcher into research payload
             summarized["watcher_fomc_headlines"] = self._watcher_fomc_headlines()
+            from snowball.watcher.feeds import CME_FEDWATCH_TOOL_URL
+            summarized["source_attribution"] = {
+                "name": "CME FedWatch Tool",
+                "url": CME_FEDWATCH_TOOL_URL,
+                "provider": "cme-fedwatch",
+            }
 
             store = self.state.fed_ledger
             if store is not None:

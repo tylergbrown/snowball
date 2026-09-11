@@ -209,3 +209,75 @@ def test_te_event_tags_conservative() -> None:
     tags = te_event_tags("Fed Interest Rate Decision", "Interest Rate")
     assert "rate_decision" in tags
     assert tag_text("World Bank approves loan") == ["worldbank"]
+
+
+def test_fedwatch_official_source_in_catalog() -> None:
+    from snowball.watcher.feeds import CME_FEDWATCH_TOOL_URL, WATCHER_OFFICIAL_SOURCES
+
+    assert "cmegroup.com" in CME_FEDWATCH_TOOL_URL
+    assert "cme-fedwatch-tool" in CME_FEDWATCH_TOOL_URL
+    assert any(s.source == "cme_fedwatch" for s in WATCHER_OFFICIAL_SOURCES)
+    src = next(s for s in WATCHER_OFFICIAL_SOURCES if s.source == "cme_fedwatch")
+    assert src.url == CME_FEDWATCH_TOOL_URL
+    assert "cme-fedwatch" in src.fetch_path
+
+
+def test_fedwatch_research_event_attribution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from snowball.watcher.fedwatch import research_event_from_summary, SOURCE
+    from snowball.watcher.feeds import CME_FEDWATCH_TOOL_URL
+
+    summarized = {
+        "next_meeting_date": "2026-09-16",
+        "p_hold": 0.55,
+        "p_hike": 0.05,
+        "p_cut": 0.40,
+        "current_target": "4.25-4.50",
+    }
+    ev = research_event_from_summary(summarized)
+    assert ev.source == SOURCE
+    assert ev.kind == "fedwatch_probs"
+    assert ev.url == CME_FEDWATCH_TOOL_URL
+    assert "fedwatch" in ev.tags
+    assert ev.raw_json["source_attribution"]["url"] == CME_FEDWATCH_TOOL_URL
+    store = WatcherStore(tmp_path / "w.db")
+    assert store.upsert(ev) is True
+    # Duplicate same fingerprint title/day → no second insert when identical
+    assert store.upsert(ev) is False
+
+
+def test_watcher_poll_includes_fedwatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from snowball.watcher.fedwatch import research_event_from_summary
+
+    settings = Settings(
+        _env_file=None,
+        watcher_enabled=True,
+        watcher_poll_seconds=30,
+        watcher_halt_around_fomc=False,
+        tradingeconomics_api_key="",
+        fred_api_key="",
+        halt_file=tmp_path / "HALT",
+        sqlite_path=tmp_path / "c.db",
+        heartbeat_path=tmp_path / "hb",
+    )
+    store = WatcherStore(tmp_path / "watcher.db")
+    http = FakeHttp()
+    sidecar = WatcherSidecar(settings, store, http=http)
+
+    def fake_poll(st):
+        summarized = {
+            "next_meeting_date": "2026-09-16",
+            "p_hold": 0.6,
+            "p_hike": 0.1,
+            "p_cut": 0.3,
+        }
+        ev = research_event_from_summary(summarized)
+        return 1 if st.upsert(ev) else 0
+
+    monkeypatch.setattr(
+        "snowball.watcher.poller.poll_fedwatch_into_store", fake_poll
+    )
+    # Avoid real RSS network — empty map raises; set default empty channel
+    http.default_get = """<?xml version="1.0"?><rss version="2.0"><channel><title>x</title></channel></rss>"""
+    stats = sidecar.poll_once()
+    assert "fedwatch_new" in stats
+    assert stats["fedwatch_new"] >= 1

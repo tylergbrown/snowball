@@ -1,13 +1,15 @@
-"""Future Trader — session day-trade engine (paper + dual-gated live CFM CDE).
+"""Future Trader — session overnight roll + intraday momentum (paper + dual-gated live CFM CDE).
 
-Primary path is America/New_York session longs on SPY/QQQ perps:
-  • Budget = futures_account_budget_pct (default 20%) of Coinbase account value
-  • 50/50 notional split across products; max 1 open lot per index
-  • Entry ~09:25–09:30 ET (late catch-up until exit window if bot was down)
-  • Exit ~15:55–16:00 ET only if green (mark >= entry); else hold overnight
-  • Overnight losers: no new entry while lot remains open
+America/New_York longs on CFM US5/TEK:
+  • Budget = futures_account_budget_pct (default 30%) of Coinbase account value
+  • 50/50 notional split across products; max 1 open lot per index (no double-long)
+  • session_day: enter preferred open window; exit ~15:55–16:00 ET only if green
+    else hold overnight; skip new session entry while overnight open
+  • momentum_15m: short-horizon breakout during US cash hours; exit on TP / stall
+    / EOD if green enough; never_sell_red; shares FT budget with session_day
+  • Prefer one momentum OR one session lot per product
 
-Legacy sma_1d/donchian_1d paper path remains when session_day is not configured.
+Legacy sma_1d/donchian_1d paper path remains when neither session/momentum configured.
 """
 
 from __future__ import annotations
@@ -46,10 +48,17 @@ from snowball.futures.market import (
 from snowball.futures.session import (
     classify_session_state,
     entry_allowed,
+    entry_allowed_for_settings,
     et_date_str,
     in_exit_window,
+    in_us_cash_session,
     session_times_from_settings,
     to_et,
+)
+from snowball.futures.momentum import (
+    MOMENTUM_15M,
+    momentum_breakout,
+    parse_ohlcv_ohlc,
 )
 from snowball.strategy import (
     DONCHIAN_1D,
@@ -65,6 +74,8 @@ from snowball.strategy import (
 log = logging.getLogger("snowball.futures.engine")
 
 SESSION_STRATEGY = "session_day"
+MOMENTUM_STRATEGY = MOMENTUM_15M
+FT_PRIMARY_STRATEGIES = frozenset({SESSION_STRATEGY, MOMENTUM_STRATEGY})
 
 
 def _futures_risk_ctx(
@@ -219,16 +230,28 @@ class FuturesEngine:
                 )
                 self._flatten_all(marks, reason="halt_flatten", now=now)
 
-        if settings.futures_uses_session_engine():
+        uses_session = settings.futures_uses_session_engine()
+        uses_mom = settings.futures_uses_momentum()
+        if uses_session or uses_mom:
             for product in products:
-                self._act_session(
-                    product=product,
-                    now=now,
-                    halted=halted,
-                    can_trade=can_trade,
-                    daily_killed=killed,
-                    marks=marks,
-                )
+                if uses_session:
+                    self._act_session(
+                        product=product,
+                        now=now,
+                        halted=halted,
+                        can_trade=can_trade,
+                        daily_killed=killed,
+                        marks=marks,
+                    )
+                if uses_mom:
+                    self._act_momentum(
+                        product=product,
+                        now=now,
+                        halted=halted,
+                        can_trade=can_trade,
+                        daily_killed=killed,
+                        marks=marks,
+                    )
         else:
             for product in products:
                 self._act_on_pair_legacy(
@@ -318,11 +341,15 @@ class FuturesEngine:
 
         # Session engine skips SMA/Donchian as primary; still refresh if legacy strategies listed
         wanted = set(settings.futures_strategy_list)
-        if wanted - {SESSION_STRATEGY}:
+        # Fetch OHLCV for legacy strategies and/or momentum_15m (session is marks-only).
+        ohlcv_strats = [s for s in settings.futures_strategy_list if s != SESSION_STRATEGY]
+        if ohlcv_strats:
             limit = settings.ohlcv_fetch_limit
-            frames = enabled_timeframes(
-                [s for s in settings.futures_strategy_list if s != SESSION_STRATEGY]
-            )
+            frames = enabled_timeframes(ohlcv_strats)
+            # Ensure configured momentum timeframe is fetched even if alias differs.
+            mom_tf = str(getattr(settings, "futures_momentum_timeframe", "15m") or "15m")
+            if MOMENTUM_STRATEGY in wanted and mom_tf not in frames:
+                frames.append(mom_tf)
             for timeframe in frames:
                 try:
                     rows = self.market.fetch_ohlcv(product, timeframe, limit)
@@ -362,8 +389,8 @@ class FuturesEngine:
                         extra={"data": {"product": product, "timeframe": timeframe}},
                     )
                     snap.last_error = str(exc)
-        elif SESSION_STRATEGY in wanted:
-            # Session: surface state in signal field for dashboard
+        elif wanted & FT_PRIMARY_STRATEGIES:
+            # Session / momentum: surface session state for dashboard
             ledger = self.state.futures_ledger
             assert ledger is not None
             lots = ledger.open_positions(product)
@@ -398,12 +425,14 @@ class FuturesEngine:
         if mark is None and snap.last is not None:
             mark = snap.last
 
-        # Exit window first: close green only
-        if lots and in_exit_window(
+        # Exit window first: close green session_day lots only (momentum has its own path).
+        # Red/flat → hold overnight; clarify in logs. Skip new entry while any lot open.
+        session_lots = [lot for lot in lots if lot.strategy == SESSION_STRATEGY]
+        if session_lots and in_exit_window(
             now, start=times["exit_start"], end=times["exit_end"]
         ):
             green_lots: list[Position] = []
-            for lot in lots:
+            for lot in session_lots:
                 if mark is None or mark < lot.entry_price:
                     log.info(
                         "futures session hold overnight (red/flat)",
@@ -463,49 +492,19 @@ class FuturesEngine:
         # Entry: only when flat (max 1 lot); overnight open lot blocks new entry
         if lots:
             return
-        if not entry_allowed(
-            now, entry_start=times["entry_start"], exit_start=times["exit_start"]
-        ):
+        if not entry_allowed_for_settings(now, settings):
             return
         today_et = et_date_str(now)
         if self._entry_dates_et.get(product) == today_et:
             return  # already entered (or attempted) this ET day
 
-        per_index = float(self._last_budget["per_index_usd"])
-        # Remaining lane budget after open exposure. CFM consumes margin estimate,
-        # not full contract notional (~$3k), so a second index can still open.
-        from snowball.sizing import cfm_required_margin_usd
-
-        margin_rate = float(getattr(settings, "cfm_margin_rate", 0.10))
-        lev = settings.cfm_order_leverage()
-        open_used = 0.0
-        for prod in self.product_list():
-            for p in ledger.open_positions(prod):
-                if is_cfm_product(prod):
-                    qty = max(1, int(round(float(p.qty))))
-                    open_used += cfm_required_margin_usd(
-                        float(p.entry_price),
-                        contracts=qty,
-                        leverage=lev,
-                        margin_rate=margin_rate,
-                    )
-                else:
-                    open_used += float(p.notional_usd)
-        budget_left = max(0.0, float(self._last_budget["budget_usd"]) - open_used)
+        notional = self._session_entry_notional(product, ledger)
         per_leg = float(
             self._last_budget.get("per_leg_notional_usd")
             or settings.effective_per_leg_notional_usd(
                 float(self._last_budget.get("account_value_usd") or 0.0)
             )
         )
-        if is_cfm_product(product):
-            # Use remaining lane budget (not INTX per-leg). order_size_for_product
-            # floors with FUTURES_MAX_NOTIONAL so 1 CFM contract can clear.
-            notional = max(budget_left, float(settings.futures_max_notional_usd))
-            if budget_left <= 1.0:
-                notional = 0.0
-        else:
-            notional = min(per_index, budget_left, per_leg)
         if notional <= 1.0:
             log.info(
                 "futures session entry skipped small notional",
@@ -547,6 +546,302 @@ class FuturesEngine:
             notional_usd=notional,
         )
 
+
+    # --- Intraday momentum path (momentum_15m) ---------------------------------
+
+    def _act_momentum(
+        self,
+        product: str,
+        now: datetime,
+        halted: bool,
+        can_trade: bool,
+        daily_killed: bool,
+        marks: dict[str, float],
+    ) -> None:
+        """Short-horizon breakout during US cash hours; shares FT budget with session."""
+        settings = self.state.settings
+        ledger = self.state.futures_ledger
+        assert ledger is not None
+        times = session_times_from_settings(settings)
+        lots = ledger.open_positions(product)
+        mom_lots = [lot for lot in lots if lot.strategy == MOMENTUM_STRATEGY]
+        mark = marks.get(product)
+        snap = self.state.futures_pairs[product]
+        if mark is None and snap.last is not None:
+            mark = snap.last
+
+        # Manage open momentum lots: TP / stall / EOD green exit
+        if mom_lots:
+            self._momentum_maybe_exit(
+                product=product,
+                mom_lots=mom_lots,
+                mark=mark,
+                now=now,
+                halted=halted,
+                can_trade=can_trade,
+                daily_killed=daily_killed,
+                marks=marks,
+                times=times,
+            )
+            return
+
+        # Entry: flat only (any strategy blocks — no double-long same index)
+        if lots:
+            return
+        if not in_us_cash_session(now):
+            return
+        # Prefer session in its preferred open window; momentum waits until after.
+        if settings.futures_uses_session_engine():
+            from snowball.futures.session import in_entry_preferred_window
+
+            if in_entry_preferred_window(
+                now, start=times["entry_start"], end=times["entry_end"]
+            ):
+                return
+        if in_exit_window(now, start=times["exit_start"], end=times["exit_end"]):
+            return
+
+        tf = str(getattr(settings, "futures_momentum_timeframe", "15m") or "15m")
+        lookback = int(getattr(settings, "futures_momentum_lookback_bars", 8) or 8)
+        min_pct = float(getattr(settings, "futures_momentum_min_pct", 0.003) or 0.0)
+        try:
+            limit = max(int(settings.ohlcv_fetch_limit), lookback + 5)
+            rows = self.market.fetch_ohlcv(product, tf, limit)
+        except Exception as exc:  # noqa: BLE001
+            log.exception(
+                "futures momentum ohlcv failed",
+                extra={"data": {"product": product, "error": str(exc)}},
+            )
+            return
+        opens, highs, lows, closes = parse_ohlcv_ohlc(rows)
+        if not momentum_breakout(
+            highs, lows, closes, opens, lookback=lookback, min_momentum_pct=min_pct
+        ):
+            return
+
+        notional = self._session_entry_notional(product, ledger)
+        if notional <= 1.0:
+            log.info(
+                "futures momentum entry skipped small notional",
+                extra={"data": {"product": product, "notional": notional}},
+            )
+            return
+        per_leg = float(
+            self._last_budget.get("per_leg_notional_usd")
+            or settings.effective_per_leg_notional_usd(
+                float(self._last_budget.get("account_value_usd") or 0.0)
+            )
+        )
+        ctx = _futures_risk_ctx(
+            settings,
+            now=now,
+            halted=halted,
+            can_trade=can_trade,
+            daily_killed=daily_killed,
+            open_count_for_pair=0,
+            last_entry_at=ledger.last_entry_at(product, MOMENTUM_STRATEGY),
+            cash_usd=max(ledger.cash_usd(), notional),
+            requested_notional=notional,
+            cooldown_seconds=0,
+            max_notional=max(
+                notional,
+                per_leg,
+                float(settings.futures_max_notional_usd),
+            ),
+        )
+        ok, reason = allow_entry(ctx)
+        if not ok:
+            log.info(
+                "futures momentum entry blocked",
+                extra={"data": {"product": product, "reason": reason}},
+            )
+            return
+        self._open_lot(
+            product,
+            marks,
+            reason=f"{MOMENTUM_STRATEGY}:breakout_enter",
+            now=now,
+            strategy=MOMENTUM_STRATEGY,
+            notional_usd=notional,
+        )
+
+    def _momentum_maybe_exit(
+        self,
+        *,
+        product: str,
+        mom_lots: list[Position],
+        mark: float | None,
+        now: datetime,
+        halted: bool,
+        can_trade: bool,
+        daily_killed: bool,
+        marks: dict[str, float],
+        times: dict,
+    ) -> None:
+        settings = self.state.settings
+        ledger = self.state.futures_ledger
+        assert ledger is not None
+        from snowball.gates import lot_unrealized_pnl_pct, price_stalled, stall_exit_allowed
+
+        to_close: list[Position] = []
+        exit_reason = f"{MOMENTUM_STRATEGY}:exit"
+
+        in_eod = in_exit_window(
+            now, start=times["exit_start"], end=times["exit_end"]
+        )
+        tp = float(getattr(settings, "futures_momentum_take_profit_pct", 0.008) or 0.0)
+        stall_on = bool(getattr(settings, "futures_momentum_stall_exit_enabled", True))
+        stall_pct = float(
+            getattr(settings, "futures_momentum_stall_exit_pct", 0.004) or 0.0
+        )
+        stall_lb = int(
+            getattr(settings, "futures_momentum_stall_lookback_bars", 4) or 4
+        )
+
+        stalled = False
+        if stall_on and mark is not None:
+            try:
+                tf = str(getattr(settings, "futures_momentum_timeframe", "15m") or "15m")
+                limit = max(int(settings.ohlcv_fetch_limit), stall_lb + 5)
+                rows = self.market.fetch_ohlcv(product, tf, limit)
+                _o, highs, lows, closes = parse_ohlcv_ohlc(rows)
+                stalled = price_stalled(
+                    highs, lows, closes, mark, lookback=stall_lb
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "futures momentum stall check failed: %s",
+                    exc,
+                    extra={"data": {"product": product}},
+                )
+
+        for lot in mom_lots:
+            if mark is None:
+                continue
+            pnl = lot_unrealized_pnl_pct(lot, mark)
+            if pnl is None:
+                continue
+            if settings.never_sell_red and mark < lot.entry_price:
+                continue
+            if tp > 0 and pnl >= tp:
+                to_close.append(lot)
+                exit_reason = f"{MOMENTUM_STRATEGY}:take_profit"
+                continue
+            if stalled:
+                ok_st, reason_st = stall_exit_allowed(
+                    lot,
+                    mark,
+                    stall_exit_pct=stall_pct,
+                    never_sell_red=settings.never_sell_red,
+                )
+                if ok_st:
+                    to_close.append(lot)
+                    exit_reason = f"{MOMENTUM_STRATEGY}:stall_exit"
+                else:
+                    log.info(
+                        "futures momentum stall hold",
+                        extra={
+                            "data": {
+                                "product": product,
+                                "position_id": lot.id,
+                                "reason": reason_st,
+                            }
+                        },
+                    )
+                continue
+            if in_eod and mark >= lot.entry_price:
+                to_close.append(lot)
+                exit_reason = f"{MOMENTUM_STRATEGY}:eod_green"
+                continue
+            if in_eod and mark < lot.entry_price:
+                log.info(
+                    "futures momentum hold overnight (red/flat at close)",
+                    extra={
+                        "data": {
+                            "product": product,
+                            "position_id": lot.id,
+                            "mark": mark,
+                            "entry": lot.entry_price,
+                        }
+                    },
+                )
+
+        if not to_close:
+            return
+        seen: set[int] = set()
+        uniq: list[Position] = []
+        for lot in to_close:
+            if lot.id in seen:
+                continue
+            seen.add(lot.id)
+            uniq.append(lot)
+        ctx = _futures_risk_ctx(
+            settings,
+            now=now,
+            halted=halted,
+            can_trade=can_trade,
+            daily_killed=daily_killed,
+            open_count_for_pair=len(ledger.open_positions(product)),
+            last_entry_at=ledger.last_entry_at(product, MOMENTUM_STRATEGY),
+            cash_usd=ledger.cash_usd(),
+            requested_notional=self._last_budget["per_index_usd"],
+            cooldown_seconds=0,
+            max_notional=max(
+                self._last_budget["per_index_usd"],
+                float(
+                    self._last_budget.get("per_leg_notional_usd")
+                    or settings.effective_per_leg_notional_usd(
+                        float(self._last_budget.get("account_value_usd") or 0.0)
+                    )
+                ),
+            ),
+        )
+        ok, reason = allow_exit(ctx)
+        if not ok:
+            log.info(
+                "futures momentum exit blocked",
+                extra={"data": {"product": product, "reason": reason}},
+            )
+            return
+        self._close_lots(product, uniq, marks, reason=exit_reason, now=now)
+
+    def _session_entry_notional(self, product: str, ledger: PaperLedger) -> float:
+        """Shared FT notional sizing for session_day and momentum_15m entries."""
+        settings = self.state.settings
+        per_index = float(self._last_budget["per_index_usd"])
+        from snowball.sizing import cfm_required_margin_usd
+
+        margin_rate = float(getattr(settings, "cfm_margin_rate", 0.10))
+        lev = settings.cfm_order_leverage()
+        open_used = 0.0
+        for prod in self.product_list():
+            for pos in ledger.open_positions(prod):
+                if is_cfm_product(prod):
+                    qty = max(1, int(round(float(pos.qty))))
+                    open_used += cfm_required_margin_usd(
+                        float(pos.entry_price),
+                        contracts=qty,
+                        leverage=lev,
+                        margin_rate=margin_rate,
+                    )
+                else:
+                    open_used += float(pos.notional_usd)
+        budget_left = max(0.0, float(self._last_budget["budget_usd"]) - open_used)
+        per_leg = float(
+            self._last_budget.get("per_leg_notional_usd")
+            or settings.effective_per_leg_notional_usd(
+                float(self._last_budget.get("account_value_usd") or 0.0)
+            )
+        )
+        if is_cfm_product(product):
+            notional = max(budget_left, float(settings.futures_max_notional_usd))
+            if budget_left <= 1.0:
+                notional = 0.0
+        else:
+            notional = min(per_index, budget_left, per_leg)
+        return float(notional)
+
+
     # --- Legacy SMA/Donchian paper path ----------------------------------------
 
     def _act_on_pair_legacy(
@@ -560,7 +855,7 @@ class FuturesEngine:
     ) -> None:
         settings = self.state.settings
         for strategy_id in settings.futures_strategy_list:
-            if strategy_id == SESSION_STRATEGY:
+            if strategy_id in FT_PRIMARY_STRATEGIES:
                 continue
             self._act_on_strategy(
                 product=product,
@@ -1073,13 +1368,18 @@ class FuturesEngine:
         for lot in lots:
             if not is_emergency_flatten_reason(reason):
                 # Session closes already gated to green; legacy uses strategy_exit_allowed
-                if SESSION_STRATEGY not in reason:
+                is_ft_primary = (
+                    SESSION_STRATEGY in reason
+                    or MOMENTUM_STRATEGY in reason
+                    or lot.strategy in FT_PRIMARY_STRATEGIES
+                )
+                if not is_ft_primary:
                     ok_sw, reason_sw = strategy_exit_allowed(
                         lot,
                         paper_px,
                         min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
                         never_sell_red=settings.never_sell_red,
-                    fee_buffer_pct=getattr(settings, "fee_buffer_pct", 0.0),
+                        fee_buffer_pct=getattr(settings, "fee_buffer_pct", 0.0),
                     )
                     if not ok_sw:
                         log.info(
@@ -1372,6 +1672,7 @@ def attach_futures_lane(state: AppState) -> FuturesEngine | None:
                 "live_orders": live,
                 "budget_pct": settings.futures_account_budget_pct,
                 "session_engine": settings.futures_uses_session_engine(),
+                "momentum_engine": settings.futures_uses_momentum(),
             }
         },
     )

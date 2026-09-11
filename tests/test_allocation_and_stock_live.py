@@ -25,19 +25,19 @@ from snowball.futures.market import normalize_futures_product
 from snowball.models import PairSnapshot
 
 
-def test_allocation_helpers_33_32_20_10_5() -> None:
+def test_allocation_helpers_33_32_30_10_5() -> None:
     pcts = lane_budget_pcts()
-    assert pcts == {"crypto": 0.33, "stock": 0.32, "futures": 0.20, "crash": 0.10, "fed": 0.05}
+    assert pcts == {"crypto": 0.33, "stock": 0.32, "futures": 0.30, "crash": 0.10, "fed": 0.05}
     budgets = lane_budgets_usd(1000.0)
     assert budgets["crypto_usd"] == 330.0
     assert budgets["stock_usd"] == 320.0
-    assert budgets["futures_usd"] == 200.0
+    assert budgets["futures_usd"] == 300.0
     assert budgets["crash_usd"] == 100.0
     assert budgets["fed_usd"] == 50.0
     s = Settings(_env_file=None, stock_enabled=False, futures_enabled=False, crash_enabled=False, fed_enabled=False)
     assert s.crypto_account_budget_pct == 0.33
     assert s.stock_account_budget_pct == 0.32
-    assert s.futures_account_budget_pct == 0.20
+    assert s.futures_account_budget_pct == 0.30
     assert s.crash_account_budget_pct == 0.10
     assert s.fed_account_budget_pct == 0.05
     assert s.lane_budget_pcts() == pcts

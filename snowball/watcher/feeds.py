@@ -112,3 +112,35 @@ FRED_OBS_URL = (
     "https://api.stlouisfed.org/fred/series/observations"
     "?series_id={series_id}&api_key={key}&file_type=json&sort_order=desc&limit=5"
 )
+
+
+# --- Official research sources (non-RSS; package / API backed) -----------------
+
+CME_FEDWATCH_TOOL_URL = (
+    "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"
+)
+
+
+@dataclass(frozen=True)
+class OfficialResearchSource:
+    """First-class official source for The Watcher / Fed research belt.
+
+    Probabilities are fetched via the sanctioned ``cme-fedwatch`` package (same
+    path Fed Desk uses). The CME page URL is recorded for citation; brittle HTML
+    scraping is not used for order signals (Watcher never places orders).
+    """
+
+    source: str
+    url: str
+    label: str
+    fetch_path: str  # human description of sanctioned fetch path
+
+
+WATCHER_OFFICIAL_SOURCES: tuple[OfficialResearchSource, ...] = (
+    OfficialResearchSource(
+        "cme_fedwatch",
+        CME_FEDWATCH_TOOL_URL,
+        "CME FedWatch Tool",
+        "cme-fedwatch package get_probabilities() / Fed Desk research sidecar",
+    ),
+)

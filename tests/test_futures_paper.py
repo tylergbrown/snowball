@@ -485,12 +485,13 @@ def test_open_lot_refuses_without_dual_gate(
 
 def test_futures_defaults_session_day() -> None:
     s = Settings(_env_file=None)
-    assert s.futures_strategy_list == ["session_day"]
+    assert s.futures_strategy_list == ["session_day", "momentum_15m"]
     assert s.futures_uses_session_engine() is True
+    assert s.futures_uses_momentum() is True
     assert s.futures_mode == "paper"
     assert s.futures_live_enabled is False
     assert s.futures_live_orders_permitted() is False
-    assert s.futures_account_budget_pct == 0.20
+    assert s.futures_account_budget_pct == 0.30
     assert s.futures_max_positions == 1
 
 

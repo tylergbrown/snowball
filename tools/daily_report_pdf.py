@@ -477,10 +477,69 @@ def append_future_trader_section(
     else:
         story.append(Paragraph(f"No FT fills or closed session trades on {day.isoformat()} (CT).", muted))
 
+    # Strategy split: session_day vs momentum_15m
+    by_strat = fut.get("fills_by_strategy") if isinstance(fut.get("fills_by_strategy"), dict) else {}
+    if not by_strat and day_fills:
+        by_strat = {}
+        for f in day_fills:
+            sid = str(f.get("strategy") or "unknown")
+            by_strat.setdefault(sid, {"fills": 0})
+            by_strat[sid]["fills"] = by_strat[sid].get("fills", 0) + 1
+    if by_strat:
+        story.append(Paragraph("FT by strategy (session vs momentum)", body))
+        strat_rows = []
+        for sid in ("session_day", "momentum_15m"):
+            b = by_strat.get(sid) or {}
+            if not b and sid not in by_strat:
+                continue
+            pnl = b.get("realized_pnl")
+            strat_rows.append(
+                [
+                    sid,
+                    str(b.get("fills") or b.get("buy") or "—"),
+                    _money(pnl, signed=True) if pnl is not None else "—",
+                ]
+            )
+        for sid, b in by_strat.items():
+            if sid in ("session_day", "momentum_15m"):
+                continue
+            pnl = b.get("realized_pnl")
+            strat_rows.append(
+                [
+                    sid,
+                    str(b.get("fills") or "—"),
+                    _money(pnl, signed=True) if pnl is not None else "—",
+                ]
+            )
+        if strat_rows:
+            story.append(
+                make_table(
+                    ["Strategy", "Fills", "Realized PnL"],
+                    strat_rows,
+                    [2.0 * inch, 1.0 * inch, 1.5 * inch],
+                )
+            )
+        story.append(Spacer(1, 4))
+
+    mom = fut.get("momentum") if isinstance(fut.get("momentum"), dict) else {}
+    target = fut.get("daily_pnl_target_usd")
+    if mom.get("enabled") or target is not None:
+        bits = []
+        if mom.get("enabled"):
+            bits.append(
+                f"momentum {mom.get('timeframe', '15m')} lookback={mom.get('lookback_bars')} "
+                f"min={mom.get('min_momentum_pct')} TP={mom.get('take_profit_pct')}"
+            )
+        if target is not None:
+            bits.append(f"aspirational KPI ~${float(target):.0f}/day (report only)")
+        story.append(Paragraph(" · ".join(bits), muted))
+
     story.append(Spacer(1, 4))
     story.append(
         Paragraph(
-            "Rules: Exit at close only if green; hold red overnight; max 1 lot per index",
+            "Rules: session exits at close only if green else hold overnight; "
+            "momentum exits on TP/stall/EOD if green; never_sell_red; max 1 lot per index "
+            "(session OR momentum — no double-long); FT budget ~30%",
             muted,
         )
     )

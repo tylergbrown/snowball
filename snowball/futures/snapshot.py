@@ -12,6 +12,30 @@ from snowball.risk import daily_loss_breached
 from snowball.state import AppState
 
 
+def _fills_by_strategy(fills: list[dict[str, Any]], ledger: Any) -> dict[str, Any]:
+    """Split FT fills/PnL for dashboard + PDF (session_day vs momentum_15m)."""
+    out: dict[str, Any] = {}
+    for f in fills:
+        sid = str(f.get("strategy") or "unknown")
+        bucket = out.setdefault(sid, {"fills": 0, "buy": 0, "sell": 0})
+        bucket["fills"] += 1
+        side = str(f.get("side") or "").lower()
+        if side == "buy":
+            bucket["buy"] += 1
+        elif side == "sell":
+            bucket["sell"] += 1
+    try:
+        sc = ledger.scorecard() or {}
+        for row in sc.get("by_strategy") or []:
+            sid = str(row.get("strategy") or "unknown")
+            bucket = out.setdefault(sid, {"fills": 0, "buy": 0, "sell": 0})
+            bucket["closed_trades"] = row.get("trades") or row.get("n") or row.get("count")
+            bucket["realized_pnl"] = row.get("realized_pnl") or row.get("pnl")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def build_futures_snapshot(state: AppState) -> dict[str, Any]:
     settings = state.settings
     now = utcnow()
@@ -151,9 +175,9 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
         times = session_times_from_settings(settings)
         mode_label = "live" if live else "paper"
         label = (
-            "Future Trader — session day-trade LIVE (dual-gated); CFM US500/TECH; never-sell-red"
+            "Future Trader — session+momentum LIVE (dual-gated); CFM US500/TECH ~30%; never-sell-red"
             if live
-            else "Future Trader — session day-trade paper; isolated book"
+            else "Future Trader — session+momentum paper; isolated book (~30% budget)"
         )
 
         return {
@@ -169,12 +193,27 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
             "mark_source": state.futures_mark_source,
             "session": {
                 "timezone": "America/New_York",
-                "entry_window_et": f"{times['entry_start'].strftime('%H:%M')}–{times['entry_end'].strftime('%H:%M')} (late catch-up until exit)",
+                "entry_window_et": f"{times['entry_start'].strftime('%H:%M')}–{times['entry_end'].strftime('%H:%M')} (late catch-up until exit unless momentum shares lane)",
                 "exit_window_et": f"{times['exit_start'].strftime('%H:%M')}–{times['exit_end'].strftime('%H:%M')}",
                 "states": dict(state.futures_session_states or {}),
                 "weekday_only": True,
                 "holiday_calendar": False,
+                "overnight_hold_when_red": True,
             },
+            "momentum": {
+                "enabled": settings.futures_uses_momentum(),
+                "strategy": "momentum_15m",
+                "timeframe": getattr(settings, "futures_momentum_timeframe", "15m"),
+                "lookback_bars": getattr(settings, "futures_momentum_lookback_bars", 8),
+                "min_momentum_pct": getattr(settings, "futures_momentum_min_pct", 0.003),
+                "take_profit_pct": getattr(settings, "futures_momentum_take_profit_pct", 0.008),
+                "stall_exit_enabled": getattr(settings, "futures_momentum_stall_exit_enabled", True),
+                "stall_lookback_bars": getattr(settings, "futures_momentum_stall_lookback_bars", 4),
+                "stall_exit_pct": getattr(settings, "futures_momentum_stall_exit_pct", 0.004),
+                "cash_hours_et": "09:30–15:45",
+                "shared_budget_with_session": True,
+            },
+            "daily_pnl_target_usd": getattr(settings, "futures_daily_pnl_target_usd", 100.0),
             "status": {
                 "halt_active": halted,
                 "trading_enabled": can_trade,
@@ -223,6 +262,7 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
             "pairs": pairs,
             "positions": positions,
             "fills": fills,
+            "fills_by_strategy": _fills_by_strategy(fills, ledger),
             "scorecard": ledger.scorecard(),
             "pair_pauses": [p for p in pause_rows.values() if p.get("active")],
         }

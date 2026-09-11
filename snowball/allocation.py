@@ -3,9 +3,12 @@
 Default split (recomputed each tick/session from live account value):
   • Crypto live trader: 33%
   • Stock trader:       32%
-  • Future Trader:      20%
+  • Future Trader:      30%  (session overnight roll + intraday momentum)
   • Crash Guard:        10%
   • Fed Desk:            5%
+
+Note: lane knobs are independent and need not sum to 100%; Tb may trim
+crypto/stock later. FUTURES_ACCOUNT_BUDGET_PCT is the FT authority.
 
 Philosophy: hold underwater; never sell red. These helpers only size *new*
 entries / max open notional — they never force loss exits.
@@ -18,7 +21,7 @@ from typing import Any
 
 DEFAULT_CRYPTO_BUDGET_PCT = 0.33
 DEFAULT_STOCK_BUDGET_PCT = 0.32
-DEFAULT_FUTURES_BUDGET_PCT = 0.20
+DEFAULT_FUTURES_BUDGET_PCT = 0.30
 DEFAULT_CRASH_BUDGET_PCT = 0.10
 DEFAULT_FED_BUDGET_PCT = 0.05
 

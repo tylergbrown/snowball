@@ -12,7 +12,11 @@ from typing import Any
 
 from snowball.config import Settings
 from snowball.models import utcnow
-from snowball.watcher.feeds import SKIPPED_FEEDS, WATCHER_RSS_FEEDS
+from snowball.watcher.feeds import (
+    SKIPPED_FEEDS,
+    WATCHER_OFFICIAL_SOURCES,
+    WATCHER_RSS_FEEDS,
+)
 from snowball.watcher.fred import fetch_fred_series
 from snowball.watcher.halt import apply_watcher_halt, matching_halt_event
 from snowball.watcher.http import HttpClient, UrlLibHttp, fetch_text
@@ -20,6 +24,7 @@ from snowball.watcher.rss import parse_rss
 from snowball.watcher.store import ResearchEvent, WatcherStore, event_fingerprint
 from snowball.watcher.tagger import tag_text
 from snowball.watcher.te import fetch_calendar
+from snowball.watcher.fedwatch import poll_fedwatch_into_store
 
 log = logging.getLogger("snowball.watcher")
 
@@ -48,12 +53,17 @@ class WatcherSidecar:
 
     def poll_once(self) -> dict[str, int]:
         """Fetch all sources. Never raises to the engine loop."""
-        stats = {"rss_new": 0, "te_new": 0, "fred_new": 0, "rss_errors": 0}
+        stats = {"rss_new": 0, "te_new": 0, "fred_new": 0, "fedwatch_new": 0, "rss_errors": 0}
         if not self._logged_skip:
             for skipped in SKIPPED_FEEDS:
                 log.warning(
                     "The Watcher skipping dead official feed",
                     extra={"data": {"source": skipped.source, "url": skipped.url, "reason": skipped.reason}},
+                )
+            for src in WATCHER_OFFICIAL_SOURCES:
+                log.info(
+                    "The Watcher official research source",
+                    extra={"data": {"source": src.source, "url": src.url, "label": src.label, "fetch_path": src.fetch_path}},
                 )
             self._logged_skip = True
         try:
@@ -71,6 +81,11 @@ class WatcherSidecar:
         except Exception:
             log.exception("The Watcher FRED poll failed")
             self.last_error = "fred poll failed"
+        try:
+            stats["fedwatch_new"] = self._poll_fedwatch()
+        except Exception:
+            log.exception("The Watcher FedWatch poll failed")
+            self.last_error = "fedwatch poll failed"
         try:
             self._maybe_halt()
         except Exception:
@@ -133,6 +148,10 @@ class WatcherSidecar:
 
     def _poll_fred(self) -> int:
         return fetch_fred_series(self.http, self.settings.fred_api_key, self.store)
+
+    def _poll_fedwatch(self) -> int:
+        """CME FedWatch probs via cme-fedwatch package — research only, no orders."""
+        return poll_fedwatch_into_store(self.store)
 
     def _maybe_halt(self) -> None:
         settings = self.settings

@@ -5,7 +5,11 @@ Late catch-up: if the bot was down during the preferred window, the first tick
 after 09:25 ET and before the exit window may still enter (once per ET day).
 
 Exit window: 15:55–16:00 ET — close only if green (mark >= entry); otherwise
-hold overnight. Weekday M–F only for v1 (US holidays not calendared).
+hold overnight (red/flat). Skip new session entry while an overnight lot remains
+open. Weekday M–F only for v1 (US holidays not calendared).
+
+When momentum_15m shares the FT lane, session entry is preferred-window only
+(09:25–09:30 ET) so intraday momentum can use the cash-hours slot if flat.
 """
 
 from __future__ import annotations
@@ -84,6 +88,24 @@ def entry_allowed(
         return False
     t = to_et(now).time()
     return entry_start <= t < exit_start
+
+
+def entry_allowed_for_settings(now: datetime, settings: object) -> bool:
+    """Session entry gate honoring preferred-only when momentum shares the lane."""
+    times = session_times_from_settings(settings)
+    preferred_only = False
+    fn = getattr(settings, "futures_session_entry_preferred_only", None)
+    if callable(fn):
+        preferred_only = bool(fn())
+    elif fn is not None:
+        preferred_only = bool(fn)
+    if preferred_only:
+        return is_us_weekday(now) and in_entry_preferred_window(
+            now, start=times["entry_start"], end=times["entry_end"]
+        )
+    return entry_allowed(
+        now, entry_start=times["entry_start"], exit_start=times["exit_start"]
+    )
 
 
 def in_exit_window(
