@@ -46,6 +46,14 @@ DEFAULT_FUTURES_PRODUCTS: tuple[str, ...] = (
     "TEK-19DEC30-CDE",
 )
 
+# Coinbase CFM quote increments (price_increment). TEK is whole index points;
+# US5 is 0.1. ccxt price_to_precision ROUNDS — a TEK buy at 3946.25 becomes
+# "3947" and Coinbase rejects post-only as INVALID_LIMIT_PRICE_POST_ONLY.
+CFM_TICK_SIZE: dict[str, float] = {
+    "US5-19DEC30-CDE": 0.1,
+    "TEK-19DEC30-CDE": 1.0,
+}
+
 CFM_DISPLAY_NAMES: dict[str, str] = {
     "US5-19DEC30-CDE": "US 500 PERP",
     "TEK-19DEC30-CDE": "TECH PERP",
@@ -72,6 +80,50 @@ def is_cfm_product(product: str) -> bool:
     if p in PRODUCT_TO_CCXT:
         return True
     return p.endswith("-CDE")
+
+
+def tick_size_for_product(product: str, exchange: object | None = None) -> float:
+    """CFM quote increment for ``product``. Prefer live market info, else defaults.
+
+    TEK tick is 1.0 (integer). US5 tick is 0.1. Never return 0.
+    """
+    pid = normalize_futures_product(product)
+    fallback = float(CFM_TICK_SIZE.get(pid) or (1.0 if pid.startswith("TEK") else 0.1))
+    if not is_cfm_product(pid):
+        fallback = 0.01
+    if exchange is None:
+        return fallback if fallback > 0 else 0.1
+    try:
+        symbol = to_futures_ccxt_symbol(pid)
+        markets = getattr(exchange, "markets", None) or {}
+        market = markets.get(symbol) if isinstance(markets, dict) else None
+        info = {}
+        precision = {}
+        if isinstance(market, dict):
+            info = market.get("info") if isinstance(market.get("info"), dict) else {}
+            precision = (
+                market.get("precision") if isinstance(market.get("precision"), dict) else {}
+            )
+        for key in ("price_increment", "quote_increment", "priceIncrement"):
+            raw = info.get(key) if info else None
+            if raw is not None and float(raw) > 0:
+                return float(raw)
+        prec = precision.get("price") if precision else None
+        if prec is not None and float(prec) > 0:
+            p = float(prec)
+            mode = getattr(exchange, "precisionMode", None)
+            # ccxt TICK_SIZE = 4; values < 1 are already increments.
+            if mode == 4 or p < 1.0:
+                return p
+    except Exception:
+        log.debug("tick_size_for_product: using fallback for %s", pid, exc_info=True)
+    return fallback if fallback > 0 else 0.1
+
+
+def is_invalid_limit_price_post_only(exc: BaseException) -> bool:
+    """True when Coinbase rejected a post-only limit as crossing the book."""
+    blob = f"{type(exc).__name__} {exc}"
+    return "INVALID_LIMIT_PRICE_POST_ONLY" in blob
 
 
 def cfm_display_name(product: str) -> str:
@@ -495,6 +547,7 @@ class CoinbaseFuturesMarket:
             DEFAULT_MAKER_TIMEOUT_SEC,
             maker_buy_price,
             maker_sell_price,
+            round_to_tick,
         )
 
         if not self._allow_orders:
@@ -507,36 +560,68 @@ class CoinbaseFuturesMarket:
         if side_l not in ("buy", "sell"):
             raise ValueError(f"invalid side {side!r}")
 
-        if bid is None and ask is None:
-            bid, ask = self.fetch_bba(product)
-
-        if price is not None and float(price) > 0:
-            limit_px = float(price)
-        elif side_l == "buy":
-            limit_px = maker_buy_price(bid, ask)
-        else:
-            limit_px = maker_sell_price(bid, ask)
-        if limit_px is None or limit_px <= 0:
-            raise ValueError(
-                f"maker swap {side_l} refused: no usable book price "
-                f"(bid={bid!r} ask={ask!r})"
-            )
-        if side_l == "buy" and ask is not None and limit_px >= float(ask):
-            if bid is None or float(bid) <= 0:
-                raise ValueError("maker swap buy would cross ask; refused")
-            limit_px = float(bid)
-            if limit_px >= float(ask):
-                raise ValueError("maker swap buy would cross ask; refused")
-        if side_l == "sell" and bid is not None and limit_px <= float(bid):
-            if ask is None or float(ask) <= 0:
-                raise ValueError("maker swap sell would cross bid; refused")
-            limit_px = float(ask)
-            if limit_px <= float(bid):
-                raise ValueError("maker swap sell would cross bid; refused")
-
         pid = normalize_futures_product(product)
         symbol = to_futures_ccxt_symbol(pid)
         cfm = is_cfm_product(pid)
+
+        # CFM: always price off THIS product's book. Ticker last / another
+        # index's mark (US5 3087 vs TEK ~3947) must not leak into the limit.
+        if cfm or (bid is None and ask is None):
+            book_bid, book_ask = self.fetch_bba(pid)
+            if book_bid is not None:
+                bid = book_bid
+            if book_ask is not None:
+                ask = book_ask
+
+        tick = tick_size_for_product(pid, self._exchange) if cfm else None
+
+        if post_only:
+            if cfm:
+                # Recompute from live BBA + tick; ignore stale caller price.
+                if side_l == "buy":
+                    limit_px = maker_buy_price(bid, ask, tick=tick)
+                else:
+                    limit_px = maker_sell_price(bid, ask, tick=tick)
+            elif price is not None and float(price) > 0:
+                limit_px = float(price)
+            elif side_l == "buy":
+                limit_px = maker_buy_price(bid, ask, tick=tick)
+            else:
+                limit_px = maker_sell_price(bid, ask, tick=tick)
+        elif price is not None and float(price) > 0:
+            # Taker-capable: honor caller price (typically the far touch).
+            aggressive = "up" if side_l == "buy" else "down"
+            limit_px = round_to_tick(float(price), tick, direction=aggressive)
+        elif side_l == "buy":
+            if ask is not None and float(ask) > 0:
+                limit_px = round_to_tick(float(ask), tick, direction="up")
+            else:
+                limit_px = maker_buy_price(bid, ask, tick=tick)
+        else:
+            if bid is not None and float(bid) > 0:
+                limit_px = round_to_tick(float(bid), tick, direction="down")
+            else:
+                limit_px = maker_sell_price(bid, ask, tick=tick)
+
+        if limit_px is None or limit_px <= 0:
+            raise ValueError(
+                f"maker swap {side_l} refused: no usable book price "
+                f"(bid={bid!r} ask={ask!r} tick={tick!r})"
+            )
+        if post_only:
+            if side_l == "buy" and ask is not None and limit_px >= float(ask):
+                if bid is None or float(bid) <= 0:
+                    raise ValueError("maker swap buy would cross ask; refused")
+                limit_px = round_to_tick(float(bid), tick, direction="down")
+                if limit_px >= float(ask):
+                    raise ValueError("maker swap buy would cross ask; refused")
+            if side_l == "sell" and bid is not None and limit_px <= float(bid):
+                if ask is None or float(ask) <= 0:
+                    raise ValueError("maker swap sell would cross bid; refused")
+                limit_px = round_to_tick(float(ask), tick, direction="up")
+                if limit_px <= float(bid):
+                    raise ValueError("maker swap sell would cross bid; refused")
+
         qty = float(int(round(float(amount)))) if cfm else float(amount)
         if qty <= 0:
             raise ValueError("amount must be positive")
@@ -548,6 +633,23 @@ class CoinbaseFuturesMarket:
             params["reduceOnly"] = True
         if post_only:
             params["postOnly"] = True
+        log.info(
+            "futures maker limit",
+            extra={
+                "data": {
+                    "product": pid,
+                    "symbol": symbol,
+                    "side": side_l,
+                    "qty": qty,
+                    "limit_px": limit_px,
+                    "bid": bid,
+                    "ask": ask,
+                    "tick": tick,
+                    "post_only": post_only,
+                    "cfm": cfm,
+                }
+            },
+        )
         # Limit create_order requires price (CFM contracts + INTX swaps)
         order = self._exchange.create_order(  # type: ignore[attr-defined]
             symbol, "limit", side_l, qty, float(limit_px), params

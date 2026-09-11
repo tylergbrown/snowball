@@ -127,3 +127,117 @@ def test_cfm_sizing_budget_floors_per_leg_soft_cap() -> None:
         lane_max_notional_usd=4000.0,
     )
     assert tek == 1.0
+
+
+def test_cfm_tick_sizes() -> None:
+    from snowball.futures.market import tick_size_for_product
+
+    assert tick_size_for_product("TEK-19DEC30-CDE") == 1.0
+    assert tick_size_for_product("TEK") == 1.0
+    assert tick_size_for_product("US5-19DEC30-CDE") == 0.1
+    assert tick_size_for_product("US5") == 0.1
+
+
+def test_tek_us5_maker_buy_from_book_never_crosses_ask() -> None:
+    """2026-09-11 live bug: TEK post-only at 3947 crossed a 1-point book."""
+    from snowball.maker import maker_buy_price, round_to_tick
+
+    # 1-tick TEK spread: inside-spread 3946.25 must floor to 3946, not ROUND to 3947.
+    tek = maker_buy_price(3946.0, 3947.0, tick=1.0)
+    assert tek == 3946.0
+    assert tek < 3947.0
+    assert round_to_tick(3946.25, 1.0, direction="down") == 3946.0
+
+    tek_frac = maker_buy_price(3946.4, 3947.0, tick=1.0)
+    assert tek_frac == 3946.0
+
+    # Locked/at-ask book: refuse rather than post-only at 3947.
+    assert maker_buy_price(3947.0, 3947.0, tick=1.0) is None
+
+    us5 = maker_buy_price(3087.6, 3087.8, tick=0.1)
+    assert us5 is not None
+    assert 3087.6 <= us5 < 3087.8
+    # Snapped to 0.1 tick and strictly below ask (US5 filled 3087.7 this morning).
+    snapped = round_to_tick(us5, 0.1, direction="down")
+    assert snapped == pytest.approx(us5)
+    assert snapped < 3087.8
+
+
+def test_cfm_maker_limit_uses_that_product_book_not_caller_price() -> None:
+    """Stale 3947 / US5 BBA must not be posted on TEK; each CDE uses its own book."""
+    from snowball.futures.market import CoinbaseFuturesMarket
+
+    class Ex:
+        def __init__(self) -> None:
+            self.orders: list[dict] = []
+            self.books = {
+                "CDEUS5/USD:USD-301219": {
+                    "bids": [[3087.6, 1.0]],
+                    "asks": [[3087.8, 1.0]],
+                },
+                "CDETEK/USD:USD-301219": {
+                    "bids": [[3946.0, 1.0]],
+                    "asks": [[3947.0, 1.0]],
+                },
+            }
+
+        def fetch_order_book(self, symbol: str, limit: int = 5) -> dict:
+            return dict(self.books[symbol])
+
+        def create_order(self, symbol, typ, side, amount, price, params):
+            self.orders.append(
+                {
+                    "symbol": symbol,
+                    "type": typ,
+                    "side": side,
+                    "amount": amount,
+                    "price": float(price),
+                    "params": dict(params or {}),
+                }
+            )
+            return {
+                "id": f"o-{len(self.orders)}",
+                "filled": float(amount),
+                "average": float(price),
+                "price": float(price),
+                "remaining": 0.0,
+                "status": "closed",
+                "fee": {"cost": 0.0, "currency": "USD"},
+            }
+
+    ex = Ex()
+    mkt = CoinbaseFuturesMarket(exchange=ex, allow_orders=True)
+
+    # Reproduce this morning: caller hands TEK the crossing 3947 (and even US5 BBA).
+    mkt.create_swap_maker_limit_order(
+        "TEK-19DEC30-CDE",
+        "buy",
+        1.0,
+        price=3947.0,
+        bid=3087.6,
+        ask=3087.8,
+        leverage=1.0,
+        timeout_sec=1.0,
+    )
+    tek_ord = ex.orders[-1]
+    assert tek_ord["symbol"].startswith("CDETEK/")
+    assert tek_ord["amount"] == 1.0
+    assert tek_ord["price"] == 3946.0
+    assert tek_ord["price"] != 3947.0
+    assert tek_ord["params"].get("postOnly") is True
+    assert tek_ord["params"].get("leverage") == "1"
+
+    mkt.create_swap_maker_limit_order(
+        "US5-19DEC30-CDE",
+        "buy",
+        1.0,
+        price=3947.0,  # wrong on purpose
+        leverage=1.0,
+        timeout_sec=1.0,
+    )
+    us5_ord = ex.orders[-1]
+    assert us5_ord["symbol"].startswith("CDEUS5/")
+    assert us5_ord["amount"] == 1.0
+    assert 3087.6 <= us5_ord["price"] < 3087.8
+    assert us5_ord["price"] != 3947.0
+    assert us5_ord["params"].get("postOnly") is True

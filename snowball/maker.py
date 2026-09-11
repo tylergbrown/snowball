@@ -13,6 +13,7 @@ fall back to market so the session does not miss the close window.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, time
 from typing import Any
 
@@ -23,10 +24,36 @@ URGENT_MAKER_TIMEOUT_SEC = 20.0
 INSIDE_SPREAD_FRAC = 0.25
 
 
+def round_to_tick(
+    price: float,
+    tick: float | None,
+    *,
+    direction: str = "down",
+) -> float:
+    """Snap ``price`` to ``tick``. ``down`` floors (maker buy); ``up`` ceils (maker sell).
+
+    Coinbase/ccxt ``price_to_precision`` *rounds* to tick. A TEK buy at 3946.25 with
+    tick=1 becomes 3947 and ``INVALID_LIMIT_PRICE_POST_ONLY`` against ask 3947.
+    Maker prices must be pre-snapped in the passive direction so ROUND is a no-op.
+    """
+    px = float(price)
+    if tick is None or float(tick) <= 0:
+        return px
+    tick_f = float(tick)
+    n = px / tick_f
+    if (direction or "down").lower() == "up":
+        steps = math.ceil(n - 1e-12)
+    else:
+        steps = math.floor(n + 1e-12)
+    return max(0.0, steps * tick_f)
+
+
 def maker_buy_price(
     bid: float | None,
     ask: float | None,
     last: float | None = None,
+    *,
+    tick: float | None = None,
 ) -> float | None:
     """Limit buy price that should rest as maker (at/near bid, strictly below ask)."""
     _ = last  # reserved; do not invent a book from last alone
@@ -40,6 +67,11 @@ def maker_buy_price(
         px = min(max(bid, inside), cap)
         if px >= ask:
             px = bid
+    px = round_to_tick(px, tick, direction="down")
+    if ask is not None and px >= float(ask):
+        px = round_to_tick(float(bid), tick, direction="down")
+        if px >= float(ask):
+            return None
     return px if px > 0 else None
 
 
@@ -47,6 +79,8 @@ def maker_sell_price(
     bid: float | None,
     ask: float | None,
     last: float | None = None,
+    *,
+    tick: float | None = None,
 ) -> float | None:
     """Limit sell price that should rest as maker (at/near ask, strictly above bid)."""
     _ = last
@@ -59,6 +93,11 @@ def maker_sell_price(
         px = max(min(ask, inside), floor)
         if px <= bid:
             px = ask
+    px = round_to_tick(px, tick, direction="up")
+    if bid is not None and px <= float(bid):
+        px = round_to_tick(float(ask), tick, direction="up")
+        if px <= float(bid):
+            return None
     return px if px > 0 else None
 
 

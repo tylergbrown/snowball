@@ -893,17 +893,33 @@ class FuturesEngine:
         ask = ticker.ask
         try:
             from snowball.maker import maker_buy_price
+            from snowball.futures.market import (
+                is_invalid_limit_price_post_only,
+                tick_size_for_product,
+            )
 
-            limit_px = maker_buy_price(bid, ask, ref)
+            # CFM: this product's book only (never US5 mark on TEK).
+            if is_cfm_product(product):
+                bid2, ask2 = self.market.fetch_bba(product)
+                if bid2 is not None:
+                    bid = bid2
+                if ask2 is not None:
+                    ask = ask2
+            tick = (
+                tick_size_for_product(product, getattr(self.market, "exchange", None))
+                if is_cfm_product(product)
+                else None
+            )
+            limit_px = maker_buy_price(bid, ask, ref, tick=tick)
             if limit_px is None or limit_px <= 0:
                 bid2, ask2 = self.market.fetch_bba(product)
                 bid = bid if bid is not None else bid2
                 ask = ask if ask is not None else ask2
-                limit_px = maker_buy_price(bid, ask, ref)
+                limit_px = maker_buy_price(bid, ask, ref, tick=tick)
             if limit_px is None or limit_px <= 0:
                 log.info(
                     "futures live buy skipped: no book bid for maker",
-                    extra={"data": {"product": product, "bid": bid, "ask": ask}},
+                    extra={"data": {"product": product, "bid": bid, "ask": ask, "tick": tick}},
                 )
                 return
             amount = order_size_for_product(
@@ -923,17 +939,68 @@ class FuturesEngine:
                 )
                 return
             timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
-            order = self.market.create_swap_maker_limit_order(
-                product,
-                "buy",
-                amount,
-                price=limit_px,
-                bid=bid,
-                ask=ask,
-                leverage=lev,
-                reduce_only=False,
-                timeout_sec=timeout,
-            )
+            try:
+                order = self.market.create_swap_maker_limit_order(
+                    product,
+                    "buy",
+                    amount,
+                    price=limit_px,
+                    bid=bid,
+                    ask=ask,
+                    leverage=lev,
+                    reduce_only=False,
+                    timeout_sec=timeout,
+                )
+            except Exception as post_exc:  # noqa: BLE001
+                times = session_times_from_settings(settings)
+                in_window = entry_allowed(
+                    now,
+                    entry_start=times["entry_start"],
+                    exit_start=times["exit_start"],
+                )
+                if not (
+                    is_invalid_limit_price_post_only(post_exc)
+                    and in_window
+                ):
+                    raise
+                # One taker fallback so the second index can still fill this session.
+                log.warning(
+                    "futures post-only rejected; one taker fallback",
+                    extra={
+                        "data": {
+                            "product": product,
+                            "error": str(post_exc),
+                            "bid": bid,
+                            "ask": ask,
+                            "limit_px": limit_px,
+                            "tick": tick,
+                        }
+                    },
+                )
+                bid3, ask3 = self.market.fetch_bba(product)
+                bid = bid3 if bid3 is not None else bid
+                ask = ask3 if ask3 is not None else ask
+                if ask is not None and float(ask) > 0:
+                    order = self.market.create_swap_maker_limit_order(
+                        product,
+                        "buy",
+                        amount,
+                        price=float(ask),
+                        bid=bid,
+                        ask=ask,
+                        leverage=lev,
+                        reduce_only=False,
+                        timeout_sec=timeout,
+                        post_only=False,
+                    )
+                else:
+                    order = self.market.create_swap_market_order(
+                        product,
+                        "buy",
+                        amount,
+                        leverage=lev,
+                        reduce_only=False,
+                    )
         except Exception as exc:  # noqa: BLE001
             log.exception(
                 "futures live buy failed",

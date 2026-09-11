@@ -548,3 +548,190 @@ def test_swap_order_leverage_is_string_for_coinbase() -> None:
     assert isinstance(captured[-1]["leverage"], str)
     assert captured[-1].get("timeInForce") == "GTC"
 
+
+
+def test_ft_invalid_post_only_falls_back_once_in_entry_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INVALID_LIMIT_PRICE_POST_ONLY during FT entry → one non-post-only limit fill."""
+    monkeypatch.delenv("FUTURES_MODE", raising=False)
+    monkeypatch.delenv("FUTURES_LIVE_ENABLED", raising=False)
+
+    class RejectThenFill(FakeFuturesMarket):
+        def __init__(self) -> None:
+            super().__init__(last=3947.0)
+            self._allow_orders = True
+            self.bba = (3946.0, 3947.0)
+
+        def fetch_ticker(self, product: str) -> Ticker:
+            bid, ask = self.bba
+            return Ticker(
+                product=product,
+                last=3947.0,
+                bid=bid,
+                ask=ask,
+                ts=datetime.now(timezone.utc),
+            )
+
+        def fetch_bba(self, product):
+            return self.bba
+
+        def create_swap_maker_limit_order(
+            self,
+            product,
+            side,
+            amount,
+            *,
+            price=None,
+            bid=None,
+            ask=None,
+            leverage=1.0,
+            reduce_only=False,
+            timeout_sec=None,
+            post_only=True,
+        ):
+            if post_only:
+                self.orders.append(
+                    {
+                        "product": product,
+                        "post_only": True,
+                        "price": price,
+                        "amount": amount,
+                        "type": "limit",
+                    }
+                )
+                raise RuntimeError(
+                    'coinbase {"success":false, "error_response":'
+                    '{"error":"INVALID_LIMIT_PRICE_POST_ONLY"}, '
+                    '"order_configuration":{"limit_limit_gtc":'
+                    '{"base_size":"1", "limit_price":"3947", "post_only":true}}}'
+                )
+            px = float(price if price is not None else (ask or self.last))
+            order = {
+                "id": "fallback-1",
+                "filled": float(amount),
+                "average": px,
+                "price": px,
+                "cost": float(amount) * px,
+                "remaining": 0.0,
+                "status": "closed",
+                "fee": {"cost": 0.0, "currency": "USD"},
+            }
+            self.orders.append(
+                {
+                    "product": product,
+                    "post_only": False,
+                    "price": px,
+                    "amount": amount,
+                    "type": "limit",
+                    **order,
+                }
+            )
+            return order
+
+    settings = _paper_settings(
+        tmp_path,
+        futures_mode="live",
+        futures_live_enabled=True,
+        futures_max_notional_usd=4000.0,
+        coinbase_api_key="organizations/demo/apiKeys/demo",
+        coinbase_api_secret="-----BEGIN EC PRIVATE KEY-----\nABC\n-----END EC PRIVATE KEY-----\n",
+    )
+    assert settings.cfm_max_contracts_per_index() == 1
+    assert settings.cfm_order_leverage() == 1.0
+    state = AppState(
+        settings=settings, ledger=PaperLedger(tmp_path / "c-live.db", 10_000.0)
+    )
+    state.futures_ledger = PaperLedger(tmp_path / "f-live.db", 10_000.0)
+    state.futures_pairs["TEK-19DEC30-CDE"] = PairSnapshot(
+        product="TEK-19DEC30-CDE",
+        last=3947.0,
+        bid=3946.0,
+        ask=3947.0,
+        max_open=1,
+    )
+    mkt = RejectThenFill()
+    engine = FuturesPaperEngine(state, market=mkt)  # type: ignore[arg-type]
+    engine._last_budget = {
+        "account_value_usd": 10_000.0,
+        "budget_usd": 4000.0,
+        "per_index_usd": 2000.0,
+        "per_leg_notional_usd": 2000.0,
+    }
+    now = _et(2026, 9, 11, 9, 26).astimezone(timezone.utc)
+    engine._open_lot(
+        "TEK-19DEC30-CDE",
+        {"TEK-19DEC30-CDE": 3947.0},
+        reason="session_day:session_enter",
+        now=now,
+        strategy="session_day",
+        notional_usd=2000.0,
+    )
+    assert state.futures_ledger is not None
+    assert state.futures_ledger.open_count("TEK-19DEC30-CDE") == 1
+    pos = state.futures_ledger.open_positions("TEK-19DEC30-CDE")[0]
+    assert pos.qty == 1.0
+    assert any(o.get("post_only") is True for o in mkt.orders)
+    assert any(o.get("post_only") is False for o in mkt.orders)
+    taker = [o for o in mkt.orders if o.get("post_only") is False][0]
+    assert taker["amount"] == 1.0
+    assert float(taker["price"]) == 3947.0  # ask touch, not a second bogus post-only
+
+
+def test_ft_post_only_reject_no_fallback_outside_entry_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("FUTURES_MODE", raising=False)
+    monkeypatch.delenv("FUTURES_LIVE_ENABLED", raising=False)
+
+    class AlwaysReject(FakeFuturesMarket):
+        def __init__(self) -> None:
+            super().__init__(last=3947.0)
+            self._allow_orders = True
+
+        def fetch_bba(self, product):
+            return 3946.0, 3947.0
+
+        def create_swap_maker_limit_order(self, *a, **k):
+            self.orders.append({"post_only": k.get("post_only", True), "type": "limit"})
+            raise RuntimeError("INVALID_LIMIT_PRICE_POST_ONLY")
+
+        def create_swap_market_order(self, *a, **k):
+            raise AssertionError("market fallback must not run outside entry window")
+
+    settings = _paper_settings(
+        tmp_path,
+        futures_mode="live",
+        futures_live_enabled=True,
+        futures_max_notional_usd=4000.0,
+        coinbase_api_key="organizations/demo/apiKeys/demo",
+        coinbase_api_secret="-----BEGIN EC PRIVATE KEY-----\nABC\n-----END EC PRIVATE KEY-----\n",
+    )
+    state = AppState(
+        settings=settings, ledger=PaperLedger(tmp_path / "c-out.db", 10_000.0)
+    )
+    state.futures_ledger = PaperLedger(tmp_path / "f-out.db", 10_000.0)
+    state.futures_pairs["TEK-19DEC30-CDE"] = PairSnapshot(
+        product="TEK-19DEC30-CDE", last=3947.0, bid=3946.0, ask=3947.0, max_open=1
+    )
+    mkt = AlwaysReject()
+    engine = FuturesPaperEngine(state, market=mkt)  # type: ignore[arg-type]
+    engine._last_budget = {
+        "account_value_usd": 10_000.0,
+        "budget_usd": 4000.0,
+        "per_index_usd": 2000.0,
+        "per_leg_notional_usd": 2000.0,
+    }
+    # Saturday — entry_allowed is False
+    now = _et(2026, 9, 12, 9, 26).astimezone(timezone.utc)
+    engine._open_lot(
+        "TEK-19DEC30-CDE",
+        {"TEK-19DEC30-CDE": 3947.0},
+        reason="session_day:session_enter",
+        now=now,
+        strategy="session_day",
+        notional_usd=2000.0,
+    )
+    assert state.futures_ledger is not None
+    assert state.futures_ledger.open_count("TEK-19DEC30-CDE") == 0
+    assert all(o.get("post_only") is True for o in mkt.orders)
