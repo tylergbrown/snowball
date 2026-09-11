@@ -78,8 +78,14 @@ def context_from_settings(
     cash_usd: float,
     requested_notional: float,
     cooldown_seconds: int | None = None,
+    max_position_notional_usd: float | None = None,
 ) -> RiskContext:
     seconds = settings.entry_cooldown_seconds if cooldown_seconds is None else cooldown_seconds
+    cap = (
+        float(max_position_notional_usd)
+        if max_position_notional_usd is not None
+        else float(settings.max_position_notional_usd)
+    )
     return RiskContext(
         now=now,
         trading_enabled=trading_enabled,
@@ -90,7 +96,7 @@ def context_from_settings(
         cash_usd=cash_usd,
         requested_notional=requested_notional,
         max_positions_per_pair=settings.max_positions_per_pair,
-        max_position_notional_usd=settings.max_position_notional_usd,
+        max_position_notional_usd=cap,
         entry_cooldown=timedelta(seconds=seconds),
         mode=settings.mode,
         live_enabled=settings.live_enabled,

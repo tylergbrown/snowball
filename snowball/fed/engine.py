@@ -373,11 +373,13 @@ class FedEngine:
         pct = float(settings.fed_account_budget_pct)
         budget = max(0.0, account_value * pct)
         per_index = budget / float(n)
-        per_index = min(per_index, float(settings.fed_max_notional_usd))
+        per_leg = settings.effective_per_leg_notional_usd(account_value)
+        per_index = min(per_index, per_leg)
         self._last_budget = {
             "account_value_usd": account_value,
             "budget_usd": budget,
             "per_index_usd": per_index,
+            "per_leg_notional_usd": per_leg,
         }
 
     def _update_pair(self, product: str) -> PairSnapshot:

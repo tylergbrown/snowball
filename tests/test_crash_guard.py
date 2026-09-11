@@ -187,7 +187,8 @@ def _paper_settings(tmp_path: Path, **kwargs) -> Settings:
 def test_trigger_fires_paper_short(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CRASH_MODE", raising=False)
     monkeypatch.delenv("CRASH_LIVE_ENABLED", raising=False)
-    # Paper budget from bankroll equity: 10_000 * 10% / 2 = 500 per index
+    # Paper budget from bankroll equity: 10_000 * 10% / 2 = 500 per index,
+    # but shared per-leg autoscale caps at 100 + floor(10000/100) = 200.
     settings = _paper_settings(tmp_path, crash_bankroll_usd=10_000.0)
     state = AppState(settings=settings, ledger=PaperLedger(settings.sqlite_path, 1000.0))
     attach_crash_lane(state)
@@ -199,7 +200,7 @@ def test_trigger_fires_paper_short(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert state.crash_ledger.open_count("QQQ-PERP-INTX") == 1
     spy = state.crash_ledger.open_positions("SPY-PERP-INTX")[0]
     assert spy.side == "short"
-    assert spy.notional_usd == pytest.approx(500.0, rel=0.05)
+    assert spy.notional_usd == pytest.approx(200.0, rel=0.05)
 
 
 def test_second_entry_blocked_while_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -93,7 +93,7 @@ def _futures_risk_ctx(
         max_position_notional_usd=(
             float(max_notional)
             if max_notional is not None
-            else settings.futures_max_notional_usd
+            else float(settings.per_leg_base_usd)
         ),
         entry_cooldown=timedelta(seconds=cooldown_seconds),
         mode="live" if live else "paper",
@@ -283,12 +283,14 @@ class FuturesEngine:
         pct = float(settings.futures_account_budget_pct)
         budget = max(0.0, account_value * pct)
         per_index = budget / float(n)
-        # Hard ceiling from FUTURES_MAX_NOTIONAL_USD
-        per_index = min(per_index, float(settings.futures_max_notional_usd))
+        # Shared per-leg autoscale ceiling (PER_LEG_*); still respects lane budget split.
+        per_leg = settings.effective_per_leg_notional_usd(account_value)
+        per_index = min(per_index, per_leg)
         self._last_budget = {
             "account_value_usd": account_value,
             "budget_usd": budget,
             "per_index_usd": per_index,
+            "per_leg_notional_usd": per_leg,
         }
         # Sync paper cash display toward bankroll when paper; live keeps ledger as fill book
         if not settings.futures_live_orders_permitted():
@@ -430,7 +432,12 @@ class FuturesEngine:
                     cooldown_seconds=0,
                     max_notional=max(
                         self._last_budget["per_index_usd"],
-                        settings.futures_max_notional_usd,
+                        float(
+                            self._last_budget.get("per_leg_notional_usd")
+                            or settings.effective_per_leg_notional_usd(
+                                float(self._last_budget.get("account_value_usd") or 0.0)
+                            )
+                        ),
                     ),
                 )
                 ok, reason = allow_exit(ctx)
@@ -468,7 +475,13 @@ class FuturesEngine:
             for p in ledger.open_positions(prod)
         )
         budget_left = max(0.0, float(self._last_budget["budget_usd"]) - open_notional)
-        notional = min(per_index, budget_left, float(settings.futures_max_notional_usd))
+        per_leg = float(
+            self._last_budget.get("per_leg_notional_usd")
+            or settings.effective_per_leg_notional_usd(
+                float(self._last_budget.get("account_value_usd") or 0.0)
+            )
+        )
+        notional = min(per_index, budget_left, per_leg)
         if notional <= 1.0:
             log.info(
                 "futures session entry skipped small notional",
@@ -487,7 +500,7 @@ class FuturesEngine:
             cash_usd=max(ledger.cash_usd(), notional),
             requested_notional=notional,
             cooldown_seconds=0,
-            max_notional=max(notional, settings.futures_max_notional_usd),
+            max_notional=max(notional, per_leg),
         )
         ok, reason = allow_entry(ctx)
         if not ok:
@@ -660,6 +673,13 @@ class FuturesEngine:
         if not ok_tf:
             return
 
+        allot = float(
+            self._last_budget.get("per_index_usd")
+            or self._last_budget.get("per_leg_notional_usd")
+            or settings.effective_per_leg_notional_usd(
+                float(self._last_budget.get("account_value_usd") or 0.0)
+            )
+        )
         ctx = _futures_risk_ctx(
             settings,
             now=now,
@@ -669,8 +689,9 @@ class FuturesEngine:
             open_count_for_pair=len(all_lots),
             last_entry_at=ledger.last_entry_at(product, strategy_id),
             cash_usd=ledger.cash_usd(),
-            requested_notional=settings.futures_max_notional_usd,
+            requested_notional=allot,
             cooldown_seconds=settings.cooldown_seconds_for(strategy_id),
+            max_notional=allot,
         )
         ok, reason = allow_entry(ctx)
         if not ok:
@@ -684,7 +705,7 @@ class FuturesEngine:
             reason=entry_reason,
             now=now,
             strategy=strategy_id,
-            notional_usd=settings.futures_max_notional_usd,
+            notional_usd=allot,
         )
 
     def _open_lot(
@@ -707,7 +728,10 @@ class FuturesEngine:
         target = float(
             notional_usd
             if notional_usd is not None
-            else settings.futures_max_notional_usd
+            else (
+                self._last_budget.get("per_leg_notional_usd")
+                or settings.per_leg_base_usd
+            )
         )
         if settings.futures_live_orders_permitted():
             self._open_lot_live(

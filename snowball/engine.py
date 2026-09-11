@@ -454,6 +454,7 @@ class Engine:
             cash_usd=self.state.ledger.cash_usd(),
             requested_notional=crypto_notional,
             cooldown_seconds=settings.cooldown_seconds_for(strategy_id),
+            max_position_notional_usd=crypto_notional,
         )
         ok, reason = allow_entry(ctx)
         if not ok:
@@ -498,10 +499,11 @@ class Engine:
         if ft_av is not None and float(ft_av) > 0:
             account_value = float(ft_av)
         budget = account_value * float(settings.crypto_account_budget_pct)
+        per_leg = settings.effective_per_leg_notional_usd(account_value)
         return leg_notional_usd(
             budget_usd=budget,
             open_notional_usd=open_n,
-            max_notional_usd=settings.max_position_notional_usd,
+            max_notional_usd=per_leg,
             target_legs=max(4, settings.max_positions_per_pair * 2),
         )
 
@@ -522,7 +524,7 @@ class Engine:
         target = float(
             notional_usd
             if notional_usd is not None
-            else settings.max_position_notional_usd
+            else settings.per_leg_base_usd
         )
         broker = self.state.broker
         if broker is not None and settings.live_orders_permitted():
@@ -537,8 +539,6 @@ class Engine:
             return
         px = fill_price(ticker, "buy", settings.slippage_bps)
         notional = min(target, self.state.ledger.cash_usd())
-        if notional > settings.max_position_notional_usd + 1e-9:
-            notional = min(notional, settings.max_position_notional_usd)
         if notional <= 0:
             return
         pos, fill = self.state.ledger.open_buy(
@@ -598,7 +598,7 @@ class Engine:
         target = float(
             notional_usd
             if notional_usd is not None
-            else settings.max_position_notional_usd
+            else settings.per_leg_base_usd
         )
         notional = min(target, free_usd, self.state.ledger.cash_usd())
         if notional <= 1e-6:

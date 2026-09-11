@@ -193,7 +193,15 @@ def build_fed_snapshot(state: AppState) -> dict[str, Any]:
                 "start_of_day_equity": start_eq,
                 "unrealized_pnl_usd": store.unrealized_pnl(marks),
                 "max_positions_per_pair": settings.fed_max_positions,
-                "max_position_notional_usd": settings.fed_max_notional_usd,
+                "max_position_notional_usd": settings.effective_per_leg_notional_usd(
+                    float(state.fed_account_value_usd or settings.fed_bankroll_usd)
+                ),
+                "effective_per_leg_notional_usd": settings.effective_per_leg_notional_usd(
+                    float(state.fed_account_value_usd or settings.fed_bankroll_usd)
+                ),
+                "per_leg_base_usd": settings.per_leg_base_usd,
+                "per_leg_autoscale": settings.per_leg_autoscale,
+                "per_leg_scale_per_100_usd_pct": settings.per_leg_scale_per_100_usd_pct,
                 "account_value_usd": state.fed_account_value_usd,
                 "budget_pct": settings.fed_account_budget_pct,
                 "budget_usd": state.fed_budget_usd,

@@ -179,6 +179,8 @@ def _live_settings(tmp_path: Path, **kwargs: object) -> Settings:
         indicator_filters_enabled=False,
         pair_pause_enabled=False,
         max_position_notional_usd=100.0,
+        per_leg_base_usd=100.0,
+        per_leg_autoscale=False,  # live fill tests isolate order path, not AV scale
         bankroll_usd=1000.0,
         products="BTC-USD,SOL-USD,ETH-USD,DOGE-USD",
     )

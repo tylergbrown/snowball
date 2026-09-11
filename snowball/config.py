@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     bankroll_usd: float = 1000.0
     max_positions_per_pair: int = 5
     max_position_notional_usd: float = 100.0
+    # Shared per-leg notional autoscale (all lanes). See snowball.sizing.
+    # per_leg = max(BASE, BASE * (1 + (PCT/100) * floor(AV/100))) when enabled.
+    per_leg_base_usd: float = 100.0
+    per_leg_scale_per_100_usd_pct: float = 1.0
+    per_leg_autoscale: bool = True
     daily_loss_kill_usd: float = 25.0
     entry_cooldown_seconds: int = 900
     entry_cooldown_5m_seconds: int = 300
@@ -338,6 +343,17 @@ class Settings(BaseSettings):
 
         return effective_take_profit_floor(
             self.min_take_profit_pct_for(strategy_id), self.fee_buffer_pct
+        )
+
+    def effective_per_leg_notional_usd(self, account_value_usd: float) -> float:
+        """Per-leg notional for all lanes from total account value (see sizing.py)."""
+        from snowball.sizing import per_leg_notional_usd
+
+        return per_leg_notional_usd(
+            account_value_usd,
+            base_usd=self.per_leg_base_usd,
+            scale_per_100_usd_pct=self.per_leg_scale_per_100_usd_pct,
+            autoscale=self.per_leg_autoscale,
         )
 
     def lane_budget_pcts(self) -> dict[str, float]:

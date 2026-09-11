@@ -181,7 +181,23 @@ def build_stocks_snapshot(state: AppState) -> dict[str, Any]:
                 "start_of_day_equity": start_eq,
                 "unrealized_pnl_usd": ledger.unrealized_pnl(marks),
                 "max_positions_per_pair": settings.stock_max_positions,
-                "max_position_notional_usd": settings.stock_max_notional_usd,
+                "max_position_notional_usd": settings.effective_per_leg_notional_usd(
+                    float(
+                        getattr(state, "stock_account_value_usd", None)
+                        or getattr(state, "futures_account_value_usd", None)
+                        or settings.stock_bankroll_usd
+                    )
+                ),
+                "effective_per_leg_notional_usd": settings.effective_per_leg_notional_usd(
+                    float(
+                        getattr(state, "stock_account_value_usd", None)
+                        or getattr(state, "futures_account_value_usd", None)
+                        or settings.stock_bankroll_usd
+                    )
+                ),
+                "per_leg_base_usd": settings.per_leg_base_usd,
+                "per_leg_autoscale": settings.per_leg_autoscale,
+                "per_leg_scale_per_100_usd_pct": settings.per_leg_scale_per_100_usd_pct,
                 "account_value_usd": getattr(state, "stock_account_value_usd", None),
                 "budget_pct": settings.stock_account_budget_pct,
                 "budget_usd": getattr(state, "stock_budget_usd", None),

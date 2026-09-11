@@ -162,7 +162,25 @@ def build_snapshot(state: AppState) -> dict:
                 "start_of_day_equity": start_eq,
                 "unrealized_pnl_usd": state.ledger.unrealized_pnl(marks),
                 "max_positions_per_pair": settings.max_positions_per_pair,
-                "max_position_notional_usd": settings.max_position_notional_usd,
+                "max_position_notional_usd": settings.effective_per_leg_notional_usd(
+                    float(
+                        getattr(state, "futures_account_value_usd", None)
+                        or getattr(state, "stock_account_value_usd", None)
+                        or equity
+                        or settings.bankroll_usd
+                    )
+                ),
+                "effective_per_leg_notional_usd": settings.effective_per_leg_notional_usd(
+                    float(
+                        getattr(state, "futures_account_value_usd", None)
+                        or getattr(state, "stock_account_value_usd", None)
+                        or equity
+                        or settings.bankroll_usd
+                    )
+                ),
+                "per_leg_base_usd": settings.per_leg_base_usd,
+                "per_leg_autoscale": settings.per_leg_autoscale,
+                "per_leg_scale_per_100_usd_pct": settings.per_leg_scale_per_100_usd_pct,
                 "open_positions": len(positions),
                 "max_book_positions": settings.max_positions_per_pair * len(settings.product_list),
             },

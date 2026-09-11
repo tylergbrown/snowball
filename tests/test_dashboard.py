@@ -20,7 +20,10 @@ def test_snapshot_json_shape(app_state: AppState) -> None:
     assert risk["equity_usd"] == 1000.0
     assert risk["daily_loss_kill_usd"] == 25.0
     assert risk["max_positions_per_pair"] == 5
-    assert risk["max_position_notional_usd"] == 100.0
+    # Autoscale on: equity/bankroll 1000 → effective per-leg 110
+    assert risk["max_position_notional_usd"] == 110.0
+    assert risk["effective_per_leg_notional_usd"] == 110.0
+    assert risk["per_leg_base_usd"] == 100.0
     assert risk["max_book_positions"] == 20
     products = [p["product"] for p in snap["pairs"]]
     assert products == ["BTC-USD", "SOL-USD", "ETH-USD", "DOGE-USD"]

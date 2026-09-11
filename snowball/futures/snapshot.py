@@ -193,7 +193,15 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
                 "start_of_day_equity": start_eq,
                 "unrealized_pnl_usd": ledger.unrealized_pnl(marks),
                 "max_positions_per_pair": settings.futures_max_positions,
-                "max_position_notional_usd": settings.futures_max_notional_usd,
+                "max_position_notional_usd": settings.effective_per_leg_notional_usd(
+                    float(state.futures_account_value_usd or settings.futures_bankroll_usd)
+                ),
+                "effective_per_leg_notional_usd": settings.effective_per_leg_notional_usd(
+                    float(state.futures_account_value_usd or settings.futures_bankroll_usd)
+                ),
+                "per_leg_base_usd": settings.per_leg_base_usd,
+                "per_leg_autoscale": settings.per_leg_autoscale,
+                "per_leg_scale_per_100_usd_pct": settings.per_leg_scale_per_100_usd_pct,
                 "account_value_usd": state.futures_account_value_usd,
                 "budget_pct": settings.futures_account_budget_pct,
                 "budget_usd": state.futures_budget_usd,

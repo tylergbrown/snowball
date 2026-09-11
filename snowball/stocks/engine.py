@@ -635,10 +635,12 @@ class StockPaperEngine:
         settings = self.state.settings
         budget = float(self._last_budget.get("budget_usd") or 0.0)
         open_n = float(self._last_budget.get("open_notional_usd") or 0.0)
+        av = float(self._last_budget.get("account_value_usd") or 0.0)
+        per_leg = settings.effective_per_leg_notional_usd(av)
         return leg_notional_usd(
             budget_usd=budget,
             open_notional_usd=open_n,
-            max_notional_usd=settings.stock_max_notional_usd,
+            max_notional_usd=per_leg,
             target_legs=8,
         )
 
@@ -655,7 +657,7 @@ class StockPaperEngine:
         ledger = self.state.stock_ledger
         assert ledger is not None
         target = float(
-            notional_usd if notional_usd is not None else settings.stock_max_notional_usd
+            notional_usd if notional_usd is not None else settings.per_leg_base_usd
         )
         if settings.stock_live_orders_permitted():
             self._open_lot_live(
