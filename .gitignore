@@ -21,3 +21,7 @@ htmlcov/
 dist/
 build/
 .python-version
+data/clerk_cache/
+# earnings scout uses data/snowball_earnings.db (covered by data/*.db)
+reports/*.pdf
+tools/*.bak*

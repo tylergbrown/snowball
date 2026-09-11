@@ -1,0 +1,79 @@
+{
+  "data": {
+    "asOf": "Thu, Sep 10, 2026",
+    "headers": {
+      "time": "Time",
+      "symbol": "Symbol",
+      "name": "Company Name",
+      "marketCap": "Market Cap",
+      "fiscalQuarterEnding": "Fiscal Quarter Ending",
+      "epsForecast": "Consensus EPS* Forecast",
+      "noOfEsts": "# of Ests",
+      "lastYearRptDt": "Last Year's Report Date",
+      "lastYearEPS": "Last year's EPS*"
+    },
+    "rows": [
+      {
+        "lastYearRptDt": "9/09/2025",
+        "lastYearEPS": "$1.20",
+        "time": "time-after-hours",
+        "symbol": "ORCL",
+        "name": "Oracle Corporation",
+        "marketCap": "$468,134,134,000",
+        "fiscalQuarterEnding": "Aug/2026",
+        "epsForecast": "$1.40",
+        "noOfEsts": "10"
+      },
+      {
+        "lastYearRptDt": "8/28/2025",
+        "lastYearEPS": "$0.68",
+        "time": "time-after-hours",
+        "symbol": "NVDA",
+        "name": "NVIDIA Corporation",
+        "marketCap": "$4,000,000,000,000",
+        "fiscalQuarterEnding": "Jul/2026",
+        "epsForecast": "$0.75",
+        "noOfEsts": "25"
+      },
+      {
+        "lastYearRptDt": "7/31/2025",
+        "lastYearEPS": "$1.40",
+        "time": "time-pre-market",
+        "symbol": "AAPL",
+        "name": "Apple Inc.",
+        "marketCap": "$3,500,000,000,000",
+        "fiscalQuarterEnding": "Jun/2026",
+        "epsForecast": "$1.45",
+        "noOfEsts": "20"
+      },
+      {
+        "lastYearRptDt": "N/A",
+        "lastYearEPS": "N/A",
+        "time": "time-not-supplied",
+        "symbol": "ZZZZ",
+        "name": "Noise Co",
+        "marketCap": "$1,000",
+        "fiscalQuarterEnding": "Jun/2026",
+        "epsForecast": "$0.01",
+        "noOfEsts": "1"
+      },
+      {
+        "lastYearRptDt": "7/30/2025",
+        "lastYearEPS": "$3.00",
+        "time": "time-after-hours",
+        "symbol": "MSFT",
+        "name": "Microsoft Corporation",
+        "marketCap": "$3,000,000,000,000",
+        "fiscalQuarterEnding": "Jun/2026",
+        "epsForecast": "$3.30",
+        "noOfEsts": "30"
+      }
+    ]
+  },
+  "message": null,
+  "status": {
+    "rCode": 200,
+    "bCodeMessage": null,
+    "developerMessage": null
+  }
+}

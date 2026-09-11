@@ -1,0 +1,34 @@
+                                                                                                                              Filing ID #20035143
+
+                          P                             T                                            R
+              Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515
+
+
+F         I
+Name:                Hon. Nancy Pelosi
+Status:              Member
+State/District: CA11
+
+
+T
+ID        Owner Asset                                          Transaction Date                Notification Amount                     Cap.
+                                                               Type                            Date                                    Gains >
+                                                                                                                                       $200?
+
+          SP          Example Widget Holdings Class A         P                06/26/2026 07/02/2026            $1,001 -
+                      Common Stock (EXPL) [ST]                                                                     $15,000
+                      F      S      : New
+                      D           : Purchased shares of Example Widget Holdings.
+
+
+          SP          Private Family Trust [ST]                S                06/01/2026 06/20/2026            $15,001 -
+                                                                                                                     $50,000
+                      D           : Sold interest in a family trust.
+
+
+          JT          Wrapped Option Co                        P                01/02/2026 01/03/2026            $1,001 -
+                      (WXYZ) [OP]                                                                                   $15,000
+                      D           : Purchased call options.
+
+
+Digitally Signed: Hon. Nancy Pelosi , 07/03/2026
