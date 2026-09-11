@@ -45,6 +45,24 @@ def is_us_weekday(now: datetime) -> bool:
     return to_et(now).weekday() < 5
 
 
+# US equity cash hours (stall early-bank path). Not the FT session entry/exit windows.
+DEFAULT_CASH_START = time(9, 30)
+DEFAULT_CASH_END = time(15, 45)
+
+
+def in_us_cash_session(
+    now: datetime,
+    *,
+    start: time = DEFAULT_CASH_START,
+    end: time = DEFAULT_CASH_END,
+) -> bool:
+    """True Mon–Fri ET during [start, end) — default 09:30–15:45 (not overnight)."""
+    if not is_us_weekday(now):
+        return False
+    t = to_et(now).time()
+    return start <= t < end
+
+
 def in_entry_preferred_window(
     now: datetime,
     *,

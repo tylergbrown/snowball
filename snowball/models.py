@@ -119,6 +119,8 @@ class PairSnapshot:
     signal_rsi_1d: str = Signal.HOLD.value
     signal_bb_15m: str = Signal.HOLD.value
     signal_bb_1d: str = Signal.HOLD.value
+    # CFM stock lane: last 15m window looks stalled (set by stock engine)
+    stalled_15m: bool = False
     open_count: int = 0
     max_open: int = 2
     last_error: str | None = None

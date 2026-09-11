@@ -20,9 +20,12 @@ from snowball.gates import (
     indicator_filters_allow,
     indicator_snapshot_for_strategy,
     is_emergency_flatten_reason,
+    is_stall_exit_reason,
     lot_unrealized_pnl_pct,
     momentum_fading,
+    price_stalled,
     scale_in_allowed,
+    stall_exit_allowed,
     strategy_exit_allowed,
     trend_filter_allows,
 )
@@ -42,6 +45,12 @@ from snowball.futures.market import (
     is_cfm_product,
     normalize_futures_product,
     order_size_for_product,
+)
+from snowball.futures.session import (
+    DEFAULT_CASH_END,
+    DEFAULT_CASH_START,
+    in_us_cash_session,
+    _parse_hhmm,
 )
 from snowball.gates import sma_fast_for_strategy, sma_slow_for_strategy
 from snowball.strategy import (
@@ -318,8 +327,19 @@ class StockPaperEngine:
         halted = halt_active(settings.halt_file)
         can_trade = trading_enabled(settings)
 
+        # Always refresh/manage products with open lots (e.g. CFM TEK/US5), even if
+        # paper universe refresh temporarily omits them from the active watchlist.
+        manage_products = list(self.state.stock_universe_active)
+        for lot in ledger.open_positions():
+            if lot.product not in manage_products:
+                manage_products.append(lot.product)
+                if lot.product not in self.state.stock_pairs:
+                    self.state.stock_pairs[lot.product] = PairSnapshot(
+                        product=lot.product, max_open=settings.stock_max_positions
+                    )
+
         marks: dict[str, float] = {}
-        for product in list(self.state.stock_universe_active):
+        for product in manage_products:
             snap = self._update_pair(product)
             if snap.last is not None:
                 marks[product] = snap.last
@@ -360,7 +380,7 @@ class StockPaperEngine:
                 self._flatten_all(marks, reason="halt_flatten", now=now)
 
         tradeable = set(self._tradeable_products())
-        for product in list(self.state.stock_universe_active):
+        for product in manage_products:
             # Always manage exits for open lots; entries only on tradeable
             self._act_on_pair(
                 product=product,
@@ -395,6 +415,14 @@ class StockPaperEngine:
         frames = enabled_timeframes(settings.stock_strategy_list)
         if not frames:
             frames = ["1d"]
+        # Stall detector needs 15m OHLCV even if only 5m/1d strategies are enabled.
+        if (
+            bool(getattr(settings, "stock_cfm_stall_exit_enabled", True))
+            and "15m" not in frames
+            and is_cfm_product(product)
+        ):
+            frames = list(frames) + ["15m"]
+        snap.stalled_15m = False
         for timeframe in frames:
             try:
                 rows = self.market.fetch_ohlcv(product, timeframe, limit)
@@ -456,6 +484,31 @@ class StockPaperEngine:
                     bb_period=int(getattr(settings, "bb_period", 20) or 20),
                     bb_std_mult=float(getattr(settings, "bb_std_mult", 2.0) or 2.0),
                 )
+                if timeframe == "15m" and bool(
+                    getattr(settings, "stock_cfm_stall_exit_enabled", True)
+                ):
+                    mark_for_stall = snap.last if snap.last is not None else (
+                        closes[-1] if closes else None
+                    )
+                    snap.stalled_15m = price_stalled(
+                        highs,
+                        lows,
+                        closes,
+                        mark_for_stall,
+                        lookback=int(
+                            getattr(settings, "stock_cfm_stall_lookback_bars", 5) or 5
+                        ),
+                        new_high_tol=float(
+                            getattr(settings, "stock_cfm_stall_new_high_tol", 0.002)
+                            or 0.002
+                        ),
+                        range_compress_pct=float(
+                            getattr(
+                                settings, "stock_cfm_stall_range_compress_pct", 0.006
+                            )
+                            or 0.006
+                        ),
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.exception(
                     "stock ohlcv failed",
@@ -508,13 +561,106 @@ class StockPaperEngine:
         assert ledger is not None
         snap = self.state.stock_pairs[product]
 
+        all_lots = ledger.open_positions(product)
+        strategy_lots = [lot for lot in all_lots if lot.strategy == strategy_id]
+        mark = marks.get(product)
+        if mark is None and snap.last is not None:
+            mark = snap.last
+
+        lots_to_close: list[Position] = []
+        exit_reason = f"{strategy_id}:exit"
+        fee_buf = float(getattr(settings, "fee_buffer_pct", 0.0) or 0.0)
+
+        # CFM stall early-bank is indicator-independent (runs even while EMA/SMA warm).
+        if (
+            strategy_lots
+            and bool(getattr(settings, "stock_cfm_stall_exit_enabled", True))
+            and is_cfm_product(product)
+            and bool(getattr(snap, "stalled_15m", False))
+        ):
+            cash_start = _parse_hhmm(
+                getattr(settings, "stock_cfm_stall_start_et", "09:30"),
+                DEFAULT_CASH_START,
+            )
+            cash_end = _parse_hhmm(
+                getattr(settings, "stock_cfm_stall_end_et", "15:45"),
+                DEFAULT_CASH_END,
+            )
+            if in_us_cash_session(now, start=cash_start, end=cash_end):
+                stall_pct = float(
+                    getattr(settings, "stock_cfm_stall_exit_pct", 0.05) or 0.05
+                )
+                for lot in strategy_lots:
+                    ok_st, reason_st = stall_exit_allowed(
+                        lot,
+                        mark,
+                        stall_exit_pct=stall_pct,
+                        never_sell_red=settings.never_sell_red,
+                    )
+                    if ok_st:
+                        lots_to_close.append(lot)
+                    else:
+                        log.info(
+                            "stock stall hold",
+                            extra={
+                                "data": {
+                                    "product": product,
+                                    "strategy": strategy_id,
+                                    "position_id": lot.id,
+                                    "reason": reason_st,
+                                    "stalled_15m": True,
+                                }
+                            },
+                        )
+                if lots_to_close:
+                    exit_reason = "stall_take_profit"
+                    log.info(
+                        "stock stall_take_profit",
+                        extra={
+                            "data": {
+                                "product": product,
+                                "strategy": strategy_id,
+                                "lots": [lot.id for lot in lots_to_close],
+                                "stall_exit_pct": stall_pct,
+                                "mark": mark,
+                            }
+                        },
+                    )
+                    ctx = _stock_risk_ctx(
+                        settings,
+                        now=now,
+                        halted=halted,
+                        can_trade=can_trade,
+                        daily_killed=daily_killed,
+                        open_count_for_pair=len(all_lots),
+                        last_entry_at=ledger.last_entry_at(product, strategy_id),
+                        cash_usd=ledger.cash_usd(),
+                        requested_notional=settings.stock_max_notional_usd,
+                        cooldown_seconds=settings.cooldown_seconds_for(strategy_id),
+                    )
+                    ok, reason = allow_exit(ctx)
+                    if not ok:
+                        log.info(
+                            "stock exit blocked",
+                            extra={
+                                "data": {
+                                    "product": product,
+                                    "strategy": strategy_id,
+                                    "reason": reason,
+                                }
+                            },
+                        )
+                        return
+                    self._close_lots(
+                        product, lots_to_close, marks, reason=exit_reason, now=now
+                    )
+                    return
+
         if strategy_id not in MEAN_REVERSION_STRATEGY_IDS:
             if _sma_fast(snap, strategy_id) is None or _sma_slow(snap, strategy_id) is None:
                 return
 
         signal, uptrend = _signal_for(snap, strategy_id)
-        all_lots = ledger.open_positions(product)
-        strategy_lots = [lot for lot in all_lots if lot.strategy == strategy_id]
         max_pos = settings.stock_max_positions
         if settings.stock_live_orders_permitted() and is_cfm_product(product):
             max_pos = min(max_pos, settings.cfm_max_contracts_per_index())
@@ -524,18 +670,11 @@ class StockPaperEngine:
         )
         want_signal_exit = signal is Signal.EXIT and len(strategy_lots) > 0
 
-        mark = marks.get(product)
-        if mark is None and snap.last is not None:
-            mark = snap.last
-
-        lots_to_close: list[Position] = []
-        exit_reason = f"{strategy_id}:exit"
         fade = momentum_fading(
             last=mark,
             sma_fast=_sma_fast(snap, strategy_id),
             sma_slow=_sma_slow(snap, strategy_id),
         )
-        fee_buf = float(getattr(settings, "fee_buffer_pct", 0.0) or 0.0)
 
         if strategy_lots and want_signal_exit:
             for lot in strategy_lots:
@@ -1080,13 +1219,26 @@ class StockPaperEngine:
         for lot in lots:
             ref = snap.last if snap is not None else None
             if not is_emergency_flatten_reason(reason):
-                ok_sw, reason_sw = strategy_exit_allowed(
-                    lot,
-                    ref,
-                    min_take_profit_pct=settings.min_take_profit_pct_for(lot.strategy),
-                    never_sell_red=settings.never_sell_red,
-                    fee_buffer_pct=fee_buf,
-                )
+                if is_stall_exit_reason(reason):
+                    # Gross stall floor (no fee buffer); do not apply swing ~7/9% floors.
+                    ok_sw, reason_sw = stall_exit_allowed(
+                        lot,
+                        ref,
+                        stall_exit_pct=float(
+                            getattr(settings, "stock_cfm_stall_exit_pct", 0.05) or 0.05
+                        ),
+                        never_sell_red=settings.never_sell_red,
+                    )
+                else:
+                    ok_sw, reason_sw = strategy_exit_allowed(
+                        lot,
+                        ref,
+                        min_take_profit_pct=settings.min_take_profit_pct_for(
+                            lot.strategy
+                        ),
+                        never_sell_red=settings.never_sell_red,
+                        fee_buffer_pct=fee_buf,
+                    )
                 if not ok_sw:
                     log.info(
                         "stock live close skipped",

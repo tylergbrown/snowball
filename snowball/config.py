@@ -151,6 +151,16 @@ class Settings(BaseSettings):
     # Cap symbols for paper/research universe (live orders only on stock_products)
     stock_max_active: int = 60
     stock_dynamic_max: int = 30
+    # CFM-only intraday stall take-profit (additional early bank; swing floors unchanged).
+    # When unrealized >= STOCK_CFM_STALL_EXIT_PCT (gross) AND 15m price looks stalled
+    # during US cash hours, exit with reason stall_take_profit. Trending → hold for fade.
+    stock_cfm_stall_exit_enabled: bool = True
+    stock_cfm_stall_exit_pct: float = 0.05
+    stock_cfm_stall_lookback_bars: int = 5
+    stock_cfm_stall_new_high_tol: float = 0.002
+    stock_cfm_stall_range_compress_pct: float = 0.006
+    stock_cfm_stall_start_et: str = "09:30"
+    stock_cfm_stall_end_et: str = "15:45"
     entry_cooldown_1d_seconds: int = 86400
 
     # --- Earnings Scout (Nasdaq calendar research sidecar; never trades) ---

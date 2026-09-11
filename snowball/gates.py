@@ -211,3 +211,90 @@ def momentum_fading(
         return False
     return last < sma_fast and last > sma_slow
 
+
+def price_stalled(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    mark: float | None,
+    *,
+    lookback: int = 5,
+    new_high_tol: float = 0.002,
+    range_compress_pct: float = 0.006,
+) -> bool:
+    """Conservative mid-day stall on 15m OHLCV (CFM early bank path).
+
+    Clear uptrend / "keeps going" must NOT look like a stall. Stalled only when
+    ALL of the following hold over the last ``lookback`` bars (~1–1.5h at 15m):
+
+    1. ``mark`` is at least ``new_high_tol`` below the window high (not pressing highs).
+    2. The latest bar did not extend a meaningful new high vs the prior bars in
+       the window (no fresh breakout on the last bar).
+    3. Either the window range is compressed
+       ``(high-low)/mid <= range_compress_pct``, OR closes are flat/non-ascending
+       (last close <= first close * (1 + new_high_tol)).
+
+    Returns False when data is insufficient or mark is unusable.
+    """
+    n = int(lookback)
+    if n < 2 or mark is None or mark <= 0:
+        return False
+    if len(highs) < n or len(lows) < n or len(closes) < n:
+        return False
+    h = [float(x) for x in highs[-n:]]
+    lo = [float(x) for x in lows[-n:]]
+    c = [float(x) for x in closes[-n:]]
+    if any(x <= 0 for x in h + lo + c):
+        return False
+    tol = max(0.0, float(new_high_tol))
+    window_high = max(h)
+    window_low = min(lo)
+    # Still at / near highs → trending, not stalled.
+    if mark >= window_high * (1.0 - tol):
+        return False
+    # Latest bar still making a new high → keeps going.
+    prior_high = max(h[:-1])
+    if h[-1] > prior_high * (1.0 + tol):
+        return False
+    mid = (window_high + window_low) / 2.0
+    if mid <= 0:
+        return False
+    range_pct = (window_high - window_low) / mid
+    compressed = range_pct <= max(0.0, float(range_compress_pct))
+    non_ascending = c[-1] <= c[0] * (1.0 + tol)
+    return compressed or non_ascending
+
+
+def stall_exit_allowed(
+    lot: Position,
+    mark: float | None,
+    *,
+    stall_exit_pct: float,
+    never_sell_red: bool,
+) -> tuple[bool, str]:
+    """Early bank gate: gross unrealized >= stall_exit_pct and never_sell_red.
+
+    Unlike strategy_exit_allowed, this uses a gross floor (no fee buffer) so a
+    5% stall bank is exactly 5% vs entry. Swing/fade exits keep their higher floors.
+    """
+    pnl_pct = lot_unrealized_pnl_pct(lot, mark)
+    if pnl_pct is None:
+        return False, "stall_no_mark"
+    if never_sell_red and pnl_pct < 0:
+        return False, "never_sell_red"
+    floor = max(0.0, float(stall_exit_pct))
+    if pnl_pct < floor:
+        return False, "below_stall_take_profit"
+    return True, "ok"
+
+
+STALL_EXIT_REASONS: frozenset[str] = frozenset(
+    {"stall_take_profit", "intraday_stall_5pct"}
+)
+
+
+def is_stall_exit_reason(reason: str) -> bool:
+    """True for CFM intraday stall take-profit close reasons."""
+    base = reason.split(":", 1)[0]
+    return reason in STALL_EXIT_REASONS or base in STALL_EXIT_REASONS
+
