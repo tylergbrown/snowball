@@ -1,8 +1,10 @@
-"""STOCK engine — isolated ledger; paper (Yahoo) or dual-gated live INTX equity perps.
+"""STOCK engine — isolated ledger; paper (Yahoo) or dual-gated live CFM indexes.
 
-Live stock trading uses Coinbase `{SYM}-PERP-INTX` only (no US equity spot).
-Requires STOCK_MODE=live AND STOCK_LIVE_ENABLED=true. Long-only. Never sell red.
-Budget = stock_account_budget_pct (default 35%) of Coinbase account value.
+Live stock trading uses Coinbase CFM CDE ``US5-19DEC30-CDE`` + ``TEK-19DEC30-CDE``
+(same integer-contract path as FT/Crash/Fed). Does **not** place single-name
+``*-PERP-INTX`` orders. Requires STOCK_MODE=live AND STOCK_LIVE_ENABLED=true.
+Long-only. Never sell red. Budget = stock_account_budget_pct (default 32%).
+Max 1 CFM lot per index; skip if Crash is short the same product.
 """
 
 from __future__ import annotations
@@ -34,9 +36,13 @@ from snowball.stocks.market import (
     StockMarkRouter,
     YahooPaperMarket,
     resolve_coinbase_equity_ids,
-    resolve_coinbase_equity_perps,
 )
 from snowball.stocks.universe import build_stock_universe, normalize_symbol
+from snowball.futures.market import (
+    is_cfm_product,
+    normalize_futures_product,
+    order_size_for_product,
+)
 from snowball.gates import sma_fast_for_strategy, sma_slow_for_strategy
 from snowball.strategy import (
     DONCHIAN_1D,
@@ -111,7 +117,7 @@ def _signal_for(snap: PairSnapshot, strategy_id: str) -> tuple[Signal, bool]:
 
 
 class StockPaperEngine:
-    """Long-only stock lane. Paper=Yahoo; live=Coinbase INTX equity perps (dual-gated)."""
+    """Long-only stock lane. Paper=Yahoo; live=Coinbase CFM US5/TEK (dual-gated)."""
 
     def __init__(self, state: AppState, market: Any | None = None) -> None:
         self.state = state
@@ -136,15 +142,22 @@ class StockPaperEngine:
             and now_m - self._last_universe_refresh < self._universe_refresh_seconds
         ):
             return
-        meta = build_stock_universe(
-            self.state.yolo,
-            max_dynamic=settings.stock_dynamic_max,
-            max_active=settings.stock_max_active,
-        )
-        self.state.stock_universe_all = list(meta["symbols"])
-        self.state.stock_universe_active = list(meta["active"])
-        self.state.stock_universe_dynamic = list(meta["dynamic"])
-        self.state.stock_universe_sources = dict(meta["sources"])
+        if settings.stock_live_orders_permitted():
+            live_prods = list(settings.stock_product_list)
+            self.state.stock_universe_all = list(live_prods)
+            self.state.stock_universe_active = list(live_prods)
+            self.state.stock_universe_dynamic = []
+            self.state.stock_universe_sources = {p: "cfm_live" for p in live_prods}
+        else:
+            meta = build_stock_universe(
+                self.state.yolo,
+                max_dynamic=settings.stock_dynamic_max,
+                max_active=settings.stock_max_active,
+            )
+            self.state.stock_universe_all = list(meta["symbols"])
+            self.state.stock_universe_active = list(meta["active"])
+            self.state.stock_universe_dynamic = list(meta["dynamic"])
+            self.state.stock_universe_sources = dict(meta["sources"])
         for product in self.state.stock_universe_active:
             if product not in self.state.stock_pairs:
                 self.state.stock_pairs[product] = PairSnapshot(
@@ -163,45 +176,82 @@ class StockPaperEngine:
         )
 
     def refresh_perp_map(self) -> dict[str, str]:
+        """Map live stock products → CFM CDE ids (identity). No INTX single-names."""
         settings = self.state.settings
-        # Do not double-trade Future Trader's SPY/QQQ INTX products in the stock lane.
-        exclude: set[str] = set()
-        for p in settings.futures_product_list:
-            base = p.split("-")[0].upper()
-            if base:
-                exclude.add(base)
-        wanted = list(self.state.stock_universe_active or [])
-        try:
-            mapping = resolve_coinbase_equity_perps(wanted, exclude_bases=exclude)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("stock INTX perp probe failed", extra={"data": {"error": str(exc)}})
-            mapping = {}
+        mapping: dict[str, str] = {}
+        if settings.stock_live_orders_permitted():
+            for raw in settings.stock_product_list:
+                pid = normalize_futures_product(raw)
+                if not is_cfm_product(pid):
+                    log.error(
+                        "stock live product refused: not CFM CDE",
+                        extra={"data": {"product": raw, "normalized": pid}},
+                    )
+                    continue
+                mapping[pid] = pid
+                # Also key common aliases for lookups
+                mapping[normalize_symbol(pid)] = pid
         self._perp_map = mapping
-        self.state.stock_coinbase_ids = dict(mapping)
-        # Keep router in sync when using StockMarkRouter
+        self.state.stock_coinbase_ids = {k: v for k, v in mapping.items() if is_cfm_product(v)}
         if isinstance(self.market, StockMarkRouter):
             self.market.perp_map = dict(mapping)
             self.market.prefer_coinbase = settings.stock_live_orders_permitted()
             self.market.coinbase = self._cb_market
         log.info(
-            "stock INTX perp map",
+            "stock CFM product map",
             extra={
                 "data": {
-                    "mapped": len(mapping),
-                    "sample": dict(list(mapping.items())[:12]),
-                    "excluded_ft": sorted(exclude),
+                    "mapped": len({v for v in mapping.values()}),
+                    "products": sorted({v for v in mapping.values()}),
+                    "venue": "CFM_CDE",
+                    "intx_live": False,
                 }
             },
         )
         return mapping
+
+    def _order_product_id(self, product: str) -> str | None:
+        """Resolve CFM product id for live orders."""
+        if product in self._perp_map:
+            return self._perp_map[product]
+        try:
+            norm = normalize_futures_product(product)
+        except Exception:
+            norm = product.strip().upper()
+        if norm in self._perp_map:
+            return self._perp_map[norm]
+        sym = normalize_symbol(product)
+        return self._perp_map.get(sym)
+
+    def _crash_has_opposing_short(self, product: str) -> bool:
+        """True when Crash Guard holds a short on the same CFM index."""
+        store = getattr(self.state, "crash_ledger", None)
+        if store is None:
+            return False
+        try:
+            pid = normalize_futures_product(product)
+        except Exception:
+            pid = product
+        try:
+            lots = store.open_positions(pid)
+        except Exception:  # noqa: BLE001
+            return False
+        return any(str(getattr(lot, "side", "")).lower() == "short" for lot in lots)
 
     def _tradeable_products(self) -> list[str]:
         settings = self.state.settings
         active = list(self.state.stock_universe_active or [])
         if not settings.stock_live_orders_permitted():
             return active
-        # Live: only symbols with an INTX perp mapping
-        return [p for p in active if normalize_symbol(p) in self._perp_map]
+        # Live: only mapped CFM CDE products
+        out: list[str] = []
+        seen: set[str] = set()
+        for p in active:
+            pid = self._order_product_id(p)
+            if pid and is_cfm_product(pid) and pid not in seen:
+                out.append(pid)
+                seen.add(pid)
+        return out
 
     def _refresh_budget(self, marks: dict[str, float]) -> None:
         settings = self.state.settings
@@ -466,6 +516,8 @@ class StockPaperEngine:
         all_lots = ledger.open_positions(product)
         strategy_lots = [lot for lot in all_lots if lot.strategy == strategy_id]
         max_pos = settings.stock_max_positions
+        if settings.stock_live_orders_permitted() and is_cfm_product(product):
+            max_pos = min(max_pos, settings.cfm_max_contracts_per_index())
 
         want_entry = signal is Signal.ENTER or (
             signal is Signal.HOLD and uptrend and 0 < len(strategy_lots) < max_pos
@@ -716,36 +768,70 @@ class StockPaperEngine:
         if self._cb_market is None:
             log.error("stock live open refused: no coinbase market")
             return
-        perp = self._perp_map.get(normalize_symbol(product))
-        if not perp:
+        pid = self._order_product_id(product) or normalize_futures_product(product)
+        if not pid or not is_cfm_product(pid):
             log.info(
-                "stock live open skipped: no INTX perp",
-                extra={"data": {"product": product}},
+                "stock live open skipped: not a CFM CDE product",
+                extra={"data": {"product": product, "pid": pid}},
+            )
+            return
+        if self._crash_has_opposing_short(pid):
+            log.warning(
+                "stock live open skipped: crash short opposing on same CFM product",
+                extra={"data": {"product": pid}},
             )
             return
         ledger = self.state.stock_ledger
         assert ledger is not None
-        snap = self.state.stock_pairs[product]
+        # Enforce 1 lot per index (CFM_MAX_CONTRACTS)
+        max_c = settings.cfm_max_contracts_per_index()
+        if ledger.open_count(pid) >= max_c or ledger.open_count(product) >= max_c:
+            log.info(
+                "stock live open skipped: max CFM contracts for index",
+                extra={"data": {"product": pid, "max": max_c}},
+            )
+            return
+        snap = self.state.stock_pairs.get(product) or self.state.stock_pairs.get(pid)
+        if snap is None:
+            snap = PairSnapshot(product=pid, max_open=max_c)
+            self.state.stock_pairs[pid] = snap
         ref = snap.last
         if ref is None or ref <= 0:
             log.warning(
                 "stock live buy skipped: no mark",
-                extra={"data": {"product": product, "perp": perp}},
+                extra={"data": {"product": pid}},
             )
             return
-        from snowball.futures.market import parse_futures_order_fill, round_amount_down
+        from snowball.futures.market import parse_futures_order_fill
 
-        amount = round_amount_down(notional_usd / float(ref), 0.01)
-        if amount < 0.01:
+        lev = settings.cfm_order_leverage()
+        margin_rate = float(getattr(settings, "cfm_margin_rate", 0.10))
+        lane_max = float(settings.stock_max_notional_usd)
+        # Prefer lane budget remaining; floor with STOCK_MAX_NOTIONAL inside order_size
+        budget = float(self._last_budget.get("budget_usd") or notional_usd)
+        open_n = float(self._last_budget.get("open_notional_usd") or 0.0)
+        sizing_notional = max(budget - open_n, notional_usd, lane_max)
+        avail = max(float(ledger.cash_usd()), sizing_notional, lane_max)
+        amount = order_size_for_product(
+            pid,
+            notional_usd=sizing_notional,
+            price=float(ref),
+            available_margin_usd=avail,
+            max_contracts=max_c,
+            leverage=lev,
+            margin_rate=margin_rate,
+            lane_max_notional_usd=lane_max,
+        )
+        if amount < 1.0:
             log.info(
-                "stock live buy skipped: amount below min",
+                "stock live buy skipped: cannot fund 1 CFM contract",
                 extra={
                     "data": {
-                        "product": product,
-                        "perp": perp,
-                        "notional": notional_usd,
+                        "product": pid,
+                        "notional": sizing_notional,
                         "ref": ref,
                         "amount": amount,
+                        "lane_max": lane_max,
                     }
                 },
             )
@@ -758,46 +844,55 @@ class StockPaperEngine:
 
             limit_px = maker_buy_price(bid, ask, ref)
             if limit_px is None or limit_px <= 0:
-                bid2, ask2 = self._cb_market.fetch_bba(perp)
+                bid2, ask2 = self._cb_market.fetch_bba(pid)
                 bid = bid if bid is not None else bid2
                 ask = ask if ask is not None else ask2
                 limit_px = maker_buy_price(bid, ask, ref)
             if limit_px is None or limit_px <= 0:
                 log.info(
                     "stock live buy skipped: no book bid for maker",
-                    extra={"data": {"product": product, "perp": perp, "bid": bid, "ask": ask}},
+                    extra={"data": {"product": pid, "bid": bid, "ask": ask}},
                 )
                 return
-            amount = round_amount_down(notional_usd / float(limit_px), 0.01)
-            if amount < 0.01:
+            amount = order_size_for_product(
+                pid,
+                notional_usd=sizing_notional,
+                price=float(limit_px),
+                available_margin_usd=avail,
+                max_contracts=max_c,
+                leverage=lev,
+                margin_rate=margin_rate,
+                lane_max_notional_usd=lane_max,
+            )
+            if amount < 1.0:
                 log.info(
                     "stock live buy skipped: amount below min",
-                    extra={"data": {"product": product, "perp": perp, "limit_px": limit_px}},
+                    extra={"data": {"product": pid, "limit_px": limit_px}},
                 )
                 return
             timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
             order = self._cb_market.create_swap_maker_limit_order(
-                perp,
+                pid,
                 "buy",
                 amount,
                 price=limit_px,
                 bid=bid,
                 ask=ask,
-                leverage=1.0,
+                leverage=lev,
                 reduce_only=False,
                 timeout_sec=timeout,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception(
                 "stock live buy failed",
-                extra={"data": {"product": product, "perp": perp, "error": str(exc)}},
+                extra={"data": {"product": pid, "error": str(exc)}},
             )
             return
         fill_px, fill_qty, fee_usd = parse_futures_order_fill(order)
         if fill_px <= 0 or fill_qty <= 0:
             log.error(
                 "stock live buy unfilled/canceled maker limit",
-                extra={"data": {"product": product, "perp": perp, "order_id": order.get("id")}},
+                extra={"data": {"product": pid, "order_id": order.get("id")}},
             )
             return
         cost = fill_qty * fill_px + fee_usd
@@ -806,8 +901,14 @@ class StockPaperEngine:
                 ledger.set_cash_usd(cost * 2, ts=now)
             except Exception:  # noqa: BLE001
                 log.exception("stock live ledger cash sync failed")
+        # Book under canonical CFM product id
+        book_product = pid
+        if book_product not in self.state.stock_pairs:
+            self.state.stock_pairs[book_product] = PairSnapshot(
+                product=book_product, max_open=max_c
+            )
         pos, fill = ledger.open_buy(
-            product=product,
+            product=book_product,
             fill_px=fill_px,
             notional_usd=fill_qty * fill_px,
             slippage_bps=0.0,
@@ -817,14 +918,15 @@ class StockPaperEngine:
             strategy=strategy,
         )
         self._live_position_ids.add(int(pos.id))
-        self.state.stock_pairs[product].open_count = ledger.open_count(product)
-        self._last_budget["open_notional_usd"] = open_notional_usd(ledger.open_positions())
+        self.state.stock_pairs[book_product].open_count = ledger.open_count(book_product)
+        self._last_budget["open_notional_usd"] = open_notional_usd(
+            [lot for lot in ledger.open_positions() if self._lot_is_live_backed(lot)]
+        )
         log.warning(
-            "stock LIVE buy (INTX perp)",
+            "stock LIVE buy (CFM CDE)",
             extra={
                 "data": {
-                    "product": product,
-                    "perp": perp,
+                    "product": book_product,
                     "strategy": strategy,
                     "qty": fill_qty,
                     "price": fill_px,
@@ -833,7 +935,9 @@ class StockPaperEngine:
                     "reason": live_reason,
                     "position_id": pos.id,
                     "order_id": order.get("id"),
-                    "mark_source": "coinbase_intx_perp",
+                    "mark_source": "coinbase_cfm_cde",
+                    "venue": "CFM_CDE",
+                    "leverage": lev,
                 }
             },
         )
@@ -959,21 +1063,22 @@ class StockPaperEngine:
         if self._cb_market is None:
             log.error("stock live close refused: no coinbase market")
             return
-        perp = self._perp_map.get(normalize_symbol(product))
-        if not perp:
+        pid = self._order_product_id(product) or normalize_futures_product(product)
+        if not pid or not is_cfm_product(pid):
             log.error(
-                "stock live close refused: no INTX perp map",
-                extra={"data": {"product": product}},
+                "stock live close refused: not a CFM CDE product",
+                extra={"data": {"product": product, "pid": pid}},
             )
             return
         ledger = self.state.stock_ledger
         assert ledger is not None
-        snap = self.state.stock_pairs[product]
-        from snowball.futures.market import parse_futures_order_fill, round_amount_down
+        snap = self.state.stock_pairs.get(product) or self.state.stock_pairs.get(pid)
+        from snowball.futures.market import parse_futures_order_fill
 
         fee_buf = float(getattr(settings, "fee_buffer_pct", 0.0) or 0.0)
+        lev = settings.cfm_order_leverage()
         for lot in lots:
-            ref = snap.last
+            ref = snap.last if snap is not None else None
             if not is_emergency_flatten_reason(reason):
                 ok_sw, reason_sw = strategy_exit_allowed(
                     lot,
@@ -987,7 +1092,7 @@ class StockPaperEngine:
                         "stock live close skipped",
                         extra={
                             "data": {
-                                "product": product,
+                                "product": pid,
                                 "position_id": lot.id,
                                 "reason": reason_sw,
                             }
@@ -998,28 +1103,26 @@ class StockPaperEngine:
                 if ref is not None and ref < lot.entry_price:
                     log.warning(
                         "stock live emergency close skipped never_sell_red",
-                        extra={"data": {"product": product, "position_id": lot.id}},
+                        extra={"data": {"product": pid, "position_id": lot.id}},
                     )
                     continue
-            amount = round_amount_down(float(lot.qty), 0.01)
-            if amount < 0.01:
+            amount = float(max(1, int(round(float(lot.qty)))))
+            if amount < 1.0:
                 continue
             try:
-                from snowball.gates import is_emergency_flatten_reason
                 from snowball.maker import maker_sell_price
 
                 if is_emergency_flatten_reason(reason):
                     order = self._cb_market.create_swap_market_order(
-                        perp, "sell", amount, leverage=1.0, reduce_only=True
+                        pid, "sell", amount, leverage=lev, reduce_only=True
                     )
                 else:
-                    snap_s = self.state.stock_pairs.get(product)
-                    bid = getattr(snap_s, "bid", None) if snap_s else None
-                    ask = getattr(snap_s, "ask", None) if snap_s else None
-                    last = getattr(snap_s, "last", None) if snap_s else None
+                    bid = getattr(snap, "bid", None) if snap else None
+                    ask = getattr(snap, "ask", None) if snap else None
+                    last = getattr(snap, "last", None) if snap else None
                     sell_px = maker_sell_price(bid, ask, last)
                     if sell_px is None:
-                        bid2, ask2 = self._cb_market.fetch_bba(perp)
+                        bid2, ask2 = self._cb_market.fetch_bba(pid)
                         bid = bid if bid is not None else bid2
                         ask = ask if ask is not None else ask2
                         sell_px = maker_sell_price(bid, ask, last)
@@ -1028,8 +1131,7 @@ class StockPaperEngine:
                             "stock live sell skipped: no ask for maker",
                             extra={
                                 "data": {
-                                    "product": product,
-                                    "perp": perp,
+                                    "product": pid,
                                     "position_id": lot.id,
                                 }
                             },
@@ -1037,27 +1139,27 @@ class StockPaperEngine:
                         continue
                     timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
                     order = self._cb_market.create_swap_maker_limit_order(
-                        perp,
+                        pid,
                         "sell",
                         amount,
                         price=sell_px,
                         bid=bid,
                         ask=ask,
-                        leverage=1.0,
+                        leverage=lev,
                         reduce_only=True,
                         timeout_sec=timeout,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.exception(
                     "stock live sell failed",
-                    extra={"data": {"product": product, "perp": perp, "error": str(exc)}},
+                    extra={"data": {"product": pid, "error": str(exc)}},
                 )
                 continue
             fill_px, fill_qty, fee_usd = parse_futures_order_fill(order)
             if fill_px <= 0 or fill_qty <= 0:
                 log.error(
                     "stock live sell unfilled/canceled maker limit",
-                    extra={"data": {"product": product, "order_id": order.get("id")}},
+                    extra={"data": {"product": pid, "order_id": order.get("id")}},
                 )
                 continue
             fill = ledger.close_position(
@@ -1071,11 +1173,10 @@ class StockPaperEngine:
             self._live_position_ids.discard(int(lot.id))
             realized = (fill.price - lot.entry_price) * fill.qty - fill.fee_usd
             log.warning(
-                "stock LIVE sell (INTX perp)",
+                "stock LIVE sell (CFM CDE)",
                 extra={
                     "data": {
-                        "product": product,
-                        "perp": perp,
+                        "product": pid,
                         "strategy": lot.strategy,
                         "qty": fill_qty,
                         "price": fill_px,
@@ -1084,11 +1185,16 @@ class StockPaperEngine:
                         "position_id": lot.id,
                         "realized": realized,
                         "order_id": order.get("id"),
+                        "venue": "CFM_CDE",
                     }
                 },
             )
-        self.state.stock_pairs[product].open_count = ledger.open_count(product)
-        self._last_budget["open_notional_usd"] = open_notional_usd(ledger.open_positions())
+        book = pid if pid in self.state.stock_pairs else product
+        if book in self.state.stock_pairs:
+            self.state.stock_pairs[book].open_count = ledger.open_count(book)
+        self._last_budget["open_notional_usd"] = open_notional_usd(
+            [lot for lot in ledger.open_positions() if self._lot_is_live_backed(lot)]
+        )
 
     def _flatten_all(self, marks: dict[str, float], reason: str, now: datetime) -> None:
         ledger = self.state.stock_ledger
@@ -1112,13 +1218,15 @@ class StockPaperEngine:
             },
         )
         self.refresh_perp_map()
-        # Informational spot probe (expected empty)
-        try:
-            ids = resolve_coinbase_equity_ids(list(self.state.stock_universe_active or [])[:40])
-            if ids:
-                log.info("coinbase spot equity ids (unexpected)", extra={"data": ids})
-        except Exception:  # noqa: BLE001
-            log.exception("coinbase spot equity probe failed")
+        log.info(
+            "stock live venue CFM CDE (no INTX single-name map)",
+            extra={
+                "data": {
+                    "products": sorted({v for v in self._perp_map.values()}),
+                    "live_orders": live,
+                }
+            },
+        )
 
         while self.state.running:
             started = time.monotonic()
@@ -1154,13 +1262,14 @@ def attach_stock_lane(state: AppState) -> StockPaperEngine | None:
             api_passphrase=settings.coinbase_api_passphrase,
             allow_orders=True,
         )
+        seed_map = {p: p for p in settings.stock_product_list}
         market: Any = StockMarkRouter(
             yahoo=YahooPaperMarket(),
             coinbase=cb_market,
-            perp_map={},
+            perp_map=seed_map,
             prefer_coinbase=True,
         )
-        state.stock_mark_source = "coinbase_intx_perp"
+        state.stock_mark_source = "coinbase_cfm_cde"
     else:
         market = YahooPaperMarket()
         state.stock_mark_source = "yahoo_paper"
@@ -1184,7 +1293,9 @@ def attach_stock_lane(state: AppState) -> StockPaperEngine | None:
                 "stock_live_enabled": settings.stock_live_enabled,
                 "live_orders": live,
                 "budget_pct": settings.stock_account_budget_pct,
-                "perp_mapped": len(engine._perp_map),
+                "cfm_products": list(settings.stock_product_list) if live else [],
+                "perp_mapped": len({v for v in engine._perp_map.values()}),
+                "venue": "CFM_CDE" if live else "yahoo_paper",
             }
         },
     )

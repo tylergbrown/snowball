@@ -78,6 +78,40 @@ def cfm_required_margin_usd(
     return max(by_rate, by_lev if lev > 1.0 else by_rate)
 
 
+def cfm_sizing_budget_usd(
+    requested_notional_usd: float,
+    *,
+    price: float,
+    lane_max_notional_usd: float = 0.0,
+    leverage: float = 1.0,
+    margin_rate: float = 0.10,
+    max_contracts: int = 1,
+) -> float:
+    """Floor CFM budget so INTX-era per-leg soft caps cannot zero CFM_MAX_CONTRACTS.
+
+    Engines historically passed effective_per_leg (~$118) as budget_usd while one
+    US5/TEK contract needs ~$306 margin at 10%. Return::
+
+        max(requested, lane_MAX_NOTIONAL, margin_for_max_contracts)
+
+    so FUTURES/CRASH/FED/STOCK_MAX_NOTIONAL_USD (e.g. 4000) and the true 1-lot
+    margin both clear the budget gate. ``available_margin_usd`` remains the
+    cash/margin affordability check at the call site.
+    """
+    req = cfm_required_margin_usd(
+        price,
+        contracts=max(1, int(max_contracts)),
+        leverage=leverage,
+        margin_rate=margin_rate,
+    )
+    return max(
+        0.0,
+        float(requested_notional_usd or 0.0),
+        float(lane_max_notional_usd or 0.0),
+        float(req),
+    )
+
+
 def cfm_contract_count(
     *,
     price: float,

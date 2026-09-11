@@ -55,10 +55,15 @@ def _cfm_paper_notional(
         product,
         notional_usd=notional_usd,
         price=float(price),
-        available_margin_usd=max(float(store.cash_usd()), float(notional_usd)),
+        available_margin_usd=max(
+            float(store.cash_usd()),
+            float(notional_usd),
+            float(settings.fed_max_notional_usd),
+        ),
         max_contracts=settings.cfm_max_contracts_per_index(),
         leverage=settings.cfm_order_leverage(),
         margin_rate=float(settings.cfm_margin_rate),
+        lane_max_notional_usd=settings.fed_max_notional_usd,
     )
     if contracts < 1:
         return None
@@ -468,6 +473,9 @@ class FedEngine:
             return
 
         allot = float(self._last_budget.get("per_index_usd") or 0.0)
+        budget_left = float(self._last_budget.get("budget_usd") or allot)
+        if is_cfm_product(product):
+            allot = max(budget_left, float(settings.fed_max_notional_usd))
         if allot <= 1.0:
             log.info(
                 "fed entry skipped: allotment too small",
@@ -738,10 +746,15 @@ class FedEngine:
                 product,
                 notional_usd=notional_usd,
                 price=float(limit_px),
-                available_margin_usd=max(float(store.cash_usd()), float(notional_usd)),
+                available_margin_usd=max(
+                    float(store.cash_usd()),
+                    float(notional_usd),
+                    float(settings.fed_max_notional_usd),
+                ),
                 max_contracts=settings.cfm_max_contracts_per_index(),
                 leverage=lev,
                 margin_rate=float(settings.cfm_margin_rate),
+                lane_max_notional_usd=settings.fed_max_notional_usd,
             )
             min_amt = 1.0 if is_cfm_product(product) else 0.01
             if amount < min_amt:

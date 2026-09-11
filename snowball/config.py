@@ -130,21 +130,25 @@ class Settings(BaseSettings):
     # Empty = current calendar year and the prior year (conditional GET, cached).
     clerk_years: str = ""
 
-    # --- STOCK lane (isolated book; live INTX equity perps gated off by default) ---
+    # --- STOCK lane (isolated book; live = CFM US5/TEK index products) ---
     stock_enabled: bool = True
     # Dual gate for live stock: STOCK_MODE=live AND STOCK_LIVE_ENABLED=true
     stock_mode: Literal["paper", "live"] = "paper"
     stock_live_enabled: bool = False
     stock_sqlite_path: Path = Path("./data/snowball_stocks.db")
     stock_bankroll_usd: float = 1000.0
-    stock_max_positions: int = 5
-    stock_max_notional_usd: float = 100.0
+    # Live CFM: prefer 1 lot per index (same spirit as CFM_MAX_CONTRACTS)
+    stock_max_positions: int = 1
+    # Soft INTX-era cap; CFM live floors sizing with this + 1-contract margin
+    stock_max_notional_usd: float = 4000.0
     stock_daily_loss_kill_usd: float = 25.0
-    # Fraction of total Coinbase account value stock lane may use (INTX perps, lev=1)
+    # Fraction of total Coinbase account value stock lane may use (CFM CDE, lev=1)
     stock_account_budget_pct: float = 0.32
+    # Live watchlist / mapped products (CFM CDE only — not single-name INTX)
+    stock_products: str = "US5-19DEC30-CDE,TEK-19DEC30-CDE"
     stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d,rsi_15m,bb_15m,rsi_1d,bb_1d"
     stock_poll_seconds: float = 60.0
-    # Cap symbols that the engine may trade (marks universe may be larger)
+    # Cap symbols for paper/research universe (live orders only on stock_products)
     stock_max_active: int = 60
     stock_dynamic_max: int = 30
     entry_cooldown_1d_seconds: int = 86400
@@ -164,7 +168,7 @@ class Settings(BaseSettings):
     # Max 1 open lot per index (session engine)
     futures_max_positions: int = 1
     # Soft ceiling per leg (INTX-era); CFM uses integer contracts + margin gates instead
-    futures_max_notional_usd: float = 500.0
+    futures_max_notional_usd: float = 4000.0
     futures_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value FT may use (split 50/50 across products)
     futures_account_budget_pct: float = 0.20
@@ -189,7 +193,7 @@ class Settings(BaseSettings):
     crash_bankroll_usd: float = 1000.0
     # Max 1 open short lot per index
     crash_max_positions: int = 1
-    crash_max_notional_usd: float = 500.0
+    crash_max_notional_usd: float = 4000.0
     crash_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value Crash Guard may use (50/50 across products)
     crash_account_budget_pct: float = 0.10
@@ -205,7 +209,7 @@ class Settings(BaseSettings):
     fed_bankroll_usd: float = 1000.0
     # Max 1 open lot per index
     fed_max_positions: int = 1
-    fed_max_notional_usd: float = 250.0
+    fed_max_notional_usd: float = 4000.0
     fed_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value Fed Desk may use (50/50 across products)
     fed_account_budget_pct: float = 0.05
@@ -214,7 +218,7 @@ class Settings(BaseSettings):
     # Research poll cadence (FedWatch); trading loop uses fed_poll_seconds
     fed_research_poll_seconds: float = 10800.0
 
-    # --- CFM CDE contract sizing (FT / Crash / Fed) ---
+    # --- CFM CDE contract sizing (FT / Crash / Fed / Stock live) ---
     # Max integer contracts per index until Tb raises it. Large notionals (~$3k US500).
     cfm_max_contracts: int = 1
     # API leverage string for Advanced Trade FUTURE orders (keep low; do not force 20x).
@@ -303,6 +307,15 @@ class Settings(BaseSettings):
     def stock_strategy_list(self) -> list[str]:
         return parse_strategies(self.stock_strategies)
 
+    @property
+    def stock_product_list(self) -> list[str]:
+        """Live CFM index products (normalized). Defaults to US5 + TEK."""
+        from snowball.futures.market import normalize_futures_product
+
+        items = [p.strip() for p in self.stock_products.split(",") if p.strip()]
+        raw = items or ["US5-19DEC30-CDE", "TEK-19DEC30-CDE"]
+        return [normalize_futures_product(p) for p in raw]
+
     def assert_stock_config(self) -> None:
         """Refuse inconsistent dual-gate; allow paper or fully dual-gated live."""
         if not self.stock_enabled:
@@ -310,7 +323,7 @@ class Settings(BaseSettings):
         if self.stock_mode == "live" and not self.stock_live_enabled:
             raise LiveTradingRefused(
                 "Stock trading refused: STOCK_MODE=live but STOCK_LIVE_ENABLED "
-                "is false (both required for live INTX equity-perp orders)."
+                "is false (both required for live CFM index orders)."
             )
         if self.stock_mode != "live" and self.stock_live_enabled:
             raise LiveTradingRefused(
@@ -327,7 +340,7 @@ class Settings(BaseSettings):
         self.assert_stock_config()
 
     def stock_live_orders_permitted(self) -> bool:
-        """Stock live INTX path requires BOTH stock flags. Default False."""
+        """Stock live CFM path requires BOTH stock flags. Default False."""
         return self.stock_mode == "live" and self.stock_live_enabled is True
 
     def min_take_profit_pct_for(self, strategy_id: str) -> float:

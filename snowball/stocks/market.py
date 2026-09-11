@@ -1,9 +1,9 @@
-"""Stock marks + live Coinbase INTX equity-perp orders.
+"""Stock marks + live Coinbase CFM index products.
 
-Paper marks come from Yahoo Finance (``yahoo_paper``). Live stock trading uses
-Coinbase Advanced Trade INTX equity perps (``{SYM}-PERP-INTX`` / ccxt
-``{SYM}/USDC:USDC``) — there is no US equity spot on Advanced Trade. Symbols
-without a listed INTX perp stay research/watch only (Yahoo marks, no orders).
+Paper marks come from Yahoo Finance (``yahoo_paper``) for the broad equity
+universe. Live stock trading uses Coinbase CFM CDE index perps
+(``US5-19DEC30-CDE``, ``TEK-19DEC30-CDE``) via the shared futures market path —
+not single-name ``*-PERP-INTX``. Broader names stay research/watch only.
 """
 
 from __future__ import annotations
@@ -220,10 +220,10 @@ def ticker_to_perp_product(ticker: str) -> str:
 
 
 class StockMarkRouter:
-    """Route marks: Coinbase INTX for mapped live symbols, Yahoo otherwise.
+    """Route marks: Coinbase CFM for mapped live products, Yahoo otherwise.
 
     Never places orders. Live orders go through ``CoinbaseFuturesMarket`` in the
-    stock engine (same INTX swap path as Future Trader).
+    stock engine (same CFM CDE path as Future Trader / Crash / Fed).
     """
 
     def __init__(
@@ -242,12 +242,38 @@ class StockMarkRouter:
     @property
     def mark_source(self) -> str:
         if self.prefer_coinbase and self.perp_map and self.coinbase is not None:
+            # Live stock is CFM CDE; keep legacy label only if map is INTX-shaped
+            sample = next(iter(self.perp_map.values()), "")
+            if str(sample).upper().endswith("-CDE"):
+                return "coinbase_cfm_cde"
             return "coinbase_intx_perp"
         return getattr(self.yahoo, "mark_source", "yahoo_paper")
 
     def _perp_id(self, product: str) -> str | None:
+        """Resolve order/mark product id (CFM ``*-CDE`` or legacy INTX)."""
+        from snowball.futures.market import is_cfm_product, normalize_futures_product
+
+        raw = (product or "").strip()
+        if not raw:
+            return None
+        # Direct CFM / alias (SPY → US5-…)
+        try:
+            norm = normalize_futures_product(raw)
+        except Exception:
+            norm = raw.upper()
+        if is_cfm_product(norm) and norm in self.perp_map.values():
+            return norm
+        if norm in self.perp_map:
+            return self.perp_map[norm]
         sym = normalize_symbol(product)
-        return self.perp_map.get(sym)
+        if sym in self.perp_map:
+            return self.perp_map[sym]
+        # Identity: live map keys are already CFM product ids
+        if raw in self.perp_map:
+            return self.perp_map[raw]
+        if norm in self.perp_map:
+            return self.perp_map[norm]
+        return None
 
     def fetch_ohlcv(self, product: str, timeframe: str, limit: int) -> list[list[float]]:
         pid = self._perp_id(product)
@@ -268,7 +294,7 @@ class StockMarkRouter:
             try:
                 t = self.coinbase.fetch_ticker(pid)
                 return Ticker(
-                    product=sym,
+                    product=pid,
                     last=t.last,
                     bid=t.bid,
                     ask=t.ask,

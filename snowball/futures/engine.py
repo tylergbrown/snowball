@@ -499,8 +499,11 @@ class FuturesEngine:
             )
         )
         if is_cfm_product(product):
-            # Lane budget remaining is the affordability budget for 1 CFM contract.
-            notional = min(per_index, budget_left)
+            # Use remaining lane budget (not INTX per-leg). order_size_for_product
+            # floors with FUTURES_MAX_NOTIONAL so 1 CFM contract can clear.
+            notional = max(budget_left, float(settings.futures_max_notional_usd))
+            if budget_left <= 1.0:
+                notional = 0.0
         else:
             notional = min(per_index, budget_left, per_leg)
         if notional <= 1.0:
@@ -521,7 +524,11 @@ class FuturesEngine:
             cash_usd=max(ledger.cash_usd(), notional),
             requested_notional=notional,
             cooldown_seconds=0,
-            max_notional=max(notional, per_leg),
+            max_notional=max(
+                notional,
+                per_leg,
+                float(settings.futures_max_notional_usd),
+            ),
         )
         ok, reason = allow_entry(ctx)
         if not ok:
@@ -746,14 +753,19 @@ class FuturesEngine:
         ticker = Ticker(
             product=product, last=snap.last, bid=snap.bid, ask=snap.ask, ts=now
         )
-        target = float(
-            notional_usd
-            if notional_usd is not None
-            else (
+        if notional_usd is not None:
+            target = float(notional_usd)
+        elif is_cfm_product(product):
+            target = float(
+                self._last_budget.get("budget_usd")
+                or self._last_budget.get("per_index_usd")
+                or settings.futures_max_notional_usd
+            )
+        else:
+            target = float(
                 self._last_budget.get("per_leg_notional_usd")
                 or settings.per_leg_base_usd
             )
-        )
         if settings.futures_live_orders_permitted():
             self._open_lot_live(
                 product=product,
@@ -770,10 +782,15 @@ class FuturesEngine:
                 product,
                 notional_usd=target,
                 price=float(px),
-                available_margin_usd=max(float(ledger.cash_usd()), float(target)),
+                available_margin_usd=max(
+                    float(ledger.cash_usd()),
+                    float(target),
+                    float(settings.futures_max_notional_usd),
+                ),
                 max_contracts=settings.cfm_max_contracts_per_index(),
                 leverage=settings.cfm_order_leverage(),
                 margin_rate=float(settings.cfm_margin_rate),
+                lane_max_notional_usd=settings.futures_max_notional_usd,
             )
             if contracts < 1:
                 log.info(
@@ -851,10 +868,11 @@ class FuturesEngine:
             product,
             notional_usd=notional_usd,
             price=float(ref),
-            available_margin_usd=avail,
+            available_margin_usd=max(avail, float(settings.futures_max_notional_usd)),
             max_contracts=max_c,
             leverage=lev,
             margin_rate=margin_rate,
+            lane_max_notional_usd=settings.futures_max_notional_usd,
         )
         min_amt = 1.0 if is_cfm_product(product) else 0.01
         if amount < min_amt:
@@ -892,10 +910,11 @@ class FuturesEngine:
                 product,
                 notional_usd=notional_usd,
                 price=float(limit_px),
-                available_margin_usd=avail,
+                available_margin_usd=max(avail, float(settings.futures_max_notional_usd)),
                 max_contracts=max_c,
                 leverage=lev,
                 margin_rate=margin_rate,
+                lane_max_notional_usd=settings.futures_max_notional_usd,
             )
             if amount < min_amt:
                 log.info(

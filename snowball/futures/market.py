@@ -1,8 +1,7 @@
 """Coinbase CFM CDE futures marks + dual-gated Advanced Trade FUTURE orders.
 
 Future Trader / Crash Guard / Fed Desk trade CFM index perps on Coinbase
-Derivatives Exchange (product ids ``*-CDE``). Stock lane may still share the
-INTX ``*-PERP-INTX`` helpers below for single-name equity perps.
+Derivatives Exchange (product ids ``*-CDE``). Stock live lane also uses CFM US5/TEK ``*-CDE`` (not single-name INTX).
 """
 
 from __future__ import annotations
@@ -143,21 +142,36 @@ def order_size_for_product(
     max_contracts: int = 1,
     leverage: float = 1.0,
     margin_rate: float = 0.10,
+    lane_max_notional_usd: float | None = None,
 ) -> float:
-    """Return order amount: integer CFM contracts, else INTX base-coin size."""
-    from snowball.sizing import cfm_contract_count
+    """Return order amount: integer CFM contracts, else INTX base-coin size.
+
+    For CFM, floor ``budget_usd`` with :func:`cfm_sizing_budget_usd` so INTX-era
+    per-leg soft caps (~$118) cannot yield contracts=0 when lane MAX_NOTIONAL
+    (or 1-contract margin) can fund a full lot. ``lane_max_notional_usd`` should
+    be the lane's ``*_MAX_NOTIONAL_USD`` (e.g. 4000).
+    """
+    from snowball.sizing import cfm_contract_count, cfm_sizing_budget_usd
 
     if price <= 0:
         return 0.0
     if is_cfm_product(product):
-        # Budget gate uses the larger of notional allotment and available margin
-        # so a tiny per-leg soft cap cannot fractionalize CDE size.
-        budget = max(0.0, float(notional_usd))
+        lane_max = float(lane_max_notional_usd or 0.0)
+        budget = cfm_sizing_budget_usd(
+            float(notional_usd),
+            price=float(price),
+            lane_max_notional_usd=lane_max,
+            leverage=float(leverage),
+            margin_rate=float(margin_rate),
+            max_contracts=int(max_contracts),
+        )
+        # Lift avail the same way when lane_max is set so both gates agree.
+        avail = max(float(available_margin_usd), float(notional_usd), lane_max)
         return float(
             cfm_contract_count(
                 price=float(price),
                 budget_usd=budget,
-                available_margin_usd=float(available_margin_usd),
+                available_margin_usd=avail,
                 max_contracts=int(max_contracts),
                 leverage=float(leverage),
                 margin_rate=float(margin_rate),

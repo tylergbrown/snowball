@@ -317,6 +317,9 @@ class CrashEngine:
 
         # Flat + trigger → open short
         allot = float(self._last_budget.get("per_index_usd") or 0.0)
+        budget_left = float(self._last_budget.get("budget_usd") or allot)
+        if is_cfm_product(product):
+            allot = max(budget_left, float(settings.crash_max_notional_usd))
         if allot <= 1.0:
             log.info(
                 "crash entry skipped: allotment too small",
@@ -400,10 +403,15 @@ class CrashEngine:
                 product,
                 notional_usd=notional_usd,
                 price=float(paper_px),
-                available_margin_usd=max(float(store.cash_usd()), float(notional_usd)),
+                available_margin_usd=max(
+                    float(store.cash_usd()),
+                    float(notional_usd),
+                    float(settings.crash_max_notional_usd),
+                ),
                 max_contracts=settings.cfm_max_contracts_per_index(),
                 leverage=settings.cfm_order_leverage(),
                 margin_rate=float(settings.cfm_margin_rate),
+                lane_max_notional_usd=settings.crash_max_notional_usd,
             )
             if contracts < 1:
                 log.info(
@@ -478,10 +486,11 @@ class CrashEngine:
             product,
             notional_usd=notional_usd,
             price=float(ref),
-            available_margin_usd=avail,
+            available_margin_usd=max(avail, float(settings.crash_max_notional_usd)),
             max_contracts=max_c,
             leverage=lev,
             margin_rate=margin_rate,
+            lane_max_notional_usd=settings.crash_max_notional_usd,
         )
         min_amt = 1.0 if is_cfm_product(product) else 0.01
         if amount < min_amt:
@@ -511,10 +520,11 @@ class CrashEngine:
                 product,
                 notional_usd=notional_usd,
                 price=float(limit_px),
-                available_margin_usd=avail,
+                available_margin_usd=max(avail, float(settings.crash_max_notional_usd)),
                 max_contracts=max_c,
                 leverage=lev,
                 margin_rate=margin_rate,
+                lane_max_notional_usd=settings.crash_max_notional_usd,
             )
             if amount < min_amt:
                 return

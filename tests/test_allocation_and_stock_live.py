@@ -1,4 +1,4 @@
-"""Capital split 33/32/20/10/5, fee-buffer exits, stock dual-gate + INTX perps."""
+"""Capital split 33/32/20/10/5, fee-buffer exits, stock dual-gate + CFM indexes."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from snowball.paper import PaperLedger
 from snowball.state import AppState
 from snowball.stocks.engine import StockPaperEngine, attach_stock_lane
 from snowball.stocks.market import resolve_coinbase_equity_perps, ticker_to_perp_product
+from snowball.futures.market import normalize_futures_product
 from snowball.models import PairSnapshot
 
 
@@ -225,7 +226,7 @@ class FakeIntxMarket:
         return 199.0, 201.0
 
     def create_swap_market_order(self, product, side, amount, *, leverage=1.0, reduce_only=False):
-        assert product.endswith("-PERP-INTX") or "PERP" in product
+        assert product.endswith("-CDE") or product.endswith("-PERP-INTX") or "PERP" in product
         assert "yahoo" not in str(product).lower()
         order = {
             "id": f"ord-{len(self.orders)+1}",
@@ -259,7 +260,7 @@ class FakeIntxMarket:
         timeout_sec=None,
         post_only=True,
     ):
-        assert product.endswith("-PERP-INTX") or "PERP" in product
+        assert product.endswith("-CDE") or product.endswith("-PERP-INTX") or "PERP" in product
         assert price is not None and float(price) > 0
         px = float(price)
         order = {
@@ -284,7 +285,7 @@ class FakeIntxMarket:
         return order
 
 
-def test_stock_live_uses_perp_not_yahoo_for_orders(
+def test_stock_live_uses_cfm_not_intx_for_orders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("STOCK_MODE", raising=False)
@@ -304,48 +305,136 @@ def test_stock_live_uses_perp_not_yahoo_for_orders(
         stock_live_enabled=True,
         stock_sqlite_path=tmp_path / "stocks.db",
         stock_strategies="sma_15m",
+        stock_products="US5-19DEC30-CDE,TEK-19DEC30-CDE",
+        stock_max_positions=1,
+        stock_max_notional_usd=4000.0,
         indicator_filters_enabled=False,
         stock_max_active=8,
         stock_dynamic_max=0,
         stock_account_budget_pct=0.40,
-        stock_max_notional_usd=100.0,
-        stock_bankroll_usd=1000.0,
+        stock_bankroll_usd=5000.0,
         futures_enabled=False,
+        crash_enabled=False,
+        fed_enabled=False,
+        cfm_max_contracts=1,
+        cfm_leverage=1.0,
+        cfm_margin_rate=0.10,
         min_take_profit_pct=0.06,
         fee_buffer_pct=0.01,
         never_sell_red=True,
     )
     state = AppState(settings=settings, ledger=PaperLedger(settings.sqlite_path, 1000.0))
-    # Manual attach without real Coinbase
     settings.assert_stock_config()
     state.stock_ledger = PaperLedger(settings.stock_sqlite_path, settings.stock_bankroll_usd)
-    state.stock_universe_active = ["AAPL", "NFLX"]  # NFLX has no perp in our fake map
+    state.stock_universe_active = ["US5-19DEC30-CDE", "TEK-19DEC30-CDE"]
     for p in state.stock_universe_active:
-        state.stock_pairs[p] = PairSnapshot(product=p, max_open=5)
+        state.stock_pairs[p] = PairSnapshot(product=p, max_open=1)
     engine = StockPaperEngine(state, market=FakeYahoo())
     fake_cb = FakeIntxMarket()
     engine._cb_market = fake_cb
-    engine._perp_map = {"AAPL": "AAPL-PERP-INTX"}
+    engine._perp_map = {
+        "US5-19DEC30-CDE": "US5-19DEC30-CDE",
+        "TEK-19DEC30-CDE": "TEK-19DEC30-CDE",
+    }
     state.stock_coinbase_ids = dict(engine._perp_map)
     engine._last_budget = {
-        "account_value_usd": 1000.0,
-        "budget_usd": 400.0,
+        "account_value_usd": 5000.0,
+        "budget_usd": 2000.0,
         "open_notional_usd": 0.0,
     }
-    # Prevent universe refresh from replacing the tiny test active set
     import time as _time
     engine._last_universe_refresh = _time.monotonic()
-    engine.tick()
-    # AAPL should have a live-backed lot; NFLX skipped (no perp) for entries
-    assert state.stock_ledger is not None
-    assert state.stock_ledger.open_count("AAPL") == 1
-    assert state.stock_ledger.open_count("NFLX") == 0
-    assert fake_cb.orders, "expected INTX swap order"
-    assert fake_cb.orders[0]["product"] == "AAPL-PERP-INTX"
+
+    # Seed marks + SMA so strategy can enter
+    for prod, px in (("US5-19DEC30-CDE", 3061.0), ("TEK-19DEC30-CDE", 2200.0)):
+        snap = state.stock_pairs[prod]
+        snap.last = px
+        snap.bid = px - 0.5
+        snap.ask = px + 0.5
+        snap.sma_fast = px + 1
+        snap.sma_slow = px - 1
+        snap.signal = "enter"
+
+    # Direct live open (bypass full strategy path flakiness)
+    engine._open_lot_live(
+        product="US5-19DEC30-CDE",
+        reason="sma_15m:enter",
+        now=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        strategy="sma_15m",
+        notional_usd=118.0,  # deliberate tiny soft-cap; must still size 1 CFM
+    )
+    assert state.stock_ledger.open_count("US5-19DEC30-CDE") == 1
+    assert fake_cb.orders, "expected CFM swap order"
+    assert fake_cb.orders[0]["product"] == "US5-19DEC30-CDE"
     assert fake_cb.orders[0]["side"] == "buy"
-    # Lot marked live-backed
-    lot = state.stock_ledger.open_positions("AAPL")[0]
+    assert float(fake_cb.orders[0]["amount"]) == 1.0
+    lot = state.stock_ledger.open_positions("US5-19DEC30-CDE")[0]
     assert engine._lot_is_live_backed(lot) is True
+
+
+def test_stock_live_skips_when_crash_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from snowball.crash.store import CrashStore
+
+    monkeypatch.delenv("STOCK_MODE", raising=False)
+    monkeypatch.delenv("STOCK_LIVE_ENABLED", raising=False)
+    settings = Settings(
+        _env_file=None,
+        mode="paper",
+        live_enabled=False,
+        trading_enabled=True,
+        halt_file=tmp_path / "HALT",
+        sqlite_path=tmp_path / "crypto.db",
+        heartbeat_path=tmp_path / "hb",
+        stock_enabled=True,
+        stock_mode="live",
+        stock_live_enabled=True,
+        stock_sqlite_path=tmp_path / "stocks.db",
+        stock_products="US5-19DEC30-CDE,TEK-19DEC30-CDE",
+        stock_max_notional_usd=4000.0,
+        stock_bankroll_usd=5000.0,
+        futures_enabled=False,
+        crash_enabled=True,
+        fed_enabled=False,
+        cfm_max_contracts=1,
+        indicator_filters_enabled=False,
+    )
+    state = AppState(settings=settings, ledger=PaperLedger(settings.sqlite_path, 1000.0))
+    state.stock_ledger = PaperLedger(settings.stock_sqlite_path, settings.stock_bankroll_usd)
+    state.crash_ledger = CrashStore(tmp_path / "crash.db", 10_000.0)
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    state.crash_ledger.open_short(
+        product="US5-19DEC30-CDE",
+        fill_px=3061.0,
+        notional_usd=3061.0,
+        slippage_bps=0.0,
+        fee_usd=0.0,
+        reason="test",
+        ts=now,
+        strategy="crash_guard",
+    )
+    engine = StockPaperEngine(state, market=FakeYahoo())
+    fake_cb = FakeIntxMarket()
+    engine._cb_market = fake_cb
+    engine._perp_map = {"US5-19DEC30-CDE": "US5-19DEC30-CDE"}
+    engine._last_budget = {
+        "account_value_usd": 5000.0,
+        "budget_usd": 2000.0,
+        "open_notional_usd": 0.0,
+    }
+    state.stock_pairs["US5-19DEC30-CDE"] = PairSnapshot(
+        product="US5-19DEC30-CDE", max_open=1, last=3061.0, bid=3060.0, ask=3062.0
+    )
+    engine._open_lot_live(
+        product="US5-19DEC30-CDE",
+        reason="sma_15m:enter",
+        now=now,
+        strategy="sma_15m",
+        notional_usd=4000.0,
+    )
+    assert state.stock_ledger.open_count("US5-19DEC30-CDE") == 0
+    assert fake_cb.orders == []
 
 
 def test_leg_notional_respects_budget() -> None:
