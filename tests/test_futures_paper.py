@@ -484,3 +484,59 @@ def test_futures_defaults_session_day() -> None:
     assert s.futures_live_orders_permitted() is False
     assert s.futures_account_budget_pct == 0.20
     assert s.futures_max_positions == 1
+
+
+def test_swap_order_leverage_is_string_for_coinbase() -> None:
+    """Coinbase INTX rejects float leverage (proto string field); params must be str."""
+    from snowball.futures.market import CoinbaseFuturesMarket, leverage_param
+
+    assert leverage_param(1.0) == "1"
+    assert leverage_param(1) == "1"
+    assert leverage_param("2.0") == "2"
+    assert isinstance(leverage_param(1.0), str)
+
+    captured: list[dict] = []
+
+    class Ex:
+        def create_order(self, symbol, typ, side, amount, price, params):
+            captured.append(dict(params or {}))
+            return {
+                "id": "t1",
+                "filled": float(amount),
+                "average": float(price or 100.0),
+                "price": float(price or 100.0),
+                "cost": float(amount) * float(price or 100.0),
+                "remaining": 0.0,
+                "fee": {"cost": 0.0, "currency": "USDC"},
+                "status": "closed",
+            }
+
+        def fetch_order(self, order_id, symbol=None):
+            return captured and {
+                "id": order_id,
+                "filled": 1.0,
+                "average": 100.0,
+                "price": 100.0,
+                "status": "closed",
+            }
+
+    mkt = CoinbaseFuturesMarket(exchange=Ex(), allow_orders=True)
+    mkt.create_swap_market_order("SPY-PERP-INTX", "sell", 1.0, leverage=1.0)
+    assert captured[-1]["leverage"] == "1"
+    assert isinstance(captured[-1]["leverage"], str)
+
+    mkt.create_swap_maker_limit_order(
+        "GOOGL-PERP-INTX",
+        "buy",
+        1.0,
+        price=100.0,
+        bid=99.0,
+        ask=101.0,
+        leverage=1.0,
+        timeout_sec=1.0,
+        post_only=False,
+    )
+    assert captured[-1]["leverage"] == "1"
+    assert isinstance(captured[-1]["leverage"], str)
+    assert captured[-1].get("timeInForce") == "GTC"
+

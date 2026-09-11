@@ -27,6 +27,11 @@ def _expand_env_newlines(value: str) -> str:
     """Turn .env-style \\n escapes into real newlines (CDP PEM). Local copy — no live import."""
     return (value or "").replace("\\n", "\n").replace("\\r", "\r")
 
+def leverage_param(leverage: float | int | str) -> str:
+    """Coinbase INTX create_order expects leverage as a string (e.g. "1"), not float 1.0."""
+    return str(int(float(leverage)))
+
+
 
 def normalize_futures_product(product: str) -> str:
     """Normalize to Coinbase product id (e.g. SPY-PERP-INTX / AAPL-PERP-INTX)."""
@@ -354,7 +359,7 @@ class CoinbaseFuturesMarket:
             raise ValueError("amount must be positive")
         symbol = to_futures_ccxt_symbol(product)
         side_l = (side or "").lower()
-        params: dict[str, Any] = {"leverage": float(leverage)}
+        params: dict[str, Any] = {"leverage": leverage_param(leverage)}
         if reduce_only:
             params["reduceOnly"] = True
         # Prefer plain create_order with base amount for swaps (not spot quote_size quirks)
@@ -423,7 +428,7 @@ class CoinbaseFuturesMarket:
 
         symbol = to_futures_ccxt_symbol(product)
         params: dict[str, Any] = {
-            "leverage": float(leverage),
+            "leverage": leverage_param(leverage),
             "timeInForce": "GTC",
         }
         if reduce_only:
