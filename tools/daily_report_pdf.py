@@ -35,7 +35,7 @@ FT_INDEX_ORDER = ("SPY", "QQQ")
 
 def fetch_snap() -> dict:
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8080/api/snapshot", timeout=8) as r:
+        with urllib.request.urlopen("http://127.0.0.1:8080/api/snapshot", timeout=25) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         return {"error": str(e)}
@@ -44,7 +44,7 @@ def fetch_snap() -> dict:
 def fetch_futures(snap: dict | None = None) -> dict:
     """Prefer dedicated /api/futures; fall back to snapshot key."""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8080/api/futures", timeout=8) as r:
+        with urllib.request.urlopen("http://127.0.0.1:8080/api/futures", timeout=25) as r:
             data = json.loads(r.read().decode())
             if isinstance(data, dict) and data:
                 return data
