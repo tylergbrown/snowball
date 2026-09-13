@@ -2,10 +2,11 @@
 """Snowball daily trade PDF — professional layout + top-10 leaderboard + Future Trader."""
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
+import sys
 import urllib.request
-import argparse
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -19,6 +20,11 @@ from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer,
 CT = ZoneInfo("America/Chicago")
 ET = ZoneInfo("America/New_York")
 ROOT = Path("/home/tb/snowball")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from snowball.reports.closed_pnl import aggregate_closed_pnl, default_lane_dbs
+
 DB = ROOT / "data" / "snowball.db"
 FUT_DB = ROOT / "data" / "snowball_futures.db"
 REPORTS = ROOT / "reports"
@@ -575,6 +581,7 @@ def build(path: Path, *, sample: bool = False, report_day: date | None = None) -
         (day_start, day_end),
     ).fetchone()
     day_realized = float(closed_day["p"] or 0)
+    book_closed = aggregate_closed_pnl(default_lane_dbs(ROOT / "data"), year=day.year)
 
     doc = SimpleDocTemplate(
         str(path),
@@ -623,6 +630,60 @@ def build(path: Path, *, sample: bool = False, report_day: date | None = None) -
             f"&nbsp;&nbsp;·&nbsp;&nbsp;{eq_note}"
             + (f"&nbsp;&nbsp;·&nbsp;&nbsp;Day closed PnL from {int(closed_day['c'] or 0)} exits" if not is_today else ""),
             body,
+        )
+    )
+
+    ytd_pnl = float(book_closed.ytd)
+    all_time_pnl = float(book_closed.all_time)
+    mid = ParagraphStyle(
+        "mid",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=18,
+        leading=22,
+        spaceAfter=2,
+    )
+    mid_ytd = ParagraphStyle(
+        "mid_ytd",
+        parent=mid,
+        textColor=colors.HexColor("#15803d" if ytd_pnl >= 0 else "#b91c1c"),
+    )
+    mid_all = ParagraphStyle(
+        "mid_all",
+        parent=mid,
+        textColor=colors.HexColor("#15803d" if all_time_pnl >= 0 else "#b91c1c"),
+    )
+    cap = ParagraphStyle(
+        "cap",
+        parent=styles["Normal"],
+        fontSize=8,
+        textColor=colors.HexColor("#64748b"),
+        leading=11,
+        spaceAfter=2,
+    )
+    story.append(Spacer(1, 6))
+    story.append(
+        Table(
+            [
+                [
+                    Paragraph("YTD closed P/L", cap),
+                    Paragraph("All-time closed P/L", cap),
+                ],
+                [
+                    Paragraph(_money(ytd_pnl, signed=True), mid_ytd),
+                    Paragraph(_money(all_time_pnl, signed=True), mid_all),
+                ],
+            ],
+            colWidths=[3.5 * inch, 3.5 * inch],
+            hAlign="LEFT",
+        )
+    )
+    story.append(
+        Paragraph(
+            f"Closed realized only · book-wide (crypto + stocks/CFM + futures/FT + crash + fed) "
+            f"· {book_closed.ytd_count} YTD / {book_closed.all_time_count} all-time exits "
+            f"· CT year {book_closed.year} · unrealized not included",
+            muted,
         )
     )
     story.append(Paragraph("Strategies: " + (", ".join(status.get("strategies") or []) or "—"), body))
