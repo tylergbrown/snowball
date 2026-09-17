@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from snowball.models import Ticker
+from snowball import rate_limit as public_rl
 
 log = logging.getLogger("snowball.futures.market")
 
@@ -363,6 +364,7 @@ class CoinbaseFuturesMarket:
 
         opts: dict[str, Any] = {
             "enableRateLimit": True,
+            "rateLimit": 250,
             "timeout": int(timeout),
         }
         key = (api_key or "").strip()
@@ -386,13 +388,27 @@ class CoinbaseFuturesMarket:
 
     def fetch_ohlcv(self, product: str, timeframe: str, limit: int) -> list[list[float]]:
         symbol = to_futures_ccxt_symbol(product)
-        rows = self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)  # type: ignore[attr-defined]
+        public_rl.wait_turn(0.25)
+        try:
+            rows = self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)  # type: ignore[attr-defined]
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "429" in msg or "rate limit" in msg:
+                public_rl.penalize(3.0)
+            raise
         return [list(map(float, row[:6])) for row in rows]
 
     def fetch_ticker(self, product: str) -> Ticker:
         pid = normalize_futures_product(product)
         symbol = to_futures_ccxt_symbol(pid)
-        raw = self._exchange.fetch_ticker(symbol)  # type: ignore[attr-defined]
+        public_rl.wait_turn(0.25)
+        try:
+            raw = self._exchange.fetch_ticker(symbol)  # type: ignore[attr-defined]
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "429" in msg or "rate limit" in msg:
+                public_rl.penalize(3.0)
+            raise
         last = raw.get("last")
         bid = raw.get("bid")
         ask = raw.get("ask")

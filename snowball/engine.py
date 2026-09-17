@@ -78,7 +78,10 @@ class Engine:
 
         marks: dict[str, float] = {}
         with self.state.lock:
-            for product in settings.product_list:
+            gap = max(0.0, float(getattr(settings, "pair_fetch_gap_sec", 0.15) or 0.0))
+            for i, product in enumerate(settings.product_list):
+                if i and gap:
+                    time.sleep(gap)
                 snap = self._update_pair(product)
                 if snap.last is not None:
                     marks[product] = snap.last

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from snowball.models import Ticker
+from snowball import rate_limit as public_rl
 from snowball.stocks.universe import normalize_symbol
 
 log = logging.getLogger("snowball.stocks.market")
@@ -146,7 +147,7 @@ def resolve_coinbase_equity_ids(wanted: list[str]) -> dict[str, str]:
     except ImportError:
         return out
     try:
-        ex = ccxt.coinbase({"enableRateLimit": True, "timeout": 15000})
+        ex = ccxt.coinbase({"enableRateLimit": True, "rateLimit": 250, "timeout": 15000})
         markets = ex.load_markets()
     except Exception as exc:  # noqa: BLE001
         log.info("coinbase equity probe skipped", extra={"data": {"error": str(exc)}})
@@ -186,7 +187,7 @@ def resolve_coinbase_equity_perps(
         try:
             import ccxt  # lazy
 
-            ex = ccxt.coinbase({"enableRateLimit": True, "timeout": 20000})
+            ex = ccxt.coinbase({"enableRateLimit": True, "rateLimit": 250, "timeout": 20000})
             market_map = ex.load_markets()
         except Exception as exc:  # noqa: BLE001
             log.info(

@@ -85,6 +85,7 @@ class LiveBroker:
                     "secret": secret,
                     "password": settings.coinbase_api_passphrase or None,
                     "enableRateLimit": True,
+                    "rateLimit": 250,
                 }
             )
         log.warning("LIVE broker constructed — real orders are possible")

@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     sqlite_path: Path = Path("./data/snowball.db")
     heartbeat_path: Path = Path("./data/heartbeat")
     poll_seconds: float = 15.0
+    # Coinbase public REST pacing (ms between requests, process-wide via rate_limit).
+    ccxt_rate_limit_ms: int = 250
+    # Reuse OHLCV within this TTL to cut redundant candle fetches across strategies.
+    ohlcv_cache_ttl_sec: float = 45.0
+    # Sleep between pair updates in the crypto engine tick (extra spacing).
+    pair_fetch_gap_sec: float = 0.15
+    public_fetch_retries: int = 4
     ohlcv_limit: int = 80
     log_level: str = "INFO"
 
