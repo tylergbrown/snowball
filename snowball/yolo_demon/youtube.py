@@ -17,7 +17,7 @@ SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 PLAYLIST_ITEMS_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
 
-DEFAULT_CHANNEL_HANDLES = ("thetradingfraternity", "thestockmarket")
+DEFAULT_CHANNEL_HANDLES = ("thetradingfraternity", "thestockmarket", "elliotrades_official")
 DEFAULT_BACKFILL_SINCE = "2026-01-01T00:00:00Z"
 
 # Only used when no handles configured or YOUTUBE_ALLOW_KEYWORD_SEARCH=true.

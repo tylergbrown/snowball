@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -30,6 +31,81 @@ SOURCE_X = "x"
 WATCH_TICKER = "WATCH"
 BACKFILL_META_KEY = "yolo_youtube_backfill_done"
 BACKFILL_COUNTS_META = "yolo_youtube_backfill_counts"
+
+
+def normalize_handle(handle: str) -> str:
+    return handle.strip().lstrip("@").lower()
+
+
+def _handles_from_counts(counts_raw: str | None) -> set[str]:
+    text = (counts_raw or "").strip()
+    if not text:
+        return set()
+    out: set[str] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        out.add(normalize_handle(part.split("=", 1)[0]))
+    return out
+
+
+def parse_backfill_completed(
+    meta_raw: str | None,
+    since: str,
+    counts_raw: str | None = None,
+) -> set[str]:
+    """Handles already backfilled for this since value.
+
+    New format: JSON {"since": "...", "completed": ["handle", ...]}.
+    Legacy scalar (meta == since or "1"): infer completed from counts meta
+    so newly added handles still backfill without --force.
+    """
+    raw = (meta_raw or "").strip()
+    if not raw:
+        return set()
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return set()
+        if not isinstance(data, dict):
+            return set()
+        if str(data.get("since") or "").strip() != since:
+            return set()
+        completed = data.get("completed") or []
+        if not isinstance(completed, list):
+            return set()
+        return {normalize_handle(str(h)) for h in completed if str(h).strip()}
+    if raw == since or raw == "1":
+        return _handles_from_counts(counts_raw)
+    return set()
+
+
+def encode_backfill_meta(since: str, completed: set[str] | list[str]) -> str:
+    normed = sorted({normalize_handle(h) for h in completed if str(h).strip()})
+    return json.dumps({"since": since, "completed": normed}, separators=(",", ":"))
+
+
+def parse_backfill_counts(counts_raw: str | None) -> dict[str, int]:
+    text = (counts_raw or "").strip()
+    out: dict[str, int] = {}
+    if not text:
+        return out
+    for part in text.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        try:
+            out[normalize_handle(k)] = int(v)
+        except ValueError:
+            continue
+    return out
+
+
+def encode_backfill_counts(counts: dict[str, int]) -> str:
+    return ",".join(f"{k}={v}" for k, v in sorted(counts.items()))
 
 
 class YoloDemonSidecar:
@@ -225,36 +301,54 @@ class YoloDemonSidecar:
         since = (self.settings.yolo_youtube_backfill_since or "").strip()
         if not since:
             return 0
-        done = (self.store.get_meta(BACKFILL_META_KEY) or "").strip()
-        if done == since or done == "1":
+        completed = parse_backfill_completed(
+            self.store.get_meta(BACKFILL_META_KEY),
+            since,
+            self.store.get_meta(BACKFILL_COUNTS_META),
+        )
+        missing = [h for h in handles if normalize_handle(h) not in completed]
+        if not missing:
             return 0
         if self._backfill_attempted:
             return 0
         self._backfill_attempted = True
         log.info(
             "Yolo Demon YouTube backfill start",
-            extra={"data": {"since": since, "handles": handles}},
+            extra={
+                "data": {
+                    "since": since,
+                    "handles": missing,
+                    "already_done": sorted(completed),
+                }
+            },
         )
         try:
             by_handle = self.youtube.backfill_channel_handles(
-                handles, published_after=since
+                missing, published_after=since
             )
         except Exception:
             log.exception("Yolo Demon YouTube backfill failed")
             self.last_error = "youtube backfill failed"
             return 0
         total = 0
-        counts: dict[str, int] = {}
+        counts = parse_backfill_counts(self.store.get_meta(BACKFILL_COUNTS_META))
         for handle, vids in by_handle.items():
-            counts[handle] = len(vids)
+            h = normalize_handle(handle)
+            counts[h] = len(vids)
             for vid in vids:
                 _, n_v = self._ingest_priority_video(vid, now)
                 total += n_v
-        self.store.set_meta(
-            BACKFILL_COUNTS_META,
-            ",".join(f"{k}={v}" for k, v in sorted(counts.items())),
-        )
-        self.store.set_meta(BACKFILL_META_KEY, since)
+            completed.add(h)
+            # Persist after each handle so a crash mid-run does not redo finished ones.
+            self.store.set_meta(BACKFILL_META_KEY, encode_backfill_meta(since, completed))
+            self.store.set_meta(BACKFILL_COUNTS_META, encode_backfill_counts(counts))
+        for handle in missing:
+            h = normalize_handle(handle)
+            if h not in completed:
+                completed.add(h)
+                counts.setdefault(h, 0)
+        self.store.set_meta(BACKFILL_META_KEY, encode_backfill_meta(since, completed))
+        self.store.set_meta(BACKFILL_COUNTS_META, encode_backfill_counts(counts))
         log.info(
             "Yolo Demon YouTube backfill complete",
             extra={"data": {"since": since, "counts": counts, "upserted": total}},
