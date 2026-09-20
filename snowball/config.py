@@ -114,14 +114,18 @@ class Settings(BaseSettings):
     yolo_demon_enabled: bool = True
     yolo_demon_poll_seconds: float = 120.0
     youtube_api_key: str = ""
-    # Comma-separated @handles; default prioritizes Trading Fraternity + The Stock Market.
-    youtube_channel_handles: str = "thetradingfraternity,thestockmarket"
+    # Comma-separated @handles; default prioritizes Trading Fraternity, The Stock Market,
+    # and Ellio Trades Official.
+    youtube_channel_handles: str = (
+        "thetradingfraternity,thestockmarket,elliotrades_official"
+    )
     # When handles are set, keyword search is off unless this is true (saves quota).
     youtube_allow_keyword_search: bool = False
     # Per priority-channel poll page size (uploads playlistItems, 1 quota unit).
     youtube_priority_max_results: int = 20
     # One-shot Jan→now backfill since (ISO). Empty disables auto backfill.
-    # Meta flag yolo_youtube_backfill_done prevents re-walk every poll.
+    # Meta yolo_youtube_backfill_done tracks completed handles per since (JSON);
+    # newly added handles backfill without --force / re-walking old channels.
     yolo_youtube_backfill_since: str = "2026-01-01T00:00:00Z"
     x_bearer_token: str = ""
     # Pay-per-use: even with bearer set, require X_ENABLED=true to call the API.

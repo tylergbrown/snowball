@@ -15,6 +15,8 @@ from snowball.yolo_demon.poller import (
     BACKFILL_META_KEY,
     WATCH_TICKER,
     YoloDemonSidecar,
+    encode_backfill_meta,
+    parse_backfill_completed,
 )
 from snowball.yolo_demon.score import score_ticker
 from snowball.yolo_demon.store import YoloStore
@@ -52,6 +54,17 @@ YT_CHANNELS = {
                 "snippet": {"title": "The Stock Market"},
                 "contentDetails": {
                     "relatedPlaylists": {"uploads": "UUsm222"}
+                },
+            }
+        ]
+    },
+    "elliotrades_official": {
+        "items": [
+            {
+                "id": "UCel333",
+                "snippet": {"title": "Ellio Trades Official"},
+                "contentDetails": {
+                    "relatedPlaylists": {"uploads": "UUel333"}
                 },
             }
         ]
@@ -100,6 +113,22 @@ YT_PLAYLIST = {
                     "description": "market open",
                     "publishedAt": "2026-09-02T09:00:00Z",
                     "channelId": "UCsm222",
+                },
+            }
+        ]
+    },
+    "UUel333": {
+        "items": [
+            {
+                "contentDetails": {
+                    "videoId": "vidEL1",
+                    "videoPublishedAt": "2026-03-15T14:00:00Z",
+                },
+                "snippet": {
+                    "title": "$NVDA Ellio levels",
+                    "description": "watchlist",
+                    "publishedAt": "2026-03-15T14:00:00Z",
+                    "channelId": "UCel333",
                 },
             }
         ]
@@ -232,6 +261,11 @@ class FakeHttp:
         raise AssertionError(f"Yolo Demon must not POST: {url}")
 
 
+
+def _mark_backfill_done(store: YoloStore, handles: list[str], since: str = "2026-01-01T00:00:00Z") -> None:
+    store.set_meta(BACKFILL_META_KEY, encode_backfill_meta(since, handles))
+
+
 def test_extract_tickers_cashtags_and_known() -> None:
     got = extract_tickers("$TSLA to the moon", "also NVDA and SPY but not A or I or THE")
     assert "TSLA" in got
@@ -245,7 +279,11 @@ def test_extract_tickers_cashtags_and_known() -> None:
 
 
 def test_parse_youtube_and_handles() -> None:
-    assert parse_handles(None) == ["thetradingfraternity", "thestockmarket"]
+    assert parse_handles(None) == [
+        "thetradingfraternity",
+        "thestockmarket",
+        "elliotrades_official",
+    ]
     assert parse_handles("thetradingfraternity,thestockmarket") == [
         "thetradingfraternity",
         "thestockmarket",
@@ -279,7 +317,7 @@ def test_poll_youtube_channels(
     monkeypatch.setattr("snowball.yolo_demon.store.utcnow", lambda: NOW)
     store = YoloStore(tmp_path / "y.db")
     # Mark backfill done so this test only covers the recent poll path.
-    store.set_meta(BACKFILL_META_KEY, "2026-01-01T00:00:00Z")
+    _mark_backfill_done(store, ["thetradingfraternity", "thestockmarket"])
     settings = tmp_settings.model_copy(
         update={
             "youtube_api_key": "yt_key",
@@ -317,7 +355,7 @@ def test_priority_video_without_ticker_in_dashboard_payload(
     monkeypatch.setattr("snowball.yolo_demon.score.utcnow", lambda: NOW)
     monkeypatch.setattr("snowball.yolo_demon.store.utcnow", lambda: NOW)
     store = YoloStore(tmp_path / "y2.db")
-    store.set_meta(BACKFILL_META_KEY, "2026-01-01T00:00:00Z")
+    _mark_backfill_done(store, ["thetradingfraternity", "thestockmarket"])
     settings = tmp_settings.model_copy(
         update={
             "youtube_api_key": "yt_key",
@@ -394,7 +432,10 @@ def test_backfill_walks_playlist_and_sets_meta(
     sidecar = YoloDemonSidecar(settings, store, http=http)
     stats = sidecar.poll_once()
     assert stats["backfill_videos"] >= 1
-    assert store.get_meta(BACKFILL_META_KEY) == "2026-01-01T00:00:00Z"
+    completed = parse_backfill_completed(
+        store.get_meta(BACKFILL_META_KEY), "2026-01-01T00:00:00Z"
+    )
+    assert completed == {"thetradingfraternity", "thestockmarket"}
     counts = store.get_meta("yolo_youtube_backfill_counts") or ""
     assert "thetradingfraternity=" in counts
     assert "thestockmarket=" in counts
@@ -406,7 +447,9 @@ def test_backfill_walks_playlist_and_sets_meta(
     n_gets = len(http.gets)
     sidecar.poll_once()
     # May still do recent playlist polls, but not extra backfill pages for both channels
-    assert store.get_meta(BACKFILL_META_KEY) == "2026-01-01T00:00:00Z"
+    assert parse_backfill_completed(
+        store.get_meta(BACKFILL_META_KEY), "2026-01-01T00:00:00Z"
+    ) == {"thetradingfraternity", "thestockmarket"}
     assert len(http.gets) >= n_gets  # recent poll still happens
 
 
@@ -544,3 +587,69 @@ def test_source_column_migration(tmp_path: Path) -> None:
     ideas = store.top_ideas()
     assert ideas
     assert ideas[0].source == "unknown"
+
+
+def test_parse_backfill_completed_legacy_uses_counts() -> None:
+    since = "2026-01-01T00:00:00Z"
+    # Legacy scalar meta + counts → only listed handles are done
+    got = parse_backfill_completed(
+        since,
+        since,
+        "thetradingfraternity=3,thestockmarket=1",
+    )
+    assert got == {"thetradingfraternity", "thestockmarket"}
+    # New handle not in counts → missing (caller backfills only that one)
+    assert "elliotrades_official" not in got
+    # JSON format
+    meta = encode_backfill_meta(since, ["thetradingfraternity", "thestockmarket"])
+    assert parse_backfill_completed(meta, since) == {
+        "thetradingfraternity",
+        "thestockmarket",
+    }
+    # Different since clears completed
+    assert parse_backfill_completed(meta, "2025-01-01T00:00:00Z") == set()
+
+
+def test_new_handle_backfills_without_force(
+    tmp_settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adding a handle should backfill only the new one (no full --force)."""
+    monkeypatch.setattr("snowball.yolo_demon.poller.utcnow", lambda: NOW)
+    monkeypatch.setattr("snowball.yolo_demon.score.utcnow", lambda: NOW)
+    monkeypatch.setattr("snowball.yolo_demon.store.utcnow", lambda: NOW)
+    monkeypatch.setattr("snowball.yolo_demon.youtube.time.sleep", lambda *_a, **_k: None)
+    store = YoloStore(tmp_path / "ynew.db")
+    # Simulate prior deploy: two handles already backfilled (legacy meta + counts)
+    since = "2026-01-01T00:00:00Z"
+    store.set_meta(BACKFILL_META_KEY, since)
+    store.set_meta(
+        "yolo_youtube_backfill_counts",
+        "thestockmarket=1,thetradingfraternity=3",
+    )
+    settings = tmp_settings.model_copy(
+        update={
+            "youtube_api_key": "yt_key",
+            "youtube_channel_handles": (
+                "thetradingfraternity,thestockmarket,elliotrades_official"
+            ),
+            "youtube_allow_keyword_search": False,
+            "yolo_youtube_backfill_since": since,
+            "x_enabled": False,
+            "x_bearer_token": "",
+        }
+    )
+    http = FakeHttp()
+    sidecar = YoloDemonSidecar(settings, store, http=http)
+    stats = sidecar.poll_once()
+    assert stats["backfill_videos"] >= 1
+    completed = parse_backfill_completed(store.get_meta(BACKFILL_META_KEY), since)
+    assert "elliotrades_official" in completed
+    assert "thetradingfraternity" in completed
+    assert "thestockmarket" in completed
+    vids = {v["video_id"] for v in store.recent_videos(50)}
+    assert "vidEL1" in vids
+    # Channel resolves for ellio only during this backfill (old handles skipped)
+    channel_gets = [u for u in http.gets if "youtube/v3/channels" in u]
+    assert any("elliotrades_official" in u.lower() for u in channel_gets)
+    assert not any("thetradingfraternity" in u.lower() for u in channel_gets)
+    assert not any("thestockmarket" in u.lower() for u in channel_gets)

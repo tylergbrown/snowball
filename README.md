@@ -206,11 +206,11 @@ Separate sidecar (`yolo_demon`). Pulls **official APIs only** — YouTube Data A
 | **YouTube** | `YOUTUBE_API_KEY` | Google Cloud → enable **YouTube Data API v3** → create an API key. |
 | **X / Twitter** | `X_BEARER_TOKEN` + `X_ENABLED=true` | X developer console, pay-per-use credits, bearer token. **Cost ~$0.005/post read.** |
 
-**YouTube priority channels (every video):** default `YOUTUBE_CHANNEL_HANDLES=thetradingfraternity,thestockmarket` ([@thetradingfraternity](https://youtube.com/@thetradingfraternity), [@thestockmarket](https://youtube.com/@thestockmarket)).
+**YouTube priority channels (every video):** default `YOUTUBE_CHANNEL_HANDLES=thetradingfraternity,thestockmarket,elliotrades_official` ([@thetradingfraternity](https://youtube.com/@thetradingfraternity), [@thestockmarket](https://youtube.com/@thestockmarket), [@elliotrades_official](https://youtube.com/@elliotrades_official)).
 
 - Resolves handle → `channelId` + **uploads playlist** (`channels.list` `contentDetails`, ~1 quota unit), then `playlistItems.list` (~1 unit/page, 50 videos) — much cheaper than `search.list` (100 units/call).
 - **Every-video rule (priority handles only):** each upload is stored in sqlite `yolo_videos` even with zero `$TICKER` cashtags. Mentions use extracted tickers, or synthetic `WATCH` when none. Keyword search (if enabled) still requires tickers and does **not** write `yolo_videos`.
-- **Backfill:** on first poll (or `python -m snowball.yolo_demon.backfill`), walks uploads from `YOLO_YOUTUBE_BACKFILL_SINCE` (default `2026-01-01T00:00:00Z`) through now. Meta `yolo_youtube_backfill_done` prevents re-walking every poll; afterward only recent pages are fetched (`YOUTUBE_PRIORITY_MAX_RESULTS`, default 20).
+- **Backfill:** on first poll (or `python -m snowball.yolo_demon.backfill`), walks uploads from `YOLO_YOUTUBE_BACKFILL_SINCE` (default `2026-01-01T00:00:00Z`) through now. Meta `yolo_youtube_backfill_done` stores completed handles for that since (JSON); newly added handles still backfill without `--force`. Afterward only recent pages are fetched (`YOUTUBE_PRIORITY_MAX_RESULTS`, default 20).
 - Free daily quota is ~10k units; prefer playlist walks. When handles are set, **keyword search is skipped** unless `YOUTUBE_ALLOW_KEYWORD_SEARCH=true`.
 
 Dashboard **Priority channel videos** lists title, channel, published time, link, and any tickers found.
