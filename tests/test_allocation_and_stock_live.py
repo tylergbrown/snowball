@@ -32,25 +32,25 @@ def test_allocation_helpers_40_25_30_10_5_shared() -> None:
     pcts = lane_budget_pcts()
     assert pcts == {
         "crypto": 0.40,
-        "stock": 0.25,
-        "futures": 0.30,
+        "stock": 0.15,
+        "futures": 0.40,
         "crash": 0.10,
         "fed": 0.05,
-        "spot": 0.65,
+        "spot": 0.55,
         "crypto_stock_shared": 1.0,
     }
     budgets = lane_budgets_usd(1000.0)
     assert budgets["crypto_usd"] == 400.0
-    assert budgets["stock_usd"] == 250.0
-    assert budgets["spot_usd"] == 650.0
-    assert budgets["futures_usd"] == 300.0
+    assert budgets["stock_usd"] == 150.0
+    assert budgets["spot_usd"] == 550.0
+    assert budgets["futures_usd"] == 400.0
     assert budgets["crash_usd"] == 100.0
     assert budgets["fed_usd"] == 50.0
     s = Settings(_env_file=None, stock_enabled=False, futures_enabled=False, crash_enabled=False, fed_enabled=False)
     assert s.crypto_account_budget_pct == 0.40
-    assert s.stock_account_budget_pct == 0.25
+    assert s.stock_account_budget_pct == 0.15
     assert s.crypto_stock_shared_budget is True
-    assert s.futures_account_budget_pct == 0.30
+    assert s.futures_account_budget_pct == 0.40
     assert s.crash_account_budget_pct == 0.10
     assert s.fed_account_budget_pct == 0.05
     assert s.lane_budget_pcts() == pcts
@@ -60,11 +60,11 @@ def test_allocation_helpers_40_25_30_10_5_shared() -> None:
 
 
 def test_spot_shared_vs_separate_remaining_budget() -> None:
-    """Shared pool lets either lane use idle capital up to 65%; separate keeps lanes apart."""
+    """Shared pool lets either lane use idle capital up to 55%; separate keeps lanes apart."""
     av = 10_000.0
-    crypto_pct, stock_pct = 0.40, 0.25
+    crypto_pct, stock_pct = 0.40, 0.15
     shared_budget = spot_shared_budget_usd(av, crypto_pct, stock_pct)
-    assert shared_budget == 6500.0
+    assert shared_budget == 5500.0
 
     class _Lot:
         def __init__(self, n: float) -> None:
@@ -74,25 +74,25 @@ def test_spot_shared_vs_separate_remaining_budget() -> None:
     stock_lots = [_Lot(500.0)]
     open_shared = spot_open_notional_usd(crypto_lots, stock_lots)
     assert open_shared == 1500.0
-    # Crypto can still deploy: shared remaining 5000 even though crypto-alone
+    # Crypto can still deploy: shared remaining 4000 even though crypto-alone
     # remaining would be 3000 if capped at 40% with only crypto open counted.
-    assert remaining_budget_usd(shared_budget, open_shared) == 5000.0
+    assert remaining_budget_usd(shared_budget, open_shared) == 4000.0
     crypto_only_budget = av * crypto_pct
     crypto_only_open = 1000.0
     assert remaining_budget_usd(crypto_only_budget, crypto_only_open) == 3000.0
-    # Idle stock capital (2500 - 500 = 2000) is available to crypto under sharing:
+    # Idle stock capital (1500 - 500 = 1000) is available to crypto under sharing:
     assert remaining_budget_usd(shared_budget, open_shared) == (
-        remaining_budget_usd(crypto_only_budget, crypto_only_open) + 2000.0
+        remaining_budget_usd(crypto_only_budget, crypto_only_open) + 1000.0
     )
 
     # Separate mode: stock remaining ignores crypto open
     stock_only_budget = av * stock_pct
-    assert remaining_budget_usd(stock_only_budget, 500.0) == 2000.0
-    # Shared with crypto full of its old 40% still has stock slice usable:
+    assert remaining_budget_usd(stock_only_budget, 500.0) == 1000.0
+    # Shared with crypto full of its 40% still has stock slice usable:
     heavy_crypto = [_Lot(4000.0)]
     assert remaining_budget_usd(
         shared_budget, spot_open_notional_usd(heavy_crypto, stock_lots)
-    ) == 2000.0
+    ) == 1000.0
 
     s_off = Settings(
         _env_file=None,
@@ -104,7 +104,7 @@ def test_spot_shared_vs_separate_remaining_budget() -> None:
     )
     pcts_off = s_off.lane_budget_pcts()
     assert pcts_off["crypto_stock_shared"] == 0.0
-    assert pcts_off["spot"] == 0.65
+    assert pcts_off["spot"] == 0.55
 
 
 def test_fee_buffer_math() -> None:

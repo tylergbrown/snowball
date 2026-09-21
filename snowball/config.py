@@ -156,7 +156,7 @@ class Settings(BaseSettings):
     stock_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value stock lane may use (CFM CDE, lev=1).
     # With CRYPTO_STOCK_SHARED_BUDGET=true, stock draws from the shared spot pool with crypto.
-    stock_account_budget_pct: float = 0.25
+    stock_account_budget_pct: float = 0.15
     # When true: crypto+stock share one AV*(crypto_pct+stock_pct) pool (~65%); either lane
     # may use idle capital from the other. When false: independent per-lane budgets.
     crypto_stock_shared_budget: bool = True
@@ -197,7 +197,7 @@ class Settings(BaseSettings):
     futures_max_notional_usd: float = 4000.0
     futures_daily_loss_kill_usd: float = 25.0
     # Fraction of total Coinbase account value FT may use (split 50/50 across products)
-    futures_account_budget_pct: float = 0.30
+    futures_account_budget_pct: float = 0.40
     # session_day = overnight-capable ET session; momentum_15m = intraday impulse (shared ~30% budget)
     futures_strategies: str = "session_day,momentum_15m"
     # CFM CDE: US 500 PERP + TECH PERP (not INTX *-PERP-INTX)
