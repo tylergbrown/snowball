@@ -82,7 +82,8 @@ class Settings(BaseSettings):
     slippage_bps: float = 5.0
     taker_fee_bps: float = 0.0
     # Max fraction of total Coinbase account value the crypto lane may deploy (open notional).
-    crypto_account_budget_pct: float = 0.33
+    # With CRYPTO_STOCK_SHARED_BUDGET=true (default), crypto+stock share AV*(crypto+stock) (~65%).
+    crypto_account_budget_pct: float = 0.40
 
     sqlite_path: Path = Path("./data/snowball.db")
     heartbeat_path: Path = Path("./data/heartbeat")
@@ -153,8 +154,12 @@ class Settings(BaseSettings):
     # Soft INTX-era cap; CFM live floors sizing with this + 1-contract margin
     stock_max_notional_usd: float = 4000.0
     stock_daily_loss_kill_usd: float = 25.0
-    # Fraction of total Coinbase account value stock lane may use (CFM CDE, lev=1)
-    stock_account_budget_pct: float = 0.32
+    # Fraction of total Coinbase account value stock lane may use (CFM CDE, lev=1).
+    # With CRYPTO_STOCK_SHARED_BUDGET=true, stock draws from the shared spot pool with crypto.
+    stock_account_budget_pct: float = 0.25
+    # When true: crypto+stock share one AV*(crypto_pct+stock_pct) pool (~65%); either lane
+    # may use idle capital from the other. When false: independent per-lane budgets.
+    crypto_stock_shared_budget: bool = True
     # Live watchlist / mapped products (CFM CDE only — not single-name INTX)
     stock_products: str = "US5-19DEC30-CDE,TEK-19DEC30-CDE"
     stock_strategies: str = "sma_15m,sma_5m,sma_1d,ema_15m,donchian_1d,rsi_15m,bb_15m,rsi_1d,bb_1d"
@@ -418,6 +423,7 @@ class Settings(BaseSettings):
             futures_pct=self.futures_account_budget_pct,
             crash_pct=self.crash_account_budget_pct,
             fed_pct=self.fed_account_budget_pct,
+            crypto_stock_shared=self.crypto_stock_shared_budget,
         )
 
     @property

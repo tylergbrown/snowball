@@ -118,16 +118,17 @@ def test_fomc_window_and_summarize() -> None:
     assert summary["in_window"] is True
 
 
-def test_allocation_33_32_30_10_5() -> None:
+def test_allocation_40_25_30_10_5() -> None:
     pcts = lane_budget_pcts()
-    assert pcts == {
-        "crypto": 0.33,
-        "stock": 0.32,
-        "futures": 0.30,
-        "crash": 0.10,
-        "fed": 0.05,
-    }
-    assert sum(pcts.values()) == pytest.approx(1.10)  # FT bumped to 30%; trim others later
+    assert pcts["crypto"] == 0.40
+    assert pcts["stock"] == 0.25
+    assert pcts["futures"] == 0.30
+    assert pcts["crash"] == 0.10
+    assert pcts["fed"] == 0.05
+    assert pcts["spot"] == 0.65
+    assert pcts["crypto_stock_shared"] == 1.0
+    lane_sum = pcts["crypto"] + pcts["stock"] + pcts["futures"] + pcts["crash"] + pcts["fed"]
+    assert lane_sum == pytest.approx(1.10)  # FT 30%; spot share is crypto+stock
     budgets = lane_budgets_usd(10_000.0)
     assert budgets["fed_usd"] == 500.0
     s = Settings(
