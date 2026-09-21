@@ -38,6 +38,8 @@ ccxt public tickers/OHLCV ──► engine tick (15s)
                                 └─ in-memory snapshot ──► FastAPI :8080 (SSE)
 ```
 
+**Spot budget pool:** by default `CRYPTO_STOCK_SHARED_BUDGET=true` combines `CRYPTO_ACCOUNT_BUDGET_PCT` (0.40) + `STOCK_ACCOUNT_BUDGET_PCT` (0.25) into one 65% account-value pool. Open notional is crypto open + stock open; either lane may use idle capital from the other. Set `CRYPTO_STOCK_SHARED_BUDGET=false` for independent per-lane budgets. FT / Crash / Fed are unchanged.
+
 One process: engine thread + dashboard + **The Watcher** (official-macro research) + **Yolo Demon** (YouTube / X research) + **The Clerk** (House Clerk PTR research). systemd or Docker runs that process. `systemctl stop snowball` is the LAN off switch. Research sidecars never place orders.
 
 ```

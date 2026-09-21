@@ -3,8 +3,11 @@
 Live stock trading uses Coinbase CFM CDE ``US5-19DEC30-CDE`` + ``TEK-19DEC30-CDE``
 (same integer-contract path as FT/Crash/Fed). Does **not** place single-name
 ``*-PERP-INTX`` orders. Requires STOCK_MODE=live AND STOCK_LIVE_ENABLED=true.
-Long-only. Never sell red. Budget = stock_account_budget_pct (default 32%).
-Max 1 CFM lot per index; skip if Crash is short the same product.
+Long-only. Never sell red.
+Budget: when CRYPTO_STOCK_SHARED_BUDGET=true (default), stock+crypto share
+AV*(crypto_pct+stock_pct) (~65%); open notional counts live-backed stock lots
+plus crypto ledger open. When sharing is off, budget = stock_account_budget_pct
+alone (default 25%). Max 1 CFM lot per index; skip if Crash is short the same product.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from snowball.allocation import leg_notional_usd, open_notional_usd
+from snowball.allocation import leg_notional_usd, open_notional_usd, spot_open_notional_usd, spot_shared_budget_usd
 from snowball.config import LiveTradingRefused, Settings
 from snowball.gates import (
     indicator_filters_allow,
@@ -287,23 +290,37 @@ class StockPaperEngine:
             account_value = float(ledger.equity_usd(marks))
             if account_value <= 0:
                 account_value = float(settings.stock_bankroll_usd)
-        pct = float(settings.stock_account_budget_pct)
-        budget = max(0.0, account_value * pct)
+        shared = bool(getattr(settings, "crypto_stock_shared_budget", True))
         # Live budget tracks exchange-backed lots only; legacy paper lots are
-        # ledger accounting and must not block INTX deployment.
+        # ledger accounting and must not block CFM deployment.
         if settings.stock_live_orders_permitted():
-            live_lots = [
+            stock_lots = [
                 lot
                 for lot in ledger.open_positions()
                 if self._lot_is_live_backed(lot)
             ]
-            open_n = open_notional_usd(live_lots)
         else:
-            open_n = open_notional_usd(ledger.open_positions())
+            stock_lots = list(ledger.open_positions())
+        if shared:
+            budget = spot_shared_budget_usd(
+                account_value,
+                settings.crypto_account_budget_pct,
+                settings.stock_account_budget_pct,
+            )
+            crypto_ledger = getattr(self.state, "ledger", None)
+            crypto_positions = (
+                list(crypto_ledger.open_positions()) if crypto_ledger is not None else []
+            )
+            open_n = spot_open_notional_usd(crypto_positions, stock_lots)
+        else:
+            pct = float(settings.stock_account_budget_pct)
+            budget = max(0.0, account_value * pct)
+            open_n = open_notional_usd(stock_lots)
         self._last_budget = {
             "account_value_usd": account_value,
             "budget_usd": budget,
             "open_notional_usd": open_n,
+            "crypto_stock_shared_budget": 1.0 if shared else 0.0,
         }
         self.state.stock_account_value_usd = account_value  # type: ignore[attr-defined]
         self.state.stock_budget_usd = budget  # type: ignore[attr-defined]
@@ -790,11 +807,15 @@ class StockPaperEngine:
 
         notional = self._target_leg_notional()
         if notional <= 1e-6:
+            shared = bool(getattr(settings, "crypto_stock_shared_budget", True))
             log.info(
-                "stock entry skipped: budget full",
+                "stock entry skipped: spot_budget_full"
+                if shared
+                else "stock entry skipped: budget full",
                 extra={
                     "data": {
                         "product": product,
+                        "reason": "spot_budget_full" if shared else "stock_budget_full",
                         "budget": self._last_budget,
                     }
                 },
@@ -1444,7 +1465,16 @@ def attach_stock_lane(state: AppState) -> StockPaperEngine | None:
                 "stock_mode": settings.stock_mode,
                 "stock_live_enabled": settings.stock_live_enabled,
                 "live_orders": live,
-                "budget_pct": settings.stock_account_budget_pct,
+                "budget_pct": (
+                    float(settings.crypto_account_budget_pct)
+                    + float(settings.stock_account_budget_pct)
+                    if getattr(settings, "crypto_stock_shared_budget", True)
+                    else float(settings.stock_account_budget_pct)
+                ),
+                "crypto_stock_shared_budget": bool(
+                    getattr(settings, "crypto_stock_shared_budget", True)
+                ),
+                "stock_account_budget_pct": settings.stock_account_budget_pct,
                 "cfm_products": list(settings.stock_product_list) if live else [],
                 "perp_mapped": len({v for v in engine._perp_map.values()}),
                 "venue": "CFM_CDE" if live else "yahoo_paper",

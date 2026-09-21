@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from snowball.allocation import leg_notional_usd, open_notional_usd
+from snowball.allocation import leg_notional_usd, open_notional_usd, spot_open_notional_usd, spot_shared_budget_usd
 from snowball.config import LiveTradingRefused, Settings
 from snowball.halt import halt_active, trading_enabled
 from snowball.live import make_broker
@@ -430,17 +430,25 @@ class Engine:
             )
             return
 
-        # Cap new lots so crypto open notional stays within CRYPTO_ACCOUNT_BUDGET_PCT.
+        # Cap new lots so crypto open notional stays within crypto (or shared spot) budget.
         crypto_notional = self._crypto_leg_notional(marks)
         if crypto_notional <= 1e-6:
+            shared = bool(getattr(settings, "crypto_stock_shared_budget", True))
+            budget_pct = (
+                float(settings.crypto_account_budget_pct)
+                + float(settings.stock_account_budget_pct)
+                if shared
+                else float(settings.crypto_account_budget_pct)
+            )
             log.info(
                 "entry blocked",
                 extra={
                     "data": {
                         "product": product,
                         "strategy": strategy_id,
-                        "reason": "crypto_budget_full",
-                        "budget_pct": settings.crypto_account_budget_pct,
+                        "reason": "spot_budget_full" if shared else "crypto_budget_full",
+                        "budget_pct": budget_pct,
+                        "crypto_stock_shared_budget": shared,
                     }
                 },
             )
@@ -480,10 +488,10 @@ class Engine:
 
 
     def _crypto_leg_notional(self, marks: dict[str, float] | None = None) -> float:
-        """Cap new crypto lot size so open notional stays within crypto_account_budget_pct."""
+        """Cap new crypto lot size within crypto budget (or shared spot pool when enabled)."""
         settings = self.state.settings
         ledger = self.state.ledger
-        open_n = open_notional_usd(ledger.open_positions())
+        crypto_open = open_notional_usd(ledger.open_positions())
         account_value = 0.0
         # Prefer live free+positions equity; fall back to ledger equity / bankroll
         try:
@@ -494,14 +502,30 @@ class Engine:
             else:
                 account_value = float(ledger.equity_usd(marks or self.state.marks()))
         except Exception:
-            account_value = float(ledger.cash_usd() + open_n)
+            account_value = float(ledger.cash_usd() + crypto_open)
         if account_value <= 0:
             account_value = float(settings.bankroll_usd)
         # If futures engine cached a fresher Coinbase AV, prefer it for allocation.
         ft_av = getattr(self.state, "futures_account_value_usd", None)
         if ft_av is not None and float(ft_av) > 0:
             account_value = float(ft_av)
-        budget = account_value * float(settings.crypto_account_budget_pct)
+        shared = bool(getattr(settings, "crypto_stock_shared_budget", True))
+        if shared:
+            stock_ledger = getattr(self.state, "stock_ledger", None)
+            stock_positions = (
+                list(stock_ledger.open_positions()) if stock_ledger is not None else []
+            )
+            budget = spot_shared_budget_usd(
+                account_value,
+                settings.crypto_account_budget_pct,
+                settings.stock_account_budget_pct,
+            )
+            open_n = spot_open_notional_usd(
+                ledger.open_positions(), stock_positions
+            )
+        else:
+            budget = account_value * float(settings.crypto_account_budget_pct)
+            open_n = crypto_open
         per_leg = settings.effective_per_leg_notional_usd(account_value)
         return leg_notional_usd(
             budget_usd=budget,
