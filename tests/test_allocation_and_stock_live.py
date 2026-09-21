@@ -1,4 +1,4 @@
-"""Capital split 40/25 shared-spot 65 + FT/Crash/Fed, fee-buffer exits, stock dual-gate + CFM."""
+"""Capital split 40/15 shared-spot 55 + FT40/Crash/Fed, fee-buffer exits, stock dual-gate + CFM."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from snowball.futures.market import normalize_futures_product
 from snowball.models import PairSnapshot
 
 
-def test_allocation_helpers_40_25_30_10_5_shared() -> None:
+def test_allocation_helpers_40_15_40_10_5_shared() -> None:
     pcts = lane_budget_pcts()
     assert pcts == {
         "crypto": 0.40,
