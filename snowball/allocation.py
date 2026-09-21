@@ -2,11 +2,11 @@
 
 Default split (recomputed each tick/session from live account value):
   • Crypto live trader: 40%
-  • Stock trader:       25%
+  • Stock trader:       15%
   • Shared spot pool:   65% when CRYPTO_STOCK_SHARED_BUDGET=true
     (crypto + stock draw from one AV*(crypto_pct+stock_pct) pool;
      open notional = crypto open + stock open; either lane may use idle capital)
-  • Future Trader:      30%  (session overnight roll + intraday momentum)
+  • Future Trader:      40%  (session overnight roll + intraday momentum)
   • Crash Guard:        10%
   • Fed Desk:            5%
 
@@ -26,8 +26,8 @@ from typing import Any
 
 
 DEFAULT_CRYPTO_BUDGET_PCT = 0.40
-DEFAULT_STOCK_BUDGET_PCT = 0.25
-DEFAULT_FUTURES_BUDGET_PCT = 0.30
+DEFAULT_STOCK_BUDGET_PCT = 0.15
+DEFAULT_FUTURES_BUDGET_PCT = 0.40
 DEFAULT_CRASH_BUDGET_PCT = 0.10
 DEFAULT_FED_BUDGET_PCT = 0.05
 # Combined spot (crypto + stock) when CRYPTO_STOCK_SHARED_BUDGET is on.
