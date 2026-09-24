@@ -111,12 +111,13 @@ def test_allocation_includes_crash_10() -> None:
     pcts = lane_budget_pcts()
     assert pcts["crash"] == 0.10
     assert pcts["crypto"] == 0.40
-    assert pcts["stock"] == 0.25
-    assert pcts["futures"] == 0.30
+    assert pcts["stock"] == 0.20
+    assert pcts["futures"] == 0.40
     assert pcts["fed"] == 0.05
-    assert pcts["spot"] == 0.65
+    assert pcts["spot"] == 0.60
+    assert pcts["crypto_stock_shared"] == 0.0
     lane_sum = pcts["crypto"] + pcts["stock"] + pcts["futures"] + pcts["crash"] + pcts["fed"]
-    assert abs(lane_sum - 1.10) < 1e-9  # FT 30%; spot share is crypto+stock
+    assert abs(lane_sum - 1.10) < 1e-9  # crash+fed sit atop crypto+stock+FT
     b = lane_budgets_usd(10_000.0)
     assert b["crash_usd"] == 1000.0
     assert b["fed_usd"] == 500.0
