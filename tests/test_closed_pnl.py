@@ -11,6 +11,7 @@ from snowball.reports.closed_pnl import (
     ct_year_of,
     current_ct_year,
     default_lane_dbs,
+    is_live_fill_evidence,
     parse_closed_at,
     sum_lane_closed_pnl,
 )
@@ -25,6 +26,23 @@ CREATE TABLE positions (
 )
 """
 
+FILLS_SCHEMA = """
+CREATE TABLE fills (
+    id INTEGER PRIMARY KEY,
+    position_id INTEGER,
+    product TEXT,
+    side TEXT,
+    qty REAL,
+    price REAL,
+    notional_usd REAL,
+    fee_usd REAL,
+    slippage_bps REAL,
+    ts TEXT,
+    reason TEXT,
+    strategy TEXT
+)
+"""
+
 
 def _seed(path: Path, rows: list[tuple[str, object, object]]) -> Path:
     con = sqlite3.connect(path)
@@ -34,6 +52,35 @@ def _seed(path: Path, rows: list[tuple[str, object, object]]) -> Path:
             "INSERT INTO positions (product, status, realized_pnl, closed_at) VALUES (?,?,?,?)",
             ("X", status, pnl, closed_at),
         )
+    con.commit()
+    con.close()
+    return path
+
+
+def _seed_with_fills(
+    path: Path,
+    positions: list[tuple[str, float, str, list[tuple[float, float, str]]]],
+) -> Path:
+    """positions: (product, pnl, closed_at, [(fee, slip, reason), ...])"""
+    con = sqlite3.connect(path)
+    con.execute(POS_SCHEMA)
+    con.execute(FILLS_SCHEMA)
+    for product, pnl, closed_at, fills in positions:
+        cur = con.execute(
+            "INSERT INTO positions (product, status, realized_pnl, closed_at) VALUES (?,?,?,?)",
+            (product, "closed", pnl, closed_at),
+        )
+        pid = cur.lastrowid
+        for fee, slip, reason in fills:
+            con.execute(
+                """
+                INSERT INTO fills
+                  (position_id, product, side, qty, price, notional_usd,
+                   fee_usd, slippage_bps, ts, reason, strategy)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (pid, product, "sell", 1.0, 1.0, 1.0, fee, slip, closed_at, reason, "t"),
+            )
     con.commit()
     con.close()
     return path
@@ -121,6 +168,10 @@ def test_aggregate_sums_all_live_lanes(tmp_path: Path) -> None:
     assert by["futures"].all_time == 4.18
     assert by["crash"].all_time == 0.0
     assert by["fed"].all_time == 0.0
+    # no-fills seeds count as live → spot vs CFM split
+    assert book.spot_all_time == 24.87
+    assert book.cfm_all_time == 10.68  # 6.50 + 0.18 + 4.00
+    assert book.paper_all_time == 0.0
 
 
 def test_unparseable_closed_at_counts_all_time_only(tmp_path: Path) -> None:
@@ -155,3 +206,71 @@ def test_missing_positions_table_is_zero(tmp_path: Path) -> None:
     assert got.all_time == 0.0
     assert got.ytd == 0.0
     assert got.all_time_count == 0
+
+
+def test_is_live_fill_evidence_rules() -> None:
+    assert is_live_fill_evidence(reasons=[], max_fee_usd=None, has_fills=False) is True
+    assert is_live_fill_evidence(
+        reasons=["ema_15m:enter:live"], max_fee_usd=0.0, has_fills=True
+    ) is True
+    assert is_live_fill_evidence(
+        reasons=["orphan_live:reconcile"], max_fee_usd=0.0, has_fills=True
+    ) is True
+    assert is_live_fill_evidence(
+        reasons=["sma_5m:fade"], max_fee_usd=0.12, has_fills=True
+    ) is True
+    assert is_live_fill_evidence(
+        reasons=["sma_5m:enter", "sma_5m:fade"], max_fee_usd=0.0, has_fills=True
+    ) is False
+
+
+def test_paper_stocks_excluded_live_tek_and_spot_cfm_split(tmp_path: Path) -> None:
+    crypto = _seed_with_fills(
+        tmp_path / "snowball.db",
+        [
+            # live crypto fee>0
+            ("BTC-USD", 100.0, "2026-09-10T12:00:00+00:00", [(0.05, 0.0, "sma_5m:exit")]),
+            # paper crypto fee=0 slip=5
+            ("SOL-USD", 10.0, "2026-09-10T13:00:00+00:00", [(0.0, 5.0, "sma_15m:take_profit")]),
+        ],
+    )
+    stocks = _seed_with_fills(
+        tmp_path / "snowball_stocks.db",
+        [
+            ("AMD", 44.73, "2026-09-09T15:08:47+00:00", [(0.0, 5.0, "sma_5m:fade")]),
+            (
+                "TEK-19DEC30-CDE",
+                176.78,
+                "2026-09-23T13:32:13+00:00",
+                [(0.12, 0.0, "daily_loss_kill:live")],
+            ),
+        ],
+    )
+    futures = _seed_with_fills(
+        tmp_path / "snowball_futures.db",
+        [
+            (
+                "TEK-19DEC30-CDE",
+                65.28,
+                "2026-09-17T19:55:46+00:00",
+                [(0.12, 0.0, "session_day:session_close")],
+            ),
+        ],
+    )
+    book = aggregate_closed_pnl(
+        {
+            "crypto": crypto,
+            "stocks": stocks,
+            "futures": futures,
+            "crash": tmp_path / "snowball_crash.db",
+            "fed": tmp_path / "snowball_fed.db",
+        },
+        year=2026,
+    )
+    assert book.all_time == 100.0 + 176.78 + 65.28
+    assert book.ytd == book.all_time
+    assert book.spot_all_time == 100.0
+    assert book.cfm_all_time == 176.78 + 65.28
+    assert abs(book.paper_all_time - (10.0 + 44.73)) < 1e-9
+    assert book.paper_all_time_count == 2
+    assert book.all_time_count == 3

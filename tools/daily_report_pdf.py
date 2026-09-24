@@ -19,9 +19,21 @@ from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer,
 
 CT = ZoneInfo("America/Chicago")
 ET = ZoneInfo("America/New_York")
-ROOT = Path("/home/tyler/snowball")
+def _resolve_root() -> Path:
+    import os
+    env = (os.environ.get("SNOWBALL_ROOT") or "").strip()
+    if env:
+        return Path(env)
+    app = Path("/app")
+    if (app / "data").is_dir():
+        return app
+    return Path("/home/tyler/snowball")
+
+ROOT = _resolve_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if "/app" not in sys.path and Path("/app/snowball").is_dir():
+    sys.path.insert(0, "/app")
 
 from snowball.reports.closed_pnl import aggregate_closed_pnl, default_lane_dbs
 
@@ -35,7 +47,7 @@ FT_INDEX_ORDER = ("SPY", "QQQ")
 
 def fetch_snap() -> dict:
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8080/api/snapshot", timeout=25) as r:
+        with urllib.request.urlopen("http://127.0.0.1:8080/api/snapshot", timeout=120) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         return {"error": str(e)}
@@ -44,7 +56,7 @@ def fetch_snap() -> dict:
 def fetch_futures(snap: dict | None = None) -> dict:
     """Prefer dedicated /api/futures; fall back to snapshot key."""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8080/api/futures", timeout=25) as r:
+        with urllib.request.urlopen("http://127.0.0.1:8080/api/futures", timeout=120) as r:
             data = json.loads(r.read().decode())
             if isinstance(data, dict) and data:
                 return data
@@ -635,6 +647,8 @@ def build(path: Path, *, sample: bool = False, report_day: date | None = None) -
 
     ytd_pnl = float(book_closed.ytd)
     all_time_pnl = float(book_closed.all_time)
+    spot_all = float(book_closed.spot_all_time)
+    cfm_all = float(book_closed.cfm_all_time)
     mid = ParagraphStyle(
         "mid",
         parent=styles["Normal"],
@@ -666,8 +680,8 @@ def build(path: Path, *, sample: bool = False, report_day: date | None = None) -
         Table(
             [
                 [
-                    Paragraph("YTD closed P/L", cap),
-                    Paragraph("All-time closed P/L", cap),
+                    Paragraph("YTD live closed P/L", cap),
+                    Paragraph("All-time live closed P/L", cap),
                 ],
                 [
                     Paragraph(_money(ytd_pnl, signed=True), mid_ytd),
@@ -680,12 +694,24 @@ def build(path: Path, *, sample: bool = False, report_day: date | None = None) -
     )
     story.append(
         Paragraph(
-            f"Closed realized only · book-wide (crypto + stocks/CFM + futures/FT + crash + fed) "
-            f"· {book_closed.ytd_count} YTD / {book_closed.all_time_count} all-time exits "
-            f"· CT year {book_closed.year} · unrealized not included",
+            f"Live closed realized only (not account balance change) · "
+            f"Spot crypto {_money(spot_all, signed=True)} · "
+            f"CFM (stocks+FT+crash+fed) {_money(cfm_all, signed=True)} · "
+            f"{book_closed.ytd_count} YTD / {book_closed.all_time_count} all-time live exits · "
+            f"CT year {book_closed.year} · unrealized not included",
             muted,
         )
     )
+    paper_all = float(getattr(book_closed, "paper_all_time", 0.0) or 0.0)
+    paper_n = int(getattr(book_closed, "paper_all_time_count", 0) or 0)
+    if paper_n or abs(paper_all) > 1e-9:
+        story.append(
+            Paragraph(
+                f"Paper / sim closed excluded from headline: "
+                f"{_money(paper_all, signed=True)} across {paper_n} exits",
+                muted,
+            )
+        )
     story.append(Paragraph("Strategies: " + (", ".join(status.get("strategies") or []) or "—"), body))
 
     # Future Trader — after crypto summary, before leaderboard (cleanest layout)
