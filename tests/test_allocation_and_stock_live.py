@@ -1,4 +1,4 @@
-"""Capital split 40/15 shared-spot 55 + FT40/Crash/Fed, fee-buffer exits, stock dual-gate + CFM."""
+"""Capital split 40/20 separate-spot + FT40/Crash/Fed, fee-buffer exits, stock dual-gate + CFM."""
 
 from __future__ import annotations
 
@@ -28,28 +28,28 @@ from snowball.futures.market import normalize_futures_product
 from snowball.models import PairSnapshot
 
 
-def test_allocation_helpers_40_15_40_10_5_shared() -> None:
+def test_allocation_helpers_40_20_40_10_5_separate() -> None:
     pcts = lane_budget_pcts()
     assert pcts == {
         "crypto": 0.40,
-        "stock": 0.15,
+        "stock": 0.20,
         "futures": 0.40,
         "crash": 0.10,
         "fed": 0.05,
-        "spot": 0.55,
-        "crypto_stock_shared": 1.0,
+        "spot": 0.60,
+        "crypto_stock_shared": 0.0,
     }
     budgets = lane_budgets_usd(1000.0)
     assert budgets["crypto_usd"] == 400.0
-    assert budgets["stock_usd"] == 150.0
-    assert budgets["spot_usd"] == 550.0
+    assert budgets["stock_usd"] == 200.0
+    assert budgets["spot_usd"] == 600.0
     assert budgets["futures_usd"] == 400.0
     assert budgets["crash_usd"] == 100.0
     assert budgets["fed_usd"] == 50.0
     s = Settings(_env_file=None, stock_enabled=False, futures_enabled=False, crash_enabled=False, fed_enabled=False)
     assert s.crypto_account_budget_pct == 0.40
-    assert s.stock_account_budget_pct == 0.15
-    assert s.crypto_stock_shared_budget is True
+    assert s.stock_account_budget_pct == 0.20
+    assert s.crypto_stock_shared_budget is False
     assert s.futures_account_budget_pct == 0.40
     assert s.crash_account_budget_pct == 0.10
     assert s.fed_account_budget_pct == 0.05
@@ -104,7 +104,7 @@ def test_spot_shared_vs_separate_remaining_budget() -> None:
     )
     pcts_off = s_off.lane_budget_pcts()
     assert pcts_off["crypto_stock_shared"] == 0.0
-    assert pcts_off["spot"] == 0.55
+    assert pcts_off["spot"] == 0.60
 
 
 def test_fee_buffer_math() -> None:

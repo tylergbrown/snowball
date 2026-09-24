@@ -3,7 +3,7 @@
 Default split (recomputed each tick/session from live account value):
   • Crypto live trader: 40%
   • Stock trader:       15%
-  • Shared spot pool:   65% when CRYPTO_STOCK_SHARED_BUDGET=true
+  • Shared spot pool:   crypto+stock when CRYPTO_STOCK_SHARED_BUDGET=true
     (crypto + stock draw from one AV*(crypto_pct+stock_pct) pool;
      open notional = crypto open + stock open; either lane may use idle capital)
   • Future Trader:      40%  (session overnight roll + intraday momentum)
@@ -26,7 +26,7 @@ from typing import Any
 
 
 DEFAULT_CRYPTO_BUDGET_PCT = 0.40
-DEFAULT_STOCK_BUDGET_PCT = 0.15
+DEFAULT_STOCK_BUDGET_PCT = 0.20
 DEFAULT_FUTURES_BUDGET_PCT = 0.40
 DEFAULT_CRASH_BUDGET_PCT = 0.10
 DEFAULT_FED_BUDGET_PCT = 0.05
@@ -41,7 +41,7 @@ def lane_budget_pcts(
     futures_pct: float = DEFAULT_FUTURES_BUDGET_PCT,
     crash_pct: float = DEFAULT_CRASH_BUDGET_PCT,
     fed_pct: float = DEFAULT_FED_BUDGET_PCT,
-    crypto_stock_shared: bool = True,
+    crypto_stock_shared: bool = False,
 ) -> dict[str, float]:
     """Return lane fractions (does not force sum==1; callers own knobs).
 
@@ -70,7 +70,7 @@ def lane_budgets_usd(
     futures_pct: float = DEFAULT_FUTURES_BUDGET_PCT,
     crash_pct: float = DEFAULT_CRASH_BUDGET_PCT,
     fed_pct: float = DEFAULT_FED_BUDGET_PCT,
-    crypto_stock_shared: bool = True,
+    crypto_stock_shared: bool = False,
 ) -> dict[str, float]:
     """Dollar budgets per lane from total account value."""
     av = max(0.0, float(account_value_usd))
