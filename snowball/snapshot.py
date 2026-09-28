@@ -183,6 +183,7 @@ def build_snapshot(state: AppState) -> dict:
                 "per_leg_scale_per_100_usd_pct": settings.per_leg_scale_per_100_usd_pct,
                 "open_positions": len(positions),
                 "max_book_positions": settings.max_positions_per_pair * len(settings.product_list),
+                "treasury_reserve": _treasury_reserve_payload(state, marks),
             },
             "pairs": pairs,
             "positions": positions,
@@ -391,5 +392,69 @@ def _earnings_payload(state: AppState) -> dict:
         "upcoming": upcoming,
         "recent_reported": recent,
         "poll_seconds": float(getattr(settings, "earnings_poll_seconds", 14400.0)),
+    }
+
+
+def _treasury_reserve_payload(state: AppState, marks: dict) -> dict:
+    """Soft-reserve numbers for CRYPTO allocation (read-only; never sells)."""
+    from pathlib import Path
+
+    from snowball.allocation import crypto_allocation_base_usd, lane_budgets_usd
+    from snowball.treasury.reserve import treasury_soft_reserve
+
+    settings = state.settings
+    enabled = bool(getattr(settings, "treasury_reserve_enabled", True))
+    av = float(
+        getattr(state, "futures_account_value_usd", None)
+        or getattr(state, "stock_account_value_usd", None)
+        or settings.bankroll_usd
+    )
+    empty = {
+        "enabled": enabled,
+        "never_sell_treasury": bool(getattr(settings, "never_sell_treasury", True)),
+        "btc_qty": 0.0,
+        "mark_usd": 0.0,
+        "cost_usd": 0.0,
+        "reserve_usd": 0.0,
+        "account_value_usd": av,
+        "crypto_allocation_base_usd": av if enabled else av,
+        "crypto_budget_usd": av * float(settings.crypto_account_budget_pct),
+        "crypto_budget_usd_gross": av * float(settings.crypto_account_budget_pct),
+    }
+    if not enabled:
+        empty["crypto_allocation_base_usd"] = av
+        return empty
+    mark_btc = None
+    for key in ("BTC-USD", "BTC/USD", "BTC"):
+        if key in marks and marks[key] is not None and float(marks[key]) > 0:
+            mark_btc = float(marks[key])
+            break
+    db = Path(getattr(settings, "treasury_sqlite_path", Path("./data/snowball_treasury.db")))
+    try:
+        res = treasury_soft_reserve(db, mark_btc_usd=mark_btc)
+    except Exception:
+        return empty
+    base = crypto_allocation_base_usd(av, res["reserve_usd"])
+    budgets = lane_budgets_usd(
+        av,
+        crypto_pct=settings.crypto_account_budget_pct,
+        stock_pct=settings.stock_account_budget_pct,
+        futures_pct=settings.futures_account_budget_pct,
+        crash_pct=settings.crash_account_budget_pct,
+        fed_pct=settings.fed_account_budget_pct,
+        crypto_stock_shared=settings.crypto_stock_shared_budget,
+        treasury_reserve_usd=res["reserve_usd"],
+    )
+    return {
+        "enabled": True,
+        "never_sell_treasury": bool(getattr(settings, "never_sell_treasury", True)),
+        "btc_qty": res["btc_qty"],
+        "mark_usd": res["mark_usd"],
+        "cost_usd": res["cost_usd"],
+        "reserve_usd": res["reserve_usd"],
+        "account_value_usd": av,
+        "crypto_allocation_base_usd": base,
+        "crypto_budget_usd": budgets["crypto_usd"],
+        "crypto_budget_usd_gross": av * float(settings.crypto_account_budget_pct),
     }
 
