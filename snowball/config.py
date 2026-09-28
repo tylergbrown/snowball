@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     maker_timeout_seconds: float = 90.0
     never_sell_red: bool = True
     never_sell_red_emergency: bool = True
+    # Soft-reserve treasury BTC mark out of CRYPTO deployable base; hard-block
+    # live BTC sells that would leave wallet below reserved qty. ADD-only
+    # contributions (friday_50 / pnl_sweep) unchanged. NEVER_SELL_RED stays on.
+    treasury_reserve_enabled: bool = True
+    never_sell_treasury: bool = True
+    treasury_sqlite_path: Path = Path("./data/snowball_treasury.db")
     # Trend filter: require last > SMA slow before any new entry / scale-in.
     trend_filter_enabled: bool = True
     # RSI/BB lean-on filters for entries (block RSI>=70 and close > BB upper).

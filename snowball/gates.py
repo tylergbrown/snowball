@@ -298,3 +298,23 @@ def is_stall_exit_reason(reason: str) -> bool:
     base = reason.split(":", 1)[0]
     return reason in STALL_EXIT_REASONS or base in STALL_EXIT_REASONS
 
+
+def never_sell_treasury_allowed(
+    *,
+    product: str,
+    sell_qty: float,
+    wallet_btc: float | None,
+    reserved_btc: float,
+    never_sell_treasury: bool = True,
+) -> tuple[bool, str]:
+    """Hard-block hook: refuse BTC sells that would invade reserved treasury qty."""
+    from snowball.treasury.reserve import treasury_btc_sell_allowed
+
+    return treasury_btc_sell_allowed(
+        product=product,
+        sell_qty=sell_qty,
+        wallet_btc=wallet_btc,
+        reserved_btc=reserved_btc,
+        enabled=never_sell_treasury,
+    )
+

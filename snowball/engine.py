@@ -487,8 +487,44 @@ class Engine:
         )
 
 
+    def _treasury_soft_reserve(self, marks: dict[str, float] | None = None) -> dict[str, float]:
+        """Read snowball_treasury.db soft reserve (btc qty + USD mark/cost)."""
+        settings = self.state.settings
+        if not bool(getattr(settings, "treasury_reserve_enabled", True)):
+            return {
+                "btc_qty": 0.0,
+                "mark_usd": 0.0,
+                "cost_usd": 0.0,
+                "reserve_usd": 0.0,
+            }
+        from snowball.treasury.reserve import treasury_soft_reserve
+
+        mark_btc = None
+        m = marks or self.state.marks()
+        if m:
+            for key in ("BTC-USD", "BTC/USD", "BTC"):
+                if key in m and m[key] is not None and float(m[key]) > 0:
+                    mark_btc = float(m[key])
+                    break
+        db = Path(getattr(settings, "treasury_sqlite_path", Path("./data/snowball_treasury.db")))
+        try:
+            return treasury_soft_reserve(db, mark_btc_usd=mark_btc)
+        except Exception:  # noqa: BLE001 — sizing must not crash the tick
+            return {
+                "btc_qty": 0.0,
+                "mark_usd": 0.0,
+                "cost_usd": 0.0,
+                "reserve_usd": 0.0,
+            }
+
     def _crypto_leg_notional(self, marks: dict[str, float] | None = None) -> float:
-        """Cap new crypto lot size within crypto budget (or shared spot pool when enabled)."""
+        """Cap new crypto lot size within crypto budget (or shared spot pool when enabled).
+
+        Soft-reserves treasury BTC mark/cost out of the CRYPTO allocation base so
+        strategies cannot sell or spend treasury as deployable bankroll.
+        """
+        from snowball.allocation import crypto_allocation_base_usd
+
         settings = self.state.settings
         ledger = self.state.ledger
         crypto_open = open_notional_usd(ledger.open_positions())
@@ -509,6 +545,9 @@ class Engine:
         ft_av = getattr(self.state, "futures_account_value_usd", None)
         if ft_av is not None and float(ft_av) > 0:
             account_value = float(ft_av)
+        reserve = self._treasury_soft_reserve(marks)
+        reserve_usd = float(reserve.get("reserve_usd") or 0.0)
+        alloc_base = crypto_allocation_base_usd(account_value, reserve_usd)
         shared = bool(getattr(settings, "crypto_stock_shared_budget", True))
         if shared:
             stock_ledger = getattr(self.state, "stock_ledger", None)
@@ -516,7 +555,7 @@ class Engine:
                 list(stock_ledger.open_positions()) if stock_ledger is not None else []
             )
             budget = spot_shared_budget_usd(
-                account_value,
+                alloc_base,
                 settings.crypto_account_budget_pct,
                 settings.stock_account_budget_pct,
             )
@@ -524,9 +563,9 @@ class Engine:
                 ledger.open_positions(), stock_positions
             )
         else:
-            budget = account_value * float(settings.crypto_account_budget_pct)
+            budget = alloc_base * float(settings.crypto_account_budget_pct)
             open_n = crypto_open
-        per_leg = settings.effective_per_leg_notional_usd(account_value)
+        per_leg = settings.effective_per_leg_notional_usd(alloc_base)
         return leg_notional_usd(
             budget_usd=budget,
             open_notional_usd=open_n,
@@ -768,6 +807,51 @@ class Engine:
                     },
                 )
                 continue
+            # Hard-block: never sell reserved treasury BTC (soft reserve + wallet floor).
+            if bool(getattr(settings, "never_sell_treasury", True)):
+                from snowball.treasury.reserve import (
+                    is_btc_product,
+                    treasury_btc_sell_allowed,
+                )
+
+                if is_btc_product(product):
+                    reserved = float(
+                        self._treasury_soft_reserve(marks).get("btc_qty") or 0.0
+                    )
+                    wallet_btc = None
+                    if live and broker is not None:
+                        fetch_btc = getattr(broker, "fetch_free_btc", None)
+                        if callable(fetch_btc):
+                            try:
+                                wallet_btc = float(fetch_btc())
+                            except Exception:  # noqa: BLE001
+                                wallet_btc = None
+                    ok_t, why_t = treasury_btc_sell_allowed(
+                        product=product,
+                        sell_qty=float(lot.qty),
+                        wallet_btc=wallet_btc,
+                        reserved_btc=reserved,
+                        enabled=True,
+                    )
+                    # Paper / no-broker: soft reserve already carved capital; only
+                    # enforce wallet floor on live sells.
+                    if live and not ok_t:
+                        log.info(
+                            "never_sell_treasury hold",
+                            extra={
+                                "data": {
+                                    "product": product,
+                                    "position_id": lot.id,
+                                    "strategy": lot.strategy,
+                                    "reason": reason,
+                                    "sell_qty": float(lot.qty),
+                                    "reserved_btc": reserved,
+                                    "wallet_btc": wallet_btc,
+                                    "gate": why_t,
+                                }
+                            },
+                        )
+                        continue
             fill_px = paper_px
             fee_usd = 0.0
             slip = settings.slippage_bps

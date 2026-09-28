@@ -109,6 +109,18 @@ class LiveBroker:
                     return float(block["free"])
         return 0.0
 
+    def fetch_free_btc(self) -> float:
+        """Free BTC balance (treasury hard-block floor uses this)."""
+        bal = self._exchange.fetch_balance()  # type: ignore[attr-defined]
+        free = (bal or {}).get("free") or {}
+        if isinstance(free, dict) and free.get("BTC") is not None:
+            return float(free["BTC"])
+        if isinstance(bal, dict):
+            block = bal.get("BTC")
+            if isinstance(block, dict) and block.get("free") is not None:
+                return float(block["free"])
+        return 0.0
+
     def create_market_order(
         self,
         product: str,

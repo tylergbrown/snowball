@@ -71,21 +71,43 @@ def lane_budgets_usd(
     crash_pct: float = DEFAULT_CRASH_BUDGET_PCT,
     fed_pct: float = DEFAULT_FED_BUDGET_PCT,
     crypto_stock_shared: bool = False,
+    treasury_reserve_usd: float = 0.0,
 ) -> dict[str, float]:
-    """Dollar budgets per lane from total account value."""
+    """Dollar budgets per lane from total account value.
+
+    CRYPTO (and shared spot when enabled) sizes off AV minus treasury soft
+    reserve so strategies cannot spend treasury BTC mark/cost.
+    """
     av = max(0.0, float(account_value_usd))
     crypto = float(crypto_pct)
     stock = float(stock_pct)
-    spot = spot_shared_budget_usd(av, crypto, stock)
+    crypto_base = crypto_allocation_base_usd(av, treasury_reserve_usd)
+    spot = spot_shared_budget_usd(crypto_base, crypto, stock)
     return {
         "account_value_usd": av,
-        "crypto_usd": av * crypto,
-        "stock_usd": av * stock,
-        "spot_usd": spot,  # AV*(crypto+stock); used when sharing is on
+        "crypto_allocation_base_usd": crypto_base,
+        "treasury_reserve_usd": max(0.0, float(treasury_reserve_usd)),
+        "crypto_usd": crypto_base * crypto,
+        "stock_usd": av * stock,  # stock lane unchanged (treasury is BTC backstop)
+        "spot_usd": spot,  # shared pool uses crypto_base so treasury stays reserved
         "futures_usd": av * float(futures_pct),
         "crash_usd": av * float(crash_pct),
         "fed_usd": av * float(fed_pct),
     }
+
+
+def crypto_allocation_base_usd(
+    account_value_usd: float,
+    treasury_reserve_usd: float = 0.0,
+) -> float:
+    """CRYPTO sizing base: total AV minus soft-reserved treasury mark/cost.
+
+    Treasury BTC (and its USD mark) is not deployable bankroll. Weekly $50 /
+    pnl_sweep may still ADD to the ledger; this helper never withdraws.
+    """
+    av = max(0.0, float(account_value_usd))
+    reserve = max(0.0, float(treasury_reserve_usd))
+    return max(0.0, av - reserve)
 
 
 def spot_shared_budget_usd(
