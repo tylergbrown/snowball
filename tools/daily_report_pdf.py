@@ -36,6 +36,7 @@ if "/app" not in sys.path and Path("/app/snowball").is_dir():
     sys.path.insert(0, "/app")
 
 from snowball.reports.closed_pnl import aggregate_closed_pnl, default_lane_dbs
+from snowball.reports.treasury_metrics import treasury_snapshot_for_pdf
 
 DB = ROOT / "data" / "snowball.db"
 FUT_DB = ROOT / "data" / "snowball_futures.db"
@@ -303,6 +304,143 @@ def _ft_closed_from_db(day: date) -> list[dict]:
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+
+def append_bitcoin_treasury_section(
+    story: list,
+    *,
+    data_dir: Path,
+    h2: ParagraphStyle,
+    body: ParagraphStyle,
+    muted: ParagraphStyle,
+    now: datetime | None = None,
+) -> None:
+    """Bitcoin treasury backstop — separate from CRYPTO trader lane."""
+    story.append(Paragraph("Bitcoin treasury", h2))
+    try:
+        snap = treasury_snapshot_for_pdf(data_dir, now=now, write_mark=True)
+    except Exception as e:
+        story.append(Paragraph(f"Treasury ledger unavailable ({e}).", body))
+        story.append(
+            Paragraph(
+                "Separate from CRYPTO trader · Friday $50 @ 2pm CT · "
+                "50% positive closed realized → treasury",
+                muted,
+            )
+        )
+        return
+
+    mid = ParagraphStyle(
+        "treas_mid",
+        parent=body,
+        fontName="Helvetica-Bold",
+        fontSize=14,
+        leading=18,
+        spaceAfter=2,
+        textColor=colors.HexColor("#0f172a"),
+    )
+    cap = ParagraphStyle(
+        "treas_cap",
+        parent=muted,
+        fontSize=8,
+        textColor=colors.HexColor("#64748b"),
+        leading=11,
+        spaceAfter=2,
+    )
+
+    def _pct(v: float | None) -> str:
+        if v is None:
+            return "—"
+        return ("+" if v >= 0 else "") + f"{v:.2f}%"
+
+    def _pnl_color(v: float | None) -> colors.Color:
+        if v is None:
+            return colors.HexColor("#0f172a")
+        return colors.HexColor("#15803d" if v >= 0 else "#b91c1c")
+
+    avg_s = _money(snap.avg_price_usd) if snap.avg_price_usd is not None else "—"
+    total_pnl = snap.total_pnl_usd
+    total_s = _money(total_pnl, signed=True) if total_pnl is not None else "—"
+    trend_s = _pct(snap.trend_30d_btc_spot_pct)
+    weekly = snap.weekly_pnl_usd
+    weekly_s = _money(weekly, signed=True) if weekly is not None else "—"
+
+    mid_avg = ParagraphStyle("treas_avg", parent=mid)
+    mid_pnl = ParagraphStyle(
+        "treas_pnl", parent=mid, textColor=_pnl_color(total_pnl)
+    )
+    mid_trend = ParagraphStyle(
+        "treas_trend",
+        parent=mid,
+        textColor=_pnl_color(snap.trend_30d_btc_spot_pct),
+    )
+    mid_week = ParagraphStyle(
+        "treas_week", parent=mid, textColor=_pnl_color(weekly)
+    )
+
+    story.append(
+        Table(
+            [
+                [
+                    Paragraph("Average price (cost basis)", cap),
+                    Paragraph("Total P/L (mark vs cost)", cap),
+                ],
+                [
+                    Paragraph(avg_s, mid_avg),
+                    Paragraph(total_s, mid_pnl),
+                ],
+                [
+                    Paragraph(snap.trend_30d_label, cap),
+                    Paragraph(snap.weekly_pnl_label, cap),
+                ],
+                [
+                    Paragraph(trend_s, mid_trend),
+                    Paragraph(weekly_s, mid_week),
+                ],
+            ],
+            colWidths=[3.5 * inch, 3.5 * inch],
+            hAlign="LEFT",
+        )
+    )
+
+    if snap.empty:
+        story.append(
+            Paragraph(
+                "No treasury BTC yet — ledger ready. "
+                "Friday $50 and P/L sweeps will appear here.",
+                body,
+            )
+        )
+    else:
+        story.append(
+            Paragraph(
+                f"Holdings {snap.holdings_btc:.8f} BTC · "
+                f"Cost {_money(snap.cost_basis_usd)} · "
+                f"Mark {_money(snap.mark_value_usd)}"
+                + (
+                    f" @ {_money(snap.mark_btc_usd)}/BTC"
+                    if snap.mark_btc_usd is not None
+                    else ""
+                )
+                + f" · {snap.contribution_count} contribution"
+                + ("s" if snap.contribution_count != 1 else ""),
+                body,
+            )
+        )
+
+    story.append(
+        Paragraph(
+            "Separate from CRYPTO trader (backstop) · "
+            "Weekly $50 Fridays 2pm CT · "
+            "50% positive closed realized → treasury; "
+            "remaining 50% pro-rata STOCK/FT/Crash/Fed · "
+            f"{snap.trend_30d_label} = BTC-USD spot % change over 30 calendar days · "
+            f"{snap.weekly_pnl_label} = change in treasury unrealized P/L over 7 days "
+            "(ex-contribution; — until marks exist)",
+            muted,
+        )
+    )
 
 
 def append_future_trader_section(
@@ -713,6 +851,16 @@ def build(path: Path, *, sample: bool = False, report_day: date | None = None) -
             )
         )
     story.append(Paragraph("Strategies: " + (", ".join(status.get("strategies") or []) or "—"), body))
+
+    # Bitcoin treasury — backstop, separate from CRYPTO trader
+    append_bitcoin_treasury_section(
+        story,
+        data_dir=ROOT / "data",
+        h2=h2,
+        body=body,
+        muted=muted,
+        now=now_ct,
+    )
 
     # Future Trader — after crypto summary, before leaderboard (cleanest layout)
     append_future_trader_section(
