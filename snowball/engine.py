@@ -832,20 +832,23 @@ class Engine:
 
     def _spot_floor_allows(self, product: str, notional: float, free_usd: float, reason: str,
                            source: str) -> bool:
-        """Block a spot buy whose cost would take spot USD below SPOT_USD_FLOOR (sells/dividend exempt)."""
+        """Block a spot buy whose cost would take spot USD below SPOT_USD_FLOOR (sells/dividend exempt).
+
+        Also enforces the 11/11 CFM index-buffer reserve: while N US5/TEK lots are open, a
+        trading-lane spot buy may not leave the liquidation buffer under N × $300. Dividend
+        and dip-buy never call this method, so they stay exempt.
+        """
         settings = self.state.settings
         floor = float(getattr(settings, "spot_usd_floor", 0.0) or 0.0)
         self._spot_floor_note(free_usd, source)
         st = self._spot_floor_stats()
-        if floor <= 0:
-            return True
         fee = float(getattr(settings, "spot_usd_floor_fee_pct", 0.006) or 0.0)
         cost = float(notional) * (1.0 + max(0.0, fee))
         # Exchange free USD already nets resting-order holds; also subtract buys this process
         # has reserved but the exchange may not reflect yet (concurrent lanes / threads).
         pending = spot_inflight_usd()
         after = float(free_usd) - pending - cost
-        if after < floor:
+        if floor > 0 and after < floor:
             st["blocked_buys"] = int(st.get("blocked_buys", 0)) + 1
             st["blocked_usd"] = round(float(st.get("blocked_usd", 0.0)) + float(notional), 2)
             st["last_blocked"] = {"product": product, "notional_usd": round(float(notional), 2),
@@ -860,7 +863,31 @@ class Engine:
                                                           "floor_usd": floor, "source": source,
                                                           "blocked_buys": st["blocked_buys"]}})
             return False
-        st["passed_buys"] = int(st.get("passed_buys", 0)) + 1
+        from snowball.futures.stops import spot_index_buffer_eval
+
+        ev = spot_index_buffer_eval(self.state, cost_usd=cost, pending_usd=pending)
+        st["index_buffer"] = ev
+        if not ev.get("ok", True):
+            bst = st.setdefault("index_buffer_blocks", {"blocked_buys": 0, "blocked_usd": 0.0})
+            bst["blocked_buys"] = int(bst.get("blocked_buys", 0)) + 1
+            bst["blocked_usd"] = round(float(bst.get("blocked_usd", 0.0)) + float(notional), 2)
+            st["last_blocked"] = {"product": product, "notional_usd": round(float(notional), 2),
+                                  "cost_usd": round(cost, 2), "free_usd": round(float(free_usd), 2),
+                                  "pending_usd": round(pending, 2),
+                                  "reason": ev.get("why"), "index_buffer": ev,
+                                  "at": utcnow().isoformat()}
+            last = _FLOOR_LOG_AT.get(f"idxbuf:{product}", 0.0)
+            if time.monotonic() - last >= 300.0:
+                _FLOOR_LOG_AT[f"idxbuf:{product}"] = time.monotonic()
+                log.info("entry blocked", extra={"data": {"product": product,
+                                                          "reason": ev.get("why"),
+                                                          "notional_usd": notional,
+                                                          "free_usd": free_usd,
+                                                          "source": source, **{k: ev.get(k) for k in
+                                                              ("n", "need_usd", "buffer_usd", "after_usd")}}})
+            return False
+        if floor > 0:
+            st["passed_buys"] = int(st.get("passed_buys", 0)) + 1
         return True
 
     def _forward_spot_gate(self, product: str, target: float, reason: str, strategy: str) -> float | None:

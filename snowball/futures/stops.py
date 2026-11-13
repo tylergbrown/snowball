@@ -882,6 +882,68 @@ def exchange_index_net(state: Any, max_age: float = 600.0) -> dict[str, float] |
     return {p: n for p, n in (x.get("net") or {}).items() if family_root(p) in fams}
 
 
+def open_index_n(state: Any) -> tuple[int, str]:
+    """Count open US5/TEK index contracts (N). Prefer fresh exchange net; else ledger.
+
+    When both are known and disagree, use the larger N so the reserve is not under-sized.
+    """
+    ledger_n = 0
+    try:
+        ledger_n = int(round(sum(abs(float(o.get("contracts") or 1.0)) for o in open_index_contracts(state))))
+    except Exception:  # noqa: BLE001
+        log.exception("open_index_n ledger count failed")
+    ex = exchange_index_net(state)
+    if ex is not None:
+        ex_n = int(round(sum(abs(float(n)) for n in ex.values())))
+        if ledger_n and ex_n != ledger_n:
+            return max(ex_n, ledger_n), "exchange_net_ledger_max"
+        return ex_n, "exchange_net"
+    return ledger_n, "ledger"
+
+
+def spot_index_buffer_eval(state: Any, *, cost_usd: float, pending_usd: float = 0.0,
+                           buffer_usd: float | None = None, n: int | None = None) -> dict:
+    """Block a spot buy that would leave CFM buffer under N × $300 (Tb via nala 2026-11-11).
+
+    Pure evaluation; never sends an order. Dividend and dip-buy are exempt because they
+    never call this. Fails closed in live when N > 0 and the buffer is unknown.
+    """
+    s = getattr(state, "settings", None)
+    on = bool(getattr(s, "spot_index_buffer_reserve_enabled", True))
+    per = float(getattr(s, "spot_index_buffer_reserve_usd", 300.0) or 0.0)
+    out: dict = {"enabled": on, "per_lot_usd": per, "cost_usd": round(float(cost_usd), 2),
+                 "pending_usd": round(float(pending_usd), 2)}
+    if not on or per <= 0:
+        return {**out, "ok": True, "why": "reserve_off", "n": 0, "need_usd": 0.0}
+    n_src = "given"
+    if n is None:
+        n, n_src = open_index_n(state)
+    n = int(n or 0)
+    out["n"] = n
+    out["n_source"] = n_src
+    if n <= 0:
+        return {**out, "ok": True, "why": "no_open_index", "need_usd": 0.0}
+    need = n * per
+    out["need_usd"] = round(need, 2)
+    if buffer_usd is None:
+        liq = _cached_liq(state)
+        if not liq or liq.get("buffer_usd") is None:
+            live = bool(getattr(s, "live_enabled", False)) and str(getattr(s, "mode", "")) == "live"
+            # Fail closed only when live: a stale/missing buffer must not let a spot buy
+            # drain the stop's reserve. Paper/tests without a liq cache stay open unless
+            # they pass buffer_usd or a live settings flag.
+            if live:
+                return {**out, "ok": False, "why": "spot_index_buffer_data_unavailable",
+                        "buffer_usd": None, "after_usd": None}
+            return {**out, "ok": True, "why": "no_buffer_non_live", "buffer_usd": None, "after_usd": None}
+        buffer_usd = float(liq["buffer_usd"])
+    after = float(buffer_usd) - float(pending_usd) - float(cost_usd)
+    ok = after + 1e-9 >= need
+    return {**out, "ok": ok,
+            "why": "ok" if ok else f"spot_index_buffer_{after:.0f}_lt_{need:.0f}",
+            "buffer_usd": round(float(buffer_usd), 2), "after_usd": round(after, 2)}
+
+
 # --------------------------------------------------------------------------- per-lot view
 
 

@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # treasury dividend (tools/treasury_dca.py) are unaffected. Lift after the deposit.
     spot_usd_floor: float = 0.0  # Tb dropped the floor 10/2 8:55 AM CT ("forget the cash floor")
     spot_usd_floor_fee_pct: float = 0.006
+    # Spot-buy CFM buffer reserve (Tb via nala 2026-11-11): while N US5/TEK index lots are open,
+    # block new trading-lane spot buys that would leave the CFM liquidation buffer under
+    # N * SPOT_INDEX_BUFFER_RESERVE_USD ($300 = $250 stop + $50 liq guard). Counts the real
+    # exchange net when known. Treasury dividend and the $10 dip-buy stay exempt (they do not
+    # use the trading-lane entry path). Does not change stops, SPOT_USD_FLOOR, never-sell-red,
+    # or the futures:* slot reservation. 0 or enabled=false turns this gate off.
+    spot_index_buffer_reserve_enabled: bool = True
+    spot_index_buffer_reserve_usd: float = 300.0
     max_position_notional_usd: float = 100.0
     # Shared per-leg notional autoscale (all lanes). See snowball.sizing.
     # per_leg = max(BASE, BASE * (1 + (PCT/100) * floor(AV/100))) when enabled.
