@@ -86,6 +86,7 @@ def cfm_sizing_budget_usd(
     leverage: float = 1.0,
     margin_rate: float = 0.10,
     max_contracts: int = 1,
+    contract_size: float = 1.0,
 ) -> float:
     """Floor CFM budget so INTX-era per-leg soft caps cannot zero CFM_MAX_CONTRACTS.
 
@@ -103,6 +104,7 @@ def cfm_sizing_budget_usd(
         contracts=max(1, int(max_contracts)),
         leverage=leverage,
         margin_rate=margin_rate,
+        contract_size=contract_size,
     )
     return max(
         0.0,

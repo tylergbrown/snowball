@@ -6,6 +6,10 @@ Enter short when flat on that index if ANY of:
   • close below Bollinger lower (20,2) with band width expanding vs prior bar
 
 Cover short only when short PnL is green enough (never cover red).
+
+2026-10-10 (Tb, fix B): a NEW short additionally needs >= CRASH_MIN_TRIGGERS (2) of the three
+triggers AND the last price below the CRASH_TREND_SMA_DAYS (20) daily average
+(crash_entry_allowed). Cover target CRASH_COVER_PCT (2.5%) net of real CFM fees.
 """
 
 from __future__ import annotations
@@ -98,6 +102,63 @@ def evaluate_crash_triggers(
         bb_width=width,
         bb_width_prior=width_prior,
     )
+
+
+def sma(closes: list[float], n: int) -> float | None:
+    if n <= 0 or len(closes) < n:
+        return None
+    w = [float(x) for x in closes[-n:]]
+    return sum(w) / float(n)
+
+
+def crash_entry_allowed(
+    tr: TriggerResult,
+    closes: list[float],
+    last_price: float | None = None,
+    *,
+    min_triggers: int = 2,
+    require_below_sma: bool = True,
+    sma_days: int = 20,
+) -> tuple[bool, str, float | None]:
+    """(B) Entry filter on top of the raw triggers: count + downtrend (price < SMA)."""
+    avg = sma(closes, int(sma_days)) if closes else None
+    if not tr.fire:
+        return False, "no_trigger", avg
+    k = len(tr.reasons)
+    if k < max(1, int(min_triggers)):
+        return False, f"triggers_{k}_lt_{int(min_triggers)}", avg
+    if require_below_sma:
+        px = float(last_price) if last_price is not None and float(last_price) > 0 else (
+            float(closes[-1]) if closes else None)
+        if avg is None or px is None:
+            return False, "no_sma", avg
+        if not px < avg:
+            return False, f"price_{px:.2f}_not_below_sma{int(sma_days)}_{avg:.2f}", avg
+    return True, "ok", avg
+
+
+def short_cover_pct_net_allowed(
+    entry_price: float,
+    mark: float | None,
+    *,
+    cover_pct: float,
+    fee_round_trip_usd: float = 0.0,
+    qty: float = 1.0,
+) -> tuple[bool, str]:
+    """(B) Cover when short P&L NET of real round-trip fees >= cover_pct of entry notional.
+
+    Never covers red (net < 0 is impossible to pass since cover_pct > 0).
+    """
+    if mark is None or mark <= 0 or entry_price <= 0:
+        return False, "no_mark"
+    q = float(qty) if float(qty) > 0 else 1.0
+    gross = (float(entry_price) - float(mark)) * q
+    if gross < 0:
+        return False, "never_cover_red"
+    net_frac = (gross - float(fee_round_trip_usd)) / (float(entry_price) * q)
+    if net_frac < float(cover_pct):
+        return False, "below_take_profit"
+    return True, "ok"
 
 
 def short_unrealized_pnl_pct(entry_price: float, mark: float | None) -> float | None:

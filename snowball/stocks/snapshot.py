@@ -15,10 +15,27 @@ def build_stocks_snapshot(state: AppState) -> dict[str, Any]:
     now = utcnow()
     ledger = state.stock_ledger
     if ledger is None or not settings.stock_enabled:
+        merged = bool(getattr(settings, "futures_stock_merge_enabled", False)) and bool(
+            getattr(settings, "futures_enabled", False)
+        )
+        archive = None
+        if merged:
+            try:
+                from snowball.futures.stock_strategies import legacy_stock_archive
+
+                archive = legacy_stock_archive(settings)
+            except Exception:  # noqa: BLE001
+                archive = None
         return {
             "enabled": False,
+            "merged_into": "futures" if merged else None,
+            "archive": archive,
             "mode": "paper",
-            "label": "STOCK PAPER (disabled)",
+            "label": (
+                "STOCK lane merged into Futures (archive; separate lane off)"
+                if merged
+                else "STOCK PAPER (disabled)"
+            ),
             "pairs": [],
             "positions": [],
             "fills": [],

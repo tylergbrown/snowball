@@ -60,6 +60,14 @@ class Position:
     exit_price: float | None = None
     realized_pnl: float | None = None
     strategy: str = "sma_15m"
+    # Contract roll (2026-09-30): carried cost basis for NEVER_SELL_RED gates.
+    # None for every lot that was never rolled -> gates use entry_price as before.
+    roll_basis: float | None = None
+
+    @property
+    def gate_entry_price(self) -> float:
+        """Price NEVER_SELL_RED / never-cover-red judge against (carried roll basis)."""
+        return float(self.roll_basis) if self.roll_basis is not None else float(self.entry_price)
 
 
 @dataclass

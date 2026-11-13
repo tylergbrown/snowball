@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from snowball import signal_context
+
 import logging
 import time
 from datetime import datetime, timezone
@@ -9,7 +11,7 @@ from typing import Any
 
 from snowball.allocation import effective_take_profit_floor
 from snowball.config import LiveTradingRefused, Settings
-from snowball.crash.triggers import short_cover_allowed, short_unrealized_pnl_pct
+from snowball.crash.triggers import sma, short_cover_allowed, short_unrealized_pnl_pct
 from snowball.fed.market import (
     DEFAULT_FED_PRODUCTS,
     FedMarket,
@@ -136,11 +138,25 @@ class FedEngine:
                 api_passphrase=s.coinbase_api_passphrase,
                 allow_orders=allow,
             )
+        from snowball.futures.roll import LaneRollSupport
+
+        self._roll = LaneRollSupport(
+            "fed",
+            state,
+            lambda: getattr(self.state, "fed_ledger", None),
+            self.market,
+            lambda: bool(self.state.settings.fed_live_orders_permitted()),
+        )
 
     def product_list(self) -> list[str]:
         settings = self.state.settings
         items = [normalize_futures_product(p) for p in settings.fed_product_list]
-        return items or list(DEFAULT_FED_PRODUCTS)
+        items = items or list(DEFAULT_FED_PRODUCTS)
+        try:
+            return self._roll.products(items)
+        except Exception:  # noqa: BLE001
+            log.exception("fed front-month resolution failed; using configured products")
+            return items
 
     def tick(self) -> None:
         settings = self.state.settings
@@ -167,6 +183,10 @@ class FedEngine:
         now = utcnow()
         halted = halt_active(settings.halt_file)
         can_trade = trading_enabled(settings)
+        try:
+            self._roll.tick(now, halted=halted, can_trade=can_trade)
+        except Exception:  # noqa: BLE001
+            log.exception("fed contract roll tick failed")
 
         marks: dict[str, float] = {}
         for product in products:
@@ -175,6 +195,19 @@ class FedEngine:
                 marks[product] = snap.last
 
         self._refresh_budget(marks)
+
+        # Futures stop-loss + liquidation guard (Tb 2026-10-01): every poll, also under HALT /
+        # daily kill, before exits/entries. FUTURES-ONLY exception to never-sell/cover-red.
+        try:
+            from snowball.futures.stops import LaneHooks, run_stops
+
+            run_stops(self.state, LaneHooks(
+                lane="fed", ledger=store, market=self.market, pairs=self.state.fed_pairs,
+                live=bool(settings.fed_live_orders_permitted()), book=self._stop_book,
+                skip=lambda lot: bool(self._roll.in_flight(lot.id)),
+            ), now=now, can_trade=can_trade)
+        except Exception:  # noqa: BLE001
+            log.exception("fed stop tick failed")
 
         equity = store.equity_usd(marks)
         utc_date, start_eq, killed = store.ensure_utc_day(now, equity)
@@ -263,7 +296,18 @@ class FedEngine:
                 eligible_skew = False
                 direction = None
 
-        bet_eligible = bool(eligible_skew and in_window)
+        # (B) 2026-10-10: a high level alone no longer bets; the dominant outcome's odds must have
+        # RISEN by >= FED_MIN_ODDS_SHIFT vs the FedWatch history lookback.
+        min_shift = float(getattr(self.state.settings, "fed_min_odds_shift", 0.0) or 0.0)
+        deltas = research.get("history_deltas") or {}
+        shift = None
+        if dominant in ("hike", "cut") and deltas and f"d_{dominant}" in deltas:
+            try:
+                shift = float(deltas[f"d_{dominant}"])
+            except (TypeError, ValueError):
+                shift = None
+        shift_ok = min_shift <= 0 or (shift is not None and shift + 1e-9 >= min_shift)
+        bet_eligible = bool(eligible_skew and in_window and shift_ok)
         status = "idle"
         if not in_window:
             status = "outside_window"
@@ -271,6 +315,8 @@ class FedEngine:
             status = "hold_flat"
         elif max_prob < BET_SKEW_THRESHOLD:
             status = "skew_below_threshold"
+        elif not shift_ok:
+            status = "odds_shift_below_min" if shift is not None else "no_odds_history"
         elif bet_eligible:
             status = f"bet_{direction}"
         return {
@@ -285,6 +331,8 @@ class FedEngine:
             "in_window": in_window,
             "meeting_date": next_date,
             "threshold": BET_SKEW_THRESHOLD,
+            "odds_shift": shift,
+            "min_odds_shift": min_shift,
         }
 
     def _maybe_poll_research(self) -> None:
@@ -327,7 +375,7 @@ class FedEngine:
                 "provider": "cme-fedwatch",
             }
 
-            store = self.state.fed_ledger
+            store = self._research_store()
             if store is not None:
                 store.save_research_snapshot(
                     summarized,
@@ -351,9 +399,13 @@ class FedEngine:
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("fed research poll failed", extra={"data": {"error": str(exc)}})
-            store = self.state.fed_ledger
+            store = self._research_store()
             if store is not None:
                 store.set_meta("last_research_error", str(exc))
+
+    def _research_store(self) -> Any:
+        """Where research snapshots go: the lane ledger (FED_ENABLED) or the research-only store."""
+        return self.state.fed_ledger
 
     def _fetch_fedwatch(self) -> dict[str, Any]:
         from cme_fedwatch import get_probabilities
@@ -477,6 +529,15 @@ class FedEngine:
         direction = decision.get("direction")
         if direction not in ("long", "short"):
             return
+        ok_t, why_t, _sma = self._trend_ok(product, direction, marks.get(product))
+        if not ok_t:
+            from snowball.futures.stops import _count, _throttled
+
+            _count(self.state, "fed_entry_filtered")
+            if _throttled(("fed_trend", product, why_t.split(":", 1)[0]), 3600.0):
+                log.info("fed entry filtered: no trend confirmation (fix B)",
+                         extra={"data": {"product": product, "direction": direction, "why": why_t}})
+            return
 
         allot = float(self._last_budget.get("per_index_usd") or 0.0)
         budget_left = float(self._last_budget.get("budget_usd") or allot)
@@ -492,6 +553,19 @@ class FedEngine:
             f"fed_desk:{direction}:dominant={decision.get('dominant')}:"
             f"max={float(decision.get('max_prob') or 0):.2f}:"
             f"meeting={decision.get('meeting_date')}"
+        )
+        signal_context.stage(
+            product, reason, lane="fed", strategy="fed_desk", action="entry", side=direction,
+            rule="FedWatch bet eligible: dominant outcome >= threshold inside meeting window + odds shift >= FED_MIN_ODDS_SHIFT + trend confirmed",
+            price=marks.get(product), now=now, timeframe="fomc",
+            indicators={k: decision.get(k) for k in ("dominant", "max_prob", "p_hold", "p_hike", "p_cut",
+                                                     "meeting_date", "days_left", "in_window", "bet_eligible")
+                        if k in decision},
+            research={"input": "CME FedWatch (Fed desk research)", "effect": "triggered this order",
+                      "meeting": decision.get("meeting_date"), "dominant": decision.get("dominant"),
+                      "max_prob": decision.get("max_prob")},
+            target={"min_take_profit_pct": settings.min_take_profit_pct, "exit": "green only; prefer day after FOMC"},
+            gates={"halted": bool(halted), "daily_killed": bool(daily_killed), "notional_usd": allot},
         )
         if direction == "long":
             self._open_long(
@@ -514,6 +588,85 @@ class FedEngine:
                 dominant=str(decision.get("dominant") or ""),
             )
 
+    def _exit_ok(self, lot: Position, px: float | None) -> tuple[bool, str]:
+        """Exit gate for every Fed path (scan, paper fill, live limit).
+
+        (B) 2026-10-10: FED_COVER_PCT (2.5%) net of real round-trip CFM fees when > 0, long or
+        short; else legacy MIN_TAKE_PROFIT_PCT + FEE_BUFFER_PCT. Never closes red.
+        """
+        settings = self.state.settings
+        cp = float(getattr(settings, "fed_cover_pct", 0.0) or 0.0)
+        short = str(lot.side).lower() == "short"
+        if cp <= 0:
+            if short:
+                return short_cover_allowed(lot.gate_entry_price, px, min_take_profit_pct=settings.min_take_profit_pct,
+                                           fee_buffer_pct=settings.fee_buffer_pct, never_cover_red=True)
+            return long_exit_allowed(lot.gate_entry_price, px, min_take_profit_pct=settings.min_take_profit_pct,
+                                     fee_buffer_pct=settings.fee_buffer_pct, never_sell_red=True)
+        if px is None or float(px) <= 0 or float(lot.gate_entry_price) <= 0:
+            return False, "no_mark"
+        q = float(lot.qty) if float(lot.qty) > 0 else 1.0
+        basis = float(lot.gate_entry_price)
+        gross = ((basis - float(px)) if short else (float(px) - basis)) * q
+        if gross < 0:
+            return False, "never_cover_red" if short else "never_sell_red"
+        fees = float(settings.fee_buffer_pct) * basis * q
+        if is_cfm_product(lot.product):
+            try:
+                from snowball.futures.stops import _aged_fees
+
+                ent, ex = _aged_fees(self.state, self.state.fed_ledger, lot, float(px))
+                fees = float(ent) + float(ex)
+            except Exception:  # noqa: BLE001
+                log.exception("fed exit fee estimate failed; using fee buffer")
+        if (gross - fees) / (basis * q) < cp:
+            return False, "below_take_profit"
+        return True, "ok"
+
+    def _trend_ok(self, product: str, direction: str, last: float | None) -> tuple[bool, str, float | None]:
+        """(B) Trend confirmation on daily closes: short needs last < SMA, long needs last > SMA."""
+        settings = self.state.settings
+        if not bool(getattr(settings, "fed_require_trend", True)):
+            return True, "trend_check_off", None
+        n = int(getattr(settings, "fed_trend_sma_days", 20) or 20)
+        cache = getattr(self, "_daily_cache", None)
+        if cache is None:
+            cache = self._daily_cache = {}
+        hit = cache.get(product)
+        closes = None
+        if hit and time.monotonic() - hit[0] < 1800.0:
+            closes = hit[1]
+        else:
+            try:
+                rows = self.market.fetch_ohlcv(product, "1d", max(n + 5, 40))
+                closes = [float(r[4]) for r in rows if len(r) >= 5]
+                cache[product] = (time.monotonic(), closes)
+            except Exception:  # noqa: BLE001
+                log.exception("fed daily candles failed", extra={"data": {"product": product}})
+                closes = None
+        avg = sma(closes or [], n)
+        px = float(last) if last is not None and float(last) > 0 else (float(closes[-1]) if closes else None)
+        if avg is None or px is None:
+            return False, "no_trend_data", avg
+        if direction == "short" and not px < avg:
+            return False, f"no_downtrend:{px:.2f}>=sma{n}:{avg:.2f}", avg
+        if direction == "long" and not px > avg:
+            return False, f"no_uptrend:{px:.2f}<=sma{n}:{avg:.2f}", avg
+        return True, "ok", avg
+
+    def _stop_book(self, lot: Position, fill_px: float, fee_usd: float, reason: str, now: datetime) -> float:
+        store = self.state.fed_ledger
+        assert store is not None
+        if lot.side == "short":
+            fill = store.cover_short(lot.id, fill_px=fill_px, slippage_bps=0.0, fee_usd=fee_usd, reason=reason, ts=now)
+            realized = (lot.entry_price - fill.price) * fill.qty - fill.fee_usd
+        else:
+            fill = store.close_long(lot.id, fill_px=fill_px, slippage_bps=0.0, fee_usd=fee_usd, reason=reason, ts=now)
+            realized = (fill.price - lot.entry_price) * fill.qty - fill.fee_usd
+        if lot.product in self.state.fed_pairs:
+            self.state.fed_pairs[lot.product].open_count = store.open_count(lot.product)
+        return realized
+
     def _maybe_exit(
         self,
         product: str,
@@ -528,21 +681,9 @@ class FedEngine:
         after = prefer_exit_after_fomc(meeting) if meeting else False
         for lot in lots:
             if lot.side == "short":
-                ok, why = short_cover_allowed(
-                    lot.entry_price,
-                    mark,
-                    min_take_profit_pct=settings.min_take_profit_pct,
-                    fee_buffer_pct=settings.fee_buffer_pct,
-                    never_cover_red=True,
-                )
+                ok, why = self._exit_ok(lot, mark)
             else:
-                ok, why = long_exit_allowed(
-                    lot.entry_price,
-                    mark,
-                    min_take_profit_pct=settings.min_take_profit_pct,
-                    fee_buffer_pct=settings.fee_buffer_pct,
-                    never_sell_red=True,
-                )
+                ok, why = self._exit_ok(lot, mark)
             if not ok:
                 log.info(
                     "fed exit refused",
@@ -562,6 +703,15 @@ class FedEngine:
             reason = "fed_desk:take_profit"
             if after:
                 reason = "fed_desk:post_fomc_green_exit"
+            signal_context.stage(
+                product, reason, lane="fed", strategy="fed_desk", action="exit",
+                side=("buy" if lot.side == "short" else "sell"),
+                rule=("post-FOMC green exit" if after else "green >= floor"), price=mark, now=now,
+                floor={"min_take_profit_pct": settings.min_take_profit_pct, "fee_buffer_pct": settings.fee_buffer_pct,
+                       "fed_cover_pct_net": float(getattr(settings, "fed_cover_pct", 0.0) or 0.0)},
+                gates={"never_sell_red/never_cover_red": True, "exit_check": why, "after_fomc": bool(after),
+                       "lot": {"id": lot.id, "side": lot.side, "entry": lot.gate_entry_price}},
+            )
             self._close_lot(product, lot, marks, reason=reason, now=now)
 
     def _open_long(
@@ -579,6 +729,11 @@ class FedEngine:
         store = self.state.fed_ledger
         assert store is not None
         if store.open_count(product) >= settings.fed_max_positions:
+            return
+        from snowball.futures.stops import futures_entry_gate
+
+        if not futures_entry_gate(self.state, product, "fed", now, side="long", market=self.market,
+                                  live=bool(settings.fed_live_orders_permitted()))[0]:
             return
         if settings.fed_live_orders_permitted():
             self._open_side_live(
@@ -646,6 +801,11 @@ class FedEngine:
         store = self.state.fed_ledger
         assert store is not None
         if store.open_count(product) >= settings.fed_max_positions:
+            return
+        from snowball.futures.stops import futures_entry_gate
+
+        if not futures_entry_gate(self.state, product, "fed", now, side="short", market=self.market,
+                                  live=bool(settings.fed_live_orders_permitted()))[0]:
             return
         if settings.fed_live_orders_permitted():
             self._open_side_live(
@@ -859,23 +1019,21 @@ class FedEngine:
         _refuse_unless_paper_or_dual_live(settings)
         store = self.state.fed_ledger
         assert store is not None
+        from snowball.futures.stops import _throttled, close_pending, is_netted
+
+        if is_netted(self.state, "fed", lot.id):
+            log.info("fed exit skipped: netted pair (bookkeeping only)", extra={"data": {"position_id": lot.id}})
+            return
+        if close_pending(self.state, "fed", lot.id):
+            if _throttled(("close_pending", "fed", lot.id)):
+                log.info("fed exit skipped: stop/aged-exit order already in flight for this lot",
+                         extra={"data": {"position_id": lot.id}})
+            return
         mark = marks.get(product)
         if lot.side == "short":
-            ok, why = short_cover_allowed(
-                lot.entry_price,
-                mark,
-                min_take_profit_pct=settings.min_take_profit_pct,
-                fee_buffer_pct=settings.fee_buffer_pct,
-                never_cover_red=True,
-            )
+            ok, why = self._exit_ok(lot, mark)
         else:
-            ok, why = long_exit_allowed(
-                lot.entry_price,
-                mark,
-                min_take_profit_pct=settings.min_take_profit_pct,
-                fee_buffer_pct=settings.fee_buffer_pct,
-                never_sell_red=True,
-            )
+            ok, why = self._exit_ok(lot, mark)
         if not ok:
             return
         if settings.fed_live_orders_permitted():
@@ -888,13 +1046,7 @@ class FedEngine:
         if paper_px is None or paper_px <= 0:
             return
         if lot.side == "short":
-            ok2, why2 = short_cover_allowed(
-                lot.entry_price,
-                paper_px,
-                min_take_profit_pct=settings.min_take_profit_pct,
-                fee_buffer_pct=settings.fee_buffer_pct,
-                never_cover_red=True,
-            )
+            ok2, why2 = self._exit_ok(lot, paper_px)
             if not ok2:
                 return
             fill = store.cover_short(
@@ -906,13 +1058,7 @@ class FedEngine:
                 ts=now,
             )
         else:
-            ok2, why2 = long_exit_allowed(
-                lot.entry_price,
-                paper_px,
-                min_take_profit_pct=settings.min_take_profit_pct,
-                fee_buffer_pct=settings.fee_buffer_pct,
-                never_sell_red=True,
-            )
+            ok2, why2 = self._exit_ok(lot, paper_px)
             if not ok2:
                 return
             fill = store.close_long(
@@ -984,27 +1130,24 @@ class FedEngine:
             if limit_px is None or limit_px <= 0:
                 return
             if lot.side == "short":
-                ok, why = short_cover_allowed(
-                    lot.entry_price,
-                    limit_px,
-                    min_take_profit_pct=settings.min_take_profit_pct,
-                    fee_buffer_pct=settings.fee_buffer_pct,
-                    never_cover_red=True,
-                )
+                ok, why = self._exit_ok(lot, limit_px)
             else:
-                ok, why = long_exit_allowed(
-                    lot.entry_price,
-                    limit_px,
-                    min_take_profit_pct=settings.min_take_profit_pct,
-                    fee_buffer_pct=settings.fee_buffer_pct,
-                    never_sell_red=True,
-                )
+                ok, why = self._exit_ok(lot, limit_px)
             if not ok:
                 log.info(
                     "fed live exit refused at limit",
                     extra={"data": {"product": product, "why": why, "limit_px": limit_px}},
                 )
                 return
+            if is_cfm_product(product):
+                from snowball.futures.stops import verify_close_allowed
+
+                ok_pos, why_pos, ex_n = verify_close_allowed(self.market, product, lot.side, int(amount))
+                if not ok_pos:
+                    log.error("fed live exit refused by exchange-position check",
+                              extra={"data": {"product": product, "position_id": lot.id, "why": why_pos,
+                                              "exchange_contracts": ex_n}})
+                    return
             timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
             order = self.market.create_swap_maker_limit_order(
                 product,
@@ -1074,6 +1217,58 @@ class FedEngine:
             except Exception:  # noqa: BLE001
                 log.exception("fed tick failed")
             time.sleep(max(1.0, float(settings.fed_poll_seconds)))
+
+
+class FedResearchRunner(FedEngine):
+    """FedWatch research ONLY, for FED_ENABLED=false + FED_RESEARCH_ENABLED=true (Tb 2026-10-16).
+
+    Same 3-hourly poll / summary / snapshot rows as the full lane (``_maybe_poll_research``),
+    written to snowball_fed.db so the research report keeps its Fed section. It never builds a
+    market/order client, never sets ``state.fed_ledger`` / ``state.fed_engine`` (so no stop,
+    roll, entry or exit path sees a Fed lane), and every order-capable method is refused.
+    """
+
+    def __init__(self, state: AppState, store: Any) -> None:  # noqa: D107 - no super(): no market
+        self.state = state
+        self._store = store
+        self.market = None
+        self._roll = None
+        self._last_budget = {"account_value_usd": 0.0, "budget_usd": 0.0, "per_index_usd": 0.0}
+        self._last_research: dict[str, Any] = {}
+        self._last_research_poll_mono = 0.0
+        self._bet_status = "disabled"
+
+    def _research_store(self) -> Any:
+        return self._store
+
+    def tick(self) -> None:
+        if not getattr(self.state.settings, "fed_research_enabled", True):
+            return
+        self._maybe_poll_research()
+
+    def __getattribute__(self, name: str) -> Any:
+        # Hard refusal of anything that could trade (entries, exits, stops, rolls, flatten).
+        if name.startswith(("_open", "_close", "_enter", "_exit", "_place", "_flatten", "_stop",
+                            "_act", "_maybe_bet", "_maybe_exit", "_bet", "_live", "_paper",
+                            "_update_pair", "_refresh_budget", "_roll")):
+            raise RuntimeError(f"FedResearchRunner refuses {name}: FED_ENABLED=false (research only)")
+        return object.__getattribute__(self, name)
+
+
+def attach_fed_research(state: AppState) -> FedResearchRunner | None:
+    """FedWatch research-only runner when FED_ENABLED=false and FED_RESEARCH_ENABLED=true."""
+    settings = state.settings
+    if settings.fed_enabled or not getattr(settings, "fed_research_enabled", True):
+        return None
+    store = FedStore(settings.fed_sqlite_path, settings.fed_bankroll_usd)
+    runner = FedResearchRunner(state, store)
+    state.fed_research_engine = runner
+    log.warning(
+        "Fed Desk research-only attached (FED_ENABLED=false; no Fed orders)",
+        extra={"data": {"sqlite": str(settings.fed_sqlite_path),
+                        "research_poll_seconds": settings.fed_research_poll_seconds}},
+    )
+    return runner
 
 
 def attach_fed_lane(state: AppState) -> FedEngine | None:

@@ -25,7 +25,10 @@ def create_app(state: AppState) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        return {"ok": True, "mode": state.settings.mode, "paper": True}
+        s = state.settings
+        # Same rule as snapshot.status.paper (was hardcoded True before 2026-10-10).
+        return {"ok": True, "mode": s.mode,
+                "paper": bool(s.mode == "paper" and not bool(getattr(s, "live_enabled", False)))}
 
     @app.get("/")
     def index() -> FileResponse:

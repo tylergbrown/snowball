@@ -73,14 +73,26 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
         positions = []
         for pos in ledger.open_positions():
             mark = marks.get(pos.product, pos.entry_price)
-            u_pnl = (mark - pos.entry_price) * pos.qty
+            if pos.side == "short":
+                u_pnl = (pos.entry_price - mark) * pos.qty
+            else:
+                u_pnl = (mark - pos.entry_price) * pos.qty
+            try:
+                from snowball.futures.market import contract_size_for_product
+
+                _cs = contract_size_for_product(pos.product)
+            except Exception:  # noqa: BLE001
+                _cs = 1.0
             positions.append(
                 {
                     "id": pos.id,
                     "product": pos.product,
                     "side": pos.side,
                     "qty": pos.qty,
+                    "contract_size": _cs,
+                    "contracts": (round(pos.qty / _cs, 6) if _cs else pos.qty),
                     "entry_price": pos.entry_price,
+                    "roll_basis_price": pos.roll_basis,
                     "mark": mark,
                     "notional_usd": pos.notional_usd,
                     "unrealized_pnl": u_pnl,
@@ -174,11 +186,30 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
 
         times = session_times_from_settings(settings)
         mode_label = "live" if live else "paper"
+        pct = int(round(float(settings.futures_account_budget_pct) * 100))
         label = (
-            "Future Trader — session+momentum LIVE (dual-gated); CFM US500/TECH ~30%; never-sell-red"
+            f"Futures — session+momentum+stock strategies LIVE (dual-gated); CFM ~{pct}%; "
+            "one net position per product; never-sell-red"
             if live
-            else "Future Trader — session+momentum paper; isolated book (~30% budget)"
+            else f"Futures — session+momentum+stock strategies paper; isolated book (~{pct}% budget)"
         )
+        eng = getattr(state, "futures_engine", None)
+        merged = None
+        try:
+            if eng is not None and getattr(eng, "_stock", None) is not None:
+                merged = eng._stock.payload()
+        except Exception:  # noqa: BLE001
+            merged = None
+        try:
+            from snowball.futures.stock_strategies import (
+                combined_futures_closed_pnl,
+                legacy_stock_archive,
+            )
+
+            legacy = legacy_stock_archive(settings)
+            combined = combined_futures_closed_pnl(settings)
+        except Exception:  # noqa: BLE001
+            legacy, combined = None, None
 
         return {
             "enabled": True,
@@ -253,11 +284,25 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
                 "sma_min_take_profit_pct": getattr(settings, "sma_min_take_profit_pct", 0.08),
                 "effective_sma_take_profit_floor": settings.effective_min_take_profit_pct_for("sma_15m"),
                 "never_sell_red": settings.never_sell_red,
+                "net_green_close": {
+                    "buffer_usd": float(getattr(settings, "futures_net_green_buffer_usd", 0.50)),
+                    "fee_pct_per_side": float(getattr(settings, "futures_fee_pct_per_side", 0.0)),
+                    "fee_per_contract": float(getattr(settings, "futures_fee_per_contract", 0.12)),
+                    "applies_to": "all FT closes incl. HALT/daily-loss flatten; contract_roll exempt",
+                },
                 "cfm_max_contracts": settings.cfm_max_contracts,
                 "cfm_leverage": settings.cfm_leverage,
                 "cfm_margin_rate": settings.cfm_margin_rate,
                 "venue": "CFM_CDE",
             },
+            "contract_rolls": (getattr(state, "contract_roll_status", {}) or {}).get("futures", {}),
+            "stops": _stops_payload(state),
+            # Task 10: STOCK lane merged into this lane
+            "lane_name": "Futures",
+            "merged_lanes": ["futures", "stocks"],
+            "merged_stock": merged,
+            "legacy_stock_lane": legacy,
+            "combined_closed_pnl": combined,
             "products": products,
             "pairs": pairs,
             "positions": positions,
@@ -266,3 +311,13 @@ def build_futures_snapshot(state: AppState) -> dict[str, Any]:
             "scorecard": ledger.scorecard(),
             "pair_pauses": [p for p in pause_rows.values() if p.get("active")],
         }
+
+
+def _stops_payload(state):
+    """Futures stops / liquidation guard / netted pairs / one-index gate (2026-10-01)."""
+    try:
+        from snowball.futures.stops import stops_snapshot
+
+        return stops_snapshot(state)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}

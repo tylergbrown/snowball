@@ -19,9 +19,15 @@ log = logging.getLogger("snowball.futures.market")
 
 # CFM CDE index perps (verified via public product_type=FUTURE list).
 # ccxt unified symbols include the Dec-2030 expiry suffix Coinbase currently lists.
+# 2026-09-30: + BTC nano perp-style (BIP, 0.01 BTC/contract) and nano crude oil
+# (NOL, 10 bbl/contract, dated monthly — roll by editing FUTURES_PRODUCTS).
+# Symbols/contract sizes/ticks verified with ccxt 4.5.82 load_markets() on the live account.
 PRODUCT_TO_CCXT: dict[str, str] = {
     "US5-19DEC30-CDE": "CDEUS5/USD:USD-301219",  # display: US 500 PERP
     "TEK-19DEC30-CDE": "CDETEK/USD:USD-301219",  # display: TECH PERP / Tech100
+    "BIP-20DEC30-CDE": "BTC/USD:USD-891230",  # display: BTC PERP (nano, 0.01 BTC)
+    "NOL-19OCT26-CDE": "CDEOIL/USD:USD-261019",  # display: OIL 19 OCT 26 (nano crude, 10 bbl)
+    "NOL-19NOV26-CDE": "CDEOIL/USD:USD-261119",  # next oil month (view-only on 2026-09-30)
 }
 
 # Human / legacy aliases → canonical CFM product id
@@ -40,6 +46,13 @@ PRODUCT_ALIASES: dict[str, str] = {
     "TECH": "TEK-19DEC30-CDE",
     "TECH100": "TEK-19DEC30-CDE",
     "TECH-PERP": "TEK-19DEC30-CDE",
+    # BTC: US perp-style CFM only (INTX BTC-PERP-INTX is denied on this account).
+    "BIP": "BIP-20DEC30-CDE",
+    "BTC-PERP-CDE": "BIP-20DEC30-CDE",
+    "BTC-CDE": "BIP-20DEC30-CDE",
+    # Crude: current front month (update when rolling).
+    "NOL": "NOL-19OCT26-CDE",
+    "OIL": "NOL-19OCT26-CDE",
 }
 
 DEFAULT_FUTURES_PRODUCTS: tuple[str, ...] = (
@@ -53,11 +66,48 @@ DEFAULT_FUTURES_PRODUCTS: tuple[str, ...] = (
 CFM_TICK_SIZE: dict[str, float] = {
     "US5-19DEC30-CDE": 0.1,
     "TEK-19DEC30-CDE": 1.0,
+    "BIP-20DEC30-CDE": 5.0,
+    "NOL-19OCT26-CDE": 0.01,
+    "NOL-19NOV26-CDE": 0.01,
+}
+
+# Underlying units per 1 contract (future_product_details.contract_size).
+# Ledger qty is stored in UNDERLYING units (contracts * contract_size) so
+# qty * price == USD notional and (exit-entry)*qty == USD P&L everywhere
+# (ledger, snapshot, PDF). Orders convert back to integer contracts.
+# US5/TEK are 1.0, so their behaviour is unchanged.
+CFM_CONTRACT_SIZE: dict[str, float] = {
+    "US5-19DEC30-CDE": 1.0,
+    "TEK-19DEC30-CDE": 1.0,
+    "BIP-20DEC30-CDE": 0.01,
+    "NOL-19OCT26-CDE": 10.0,
+    "NOL-19NOV26-CDE": 10.0,
+}
+
+# Conservative exchange OVERNIGHT margin rates (long, short) from
+# future_product_details on 2026-09-30. Sizing/affordability uses
+# max(CFM_MARGIN_RATE, this) so BTC's ~25-31% overnight margin is respected;
+# US5/TEK (6-7%) stay at the 10% CFM_MARGIN_RATE floor (unchanged).
+CFM_OVERNIGHT_MARGIN_RATE: dict[str, tuple[float, float]] = {
+    "US5-19DEC30-CDE": (0.06325, 0.067625),
+    "TEK-19DEC30-CDE": (0.0695, 0.074125),
+    "BIP-20DEC30-CDE": (0.245625, 0.306375),
+    "NOL-19OCT26-CDE": (0.138125, 0.161),
+    "NOL-19NOV26-CDE": (0.138, 0.161),
+}
+
+# Contract expiry (UTC) for dated contracts; perps/perp-style omitted.
+CFM_EXPIRY_UTC: dict[str, str] = {
+    "NOL-19OCT26-CDE": "2026-10-19T18:30:00+00:00",
+    "NOL-19NOV26-CDE": "2026-11-19T19:30:00+00:00",
 }
 
 CFM_DISPLAY_NAMES: dict[str, str] = {
     "US5-19DEC30-CDE": "US 500 PERP",
     "TEK-19DEC30-CDE": "TECH PERP",
+    "BIP-20DEC30-CDE": "BTC PERP",
+    "NOL-19OCT26-CDE": "OIL 19 OCT 26",
+    "NOL-19NOV26-CDE": "OIL 19 NOV 26",
 }
 
 _STABLES = ("USD", "USDC", "USDT")
@@ -132,6 +182,60 @@ def cfm_display_name(product: str) -> str:
     return CFM_DISPLAY_NAMES.get(pid, pid)
 
 
+def contract_size_for_product(product: str, exchange: object | None = None) -> float:
+    """Underlying units per CFM contract (BTC nano 0.01, crude 10, US5/TEK 1).
+
+    Prefers the static table (verified); falls back to ccxt market contractSize,
+    then 1.0. Non-CFM products return 1.0.
+    """
+    pid = normalize_futures_product(product)
+    if not is_cfm_product(pid):
+        return 1.0
+    if pid in CFM_CONTRACT_SIZE:
+        return float(CFM_CONTRACT_SIZE[pid])
+    try:
+        if exchange is not None:
+            markets = getattr(exchange, "markets", None) or {}
+            market = markets.get(to_futures_ccxt_symbol(pid)) if isinstance(markets, dict) else None
+            if isinstance(market, dict) and market.get("contractSize"):
+                cs = float(market["contractSize"])
+                if cs > 0:
+                    return cs
+    except Exception:
+        log.debug("contract_size_for_product fallback for %s", pid, exc_info=True)
+    return 1.0
+
+
+def margin_rate_for_product(product: str, side: str = "long", base_rate: float = 0.10) -> float:
+    """max(base CFM_MARGIN_RATE, exchange overnight rate for this product/side)."""
+    pid = normalize_futures_product(product)
+    base = max(0.0, float(base_rate))
+    rates = CFM_OVERNIGHT_MARGIN_RATE.get(pid)
+    if not rates:
+        return base
+    r = rates[1] if str(side).lower() in ("short", "sell") else rates[0]
+    return max(base, float(r))
+
+
+def expiry_for_product(product: str) -> datetime | None:
+    pid = normalize_futures_product(product)
+    raw = CFM_EXPIRY_UTC.get(pid)
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def contracts_from_qty(product: str, qty: float, exchange: object | None = None) -> int:
+    """Integer contracts for a ledger qty stored in underlying units."""
+    cs = contract_size_for_product(product, exchange)
+    if cs <= 0:
+        cs = 1.0
+    return max(1, int(round(float(qty) / cs)))
+
+
 def normalize_futures_product(product: str) -> str:
     """Normalize to Coinbase product id (CFM ``*-CDE`` or INTX ``*-PERP-INTX``)."""
     p = product.strip().upper().replace("_", "-")
@@ -196,8 +300,13 @@ def order_size_for_product(
     leverage: float = 1.0,
     margin_rate: float = 0.10,
     lane_max_notional_usd: float | None = None,
+    contract_size: float | None = None,
 ) -> float:
     """Return order amount: integer CFM contracts, else INTX base-coin size.
+
+    ``contract_size`` (underlying units per contract) defaults to the product's
+    CFM_CONTRACT_SIZE (1.0 for US5/TEK) so BTC nano (0.01) and crude (10 bbl)
+    margin is computed on the real contract notional.
 
     For CFM, floor ``budget_usd`` with :func:`cfm_sizing_budget_usd` so INTX-era
     per-leg soft caps (~$118) cannot yield contracts=0 when lane MAX_NOTIONAL
@@ -209,6 +318,7 @@ def order_size_for_product(
     if price <= 0:
         return 0.0
     if is_cfm_product(product):
+        cs = float(contract_size) if contract_size else contract_size_for_product(product)
         lane_max = float(lane_max_notional_usd or 0.0)
         budget = cfm_sizing_budget_usd(
             float(notional_usd),
@@ -217,6 +327,7 @@ def order_size_for_product(
             leverage=float(leverage),
             margin_rate=float(margin_rate),
             max_contracts=int(max_contracts),
+            contract_size=cs,
         )
         # Lift avail the same way when lane_max is set so both gates agree.
         avail = max(float(available_margin_usd), float(notional_usd), lane_max)
@@ -228,6 +339,7 @@ def order_size_for_product(
                 max_contracts=int(max_contracts),
                 leverage=float(leverage),
                 margin_rate=float(margin_rate),
+                contract_size=cs,
             )
         )
     return round_amount_down(float(notional_usd) / float(price), 0.01)
@@ -543,6 +655,63 @@ class CoinbaseFuturesMarket:
             symbol, "market", side_l, qty, None, params
         )
         return self._settle_order(order if isinstance(order, dict) else {}, symbol)
+
+    def create_swap_limit_close_order(
+        self,
+        product: str,
+        side: str,
+        amount: float,
+        *,
+        price: float,
+        leverage: float = 1.0,
+    ) -> dict[str, Any]:
+        """Non-post-only GTC limit for a stop/liq-guard close (2026-10-30, live-20261030a).
+
+        Coinbase rejects MARKET orders on CFM index futures outside the core session
+        (PREVIEW_FUTURES_AFTER_HOUR_INVALID_ORDER_TYPE) but accepts / queues LIMIT orders.
+        The caller prices it marketable (worst touch +/- collar). Polls briefly for a fill and
+        NEVER cancels on timeout: a queued after-hours order keeps working and the stop path
+        monitors it by order id.
+        """
+        from snowball.maker import round_to_tick
+
+        if not self._allow_orders:
+            raise RuntimeError("futures create_swap_limit_close_order refused: allow_orders=False")
+        if amount <= 0 or price is None or float(price) <= 0:
+            raise ValueError("amount and price must be positive")
+        side_l = (side or "").lower()
+        if side_l not in ("buy", "sell"):
+            raise ValueError(f"invalid side {side!r}")
+        pid = normalize_futures_product(product)
+        symbol = to_futures_ccxt_symbol(pid)
+        cfm = is_cfm_product(pid)
+        tick = tick_size_for_product(pid, self._exchange) if cfm else None
+        limit_px = round_to_tick(float(price), tick, direction="up" if side_l == "buy" else "down")
+        qty = float(int(round(float(amount)))) if cfm else float(amount)
+        if qty <= 0 or limit_px is None or limit_px <= 0:
+            raise ValueError("amount and price must be positive")
+        params: dict[str, Any] = {"leverage": leverage_param(leverage), "timeInForce": "GTC"}
+        log.warning("futures closing LIMIT (stop / liq guard)", extra={"data": {
+            "product": pid, "side": side_l, "qty": qty, "limit_px": limit_px, "tick": tick}})
+        order = self._exchange.create_order(  # type: ignore[attr-defined]
+            symbol, "limit", side_l, qty, float(limit_px), params
+        )
+        out = self._settle_order(order if isinstance(order, dict) else {}, symbol)
+        if isinstance(out, dict):
+            out.setdefault("limit_px", limit_px)
+        return out
+
+    def fetch_order_safe(self, order_id: str, product: str) -> dict[str, Any] | None:
+        """READ an order by id (None on error). Used to monitor a working closing limit."""
+        fetch = getattr(self._exchange, "fetch_order", None)
+        if not callable(fetch) or not order_id:
+            return None
+        try:
+            o = fetch(str(order_id), to_futures_ccxt_symbol(normalize_futures_product(product)))
+        except Exception:  # noqa: BLE001
+            log.exception("futures fetch_order failed for %s", order_id)
+            return None
+        return o if isinstance(o, dict) else None
 
     def create_swap_maker_limit_order(
         self,

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from snowball.signal_context import attach_fill_context, ensure_fill_context_columns
+
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from snowball.models import Fill, Position, utcnow
+from snowball.roll_basis import attach_roll_basis
 
 
 def _parse_ts(value: str) -> datetime:
@@ -129,6 +132,7 @@ class PaperLedger:
             )
             """
         )
+        ensure_fill_context_columns(self._conn)
         self._conn.commit()
 
     def _ensure_account(self) -> None:
@@ -207,7 +211,7 @@ class PaperLedger:
                 args.append(strategy)
             sql += " ORDER BY id"
             rows = self._conn.execute(sql, args).fetchall()
-            return [self._position(r) for r in rows]
+            return attach_roll_basis(self._conn, [self._position(r) for r in rows])
 
     def open_count(self, product: str, strategy: str | None = None) -> int:
         return len(self.open_positions(product, strategy=strategy))
@@ -324,6 +328,7 @@ class PaperLedger:
                 ),
             )
             fill_id = int(cur.execute("SELECT last_insert_rowid()").fetchone()[0])
+            attach_fill_context(cur, fill_id)
             cur.commit()
             pos = Position(
                 id=pos_id,
@@ -407,6 +412,7 @@ class PaperLedger:
                 ),
             )
             fill_id = int(self._conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            attach_fill_context(self._conn, fill_id)
             self._conn.commit()
             return Fill(
                 id=fill_id,

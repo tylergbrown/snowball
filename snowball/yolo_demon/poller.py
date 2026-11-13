@@ -376,6 +376,13 @@ class YoloDemonSidecar:
             fetched_at=now,
         )
         mention_tickers = tickers if tickers else [WATCH_TICKER]
+        if not tickers:
+            # transcript already produced tickers for this video: no WATCH placeholder
+            try:
+                if self.store.transcript_tickers(vid.video_id):
+                    mention_tickers = []
+            except Exception:  # noqa: BLE001
+                pass
         posts = 0
         for ticker in mention_tickers:
             if self.store.upsert_mention(

@@ -151,9 +151,11 @@ def indicator_filters_allow(
 
 def lot_unrealized_pnl_pct(lot: Position, mark: float | None) -> float | None:
     """(mark - entry) / entry, or None if mark/entry unusable."""
-    if mark is None or mark <= 0 or lot.entry_price <= 0:
+    # gate_entry_price = carried roll basis after a contract roll, else entry_price
+    base = float(getattr(lot, "gate_entry_price", lot.entry_price) or 0.0)
+    if mark is None or mark <= 0 or base <= 0:
         return None
-    return (mark - lot.entry_price) / lot.entry_price
+    return (mark - base) / base
 
 
 def strategy_exit_allowed(
@@ -297,4 +299,24 @@ def is_stall_exit_reason(reason: str) -> bool:
     """True for CFM intraday stall take-profit close reasons."""
     base = reason.split(":", 1)[0]
     return reason in STALL_EXIT_REASONS or base in STALL_EXIT_REASONS
+
+
+def never_sell_treasury_allowed(
+    *,
+    product: str,
+    sell_qty: float,
+    wallet_btc: float | None,
+    reserved_btc: float,
+    never_sell_treasury: bool = True,
+) -> tuple[bool, str]:
+    """Hard-block hook: refuse BTC sells that would invade reserved treasury qty."""
+    from snowball.treasury.reserve import treasury_btc_sell_allowed
+
+    return treasury_btc_sell_allowed(
+        product=product,
+        sell_qty=sell_qty,
+        wallet_btc=wallet_btc,
+        reserved_btc=reserved_btc,
+        enabled=never_sell_treasury,
+    )
 
