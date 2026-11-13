@@ -162,6 +162,10 @@ def build_snapshot(state: AppState) -> dict:
                 "start_of_day_equity": start_eq,
                 "unrealized_pnl_usd": state.ledger.unrealized_pnl(marks),
                 "max_positions_per_pair": settings.max_positions_per_pair,
+                "dust_usd": float(getattr(settings, "dust_usd", 5.0)),
+                "dust_buy_stats": getattr(state, "dust_buy_stats", None) or {},
+                "spot_usd_floor": {"floor_usd": float(getattr(settings, "spot_usd_floor", 0.0) or 0.0),
+                                   **(getattr(state, "spot_floor_stats", None) or {})},
                 "max_position_notional_usd": settings.effective_per_leg_notional_usd(
                     float(
                         getattr(state, "futures_account_value_usd", None)
@@ -183,6 +187,7 @@ def build_snapshot(state: AppState) -> dict:
                 "per_leg_scale_per_100_usd_pct": settings.per_leg_scale_per_100_usd_pct,
                 "open_positions": len(positions),
                 "max_book_positions": settings.max_positions_per_pair * len(settings.product_list),
+                "treasury_reserve": _treasury_reserve_payload(state, marks),
             },
             "pairs": pairs,
             "positions": positions,
@@ -197,7 +202,71 @@ def build_snapshot(state: AppState) -> dict:
             "futures": build_futures_snapshot(state),
             "crash": build_crash_snapshot(state),
             "fed": build_fed_snapshot(state),
+            "contract_rolls": _contract_rolls_payload(state),
+            "research_digest": _research_digest_payload(state),
+            "forward_guidance": _forward_guidance_payload(state),
         }
+
+
+def _forward_guidance_payload(state: AppState) -> dict:
+    """Forward Guidance (Tb 10/3): latest daily run (regimes, probabilities, playbook, scorecard)."""
+    try:
+        from snowball.forward.report import compact
+
+        fg = getattr(state, "forward_guidance", None) or None
+        if not fg and bool(getattr(state.settings, "forward_enabled", False)):
+            from snowball.forward.runner import load_latest
+
+            fg = load_latest(state.settings)
+        out = compact(fg)
+        r = getattr(state, "forward_runner", None)
+        if r is not None and getattr(r, "last_error", None):
+            out["last_error"] = r.last_error
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return {"state": "error", "error": str(exc)[:160]}
+
+
+_RESEARCH_DIGEST_CACHE: dict = {"at": 0.0, "data": None}
+
+
+def _research_digest_payload(state: AppState) -> dict:
+    """Mirror of the PDF 'videos learned today' + 'prospective plays' (cached 120s; read-only)."""
+    import time as _time
+
+    now_m = _time.monotonic()
+    if _RESEARCH_DIGEST_CACHE["data"] is not None and now_m - _RESEARCH_DIGEST_CACHE["at"] < 120.0:
+        return _RESEARCH_DIGEST_CACHE["data"]
+    try:
+        from pathlib import Path as _P
+
+        from snowball.reports.research_report import research_digest
+
+        data_dir = _P(getattr(state.settings, "sqlite_path", "./data/snowball.db")).parent
+        out = research_digest(data_dir, min_prob=float(getattr(state.settings, "research_exec_min_prob", 0.70) or 0.70))
+    except Exception as exc:  # noqa: BLE001
+        out = {"error": str(exc)[:160]}
+    _RESEARCH_DIGEST_CACHE.update({"at": now_m, "data": out})
+    return out
+
+
+def _contract_rolls_payload(state: AppState) -> dict:
+    """All-lane contract roll status; ``alerts`` non-empty => tell Tb."""
+    raw = getattr(state, "contract_roll_status", None) or {}
+    items = []
+    for lane, entries in raw.items():
+        for key, st in (entries or {}).items():
+            row = dict(st)
+            row.setdefault("lane", lane)
+            row["key"] = key
+            items.append(row)
+    alerts = [r for r in items if r.get("alert")]
+    return {
+        "auto_roll": bool(getattr(state.settings, "futures_auto_roll", True)),
+        "window_days": float(getattr(state.settings, "futures_expiry_entry_block_days", 3.0) or 3.0),
+        "items": items,
+        "alerts": alerts,
+    }
 
 
 def _watcher_payload(state: AppState) -> dict:
@@ -227,6 +296,18 @@ def _watcher_payload(state: AppState) -> dict:
         "latest_press": press,
         "rates": rates,
     }
+
+
+def _yolo_transcripts_payload(state: AppState) -> dict:
+    worker = getattr(state, "yolo_transcripts", None)
+    try:
+        if worker is not None:
+            return worker.status_payload()
+        if state.yolo is not None and hasattr(state.yolo, "transcript_status_counts"):
+            return {"enabled": False, "counts": state.yolo.transcript_status_counts()}
+    except Exception:  # noqa: BLE001
+        return {"error": "unavailable"}
+    return {}
 
 
 def _yolo_payload(state: AppState) -> dict:
@@ -276,6 +357,7 @@ def _yolo_payload(state: AppState) -> dict:
         "last_poll_at": last_poll.isoformat() if hasattr(last_poll, "isoformat") else last_poll,
         "last_error": last_error,
         "ideas": ideas,
+        "transcripts": _yolo_transcripts_payload(state),
         "priority_videos": priority_videos,
         "youtube_backfill_done": backfill_done,
         "youtube_backfill_counts": backfill_counts,
@@ -391,5 +473,159 @@ def _earnings_payload(state: AppState) -> dict:
         "upcoming": upcoming,
         "recent_reported": recent,
         "poll_seconds": float(getattr(settings, "earnings_poll_seconds", 14400.0)),
+    }
+
+
+def _treasury_dca_payload(settings) -> dict:
+    """Treasury daily profit dividend: label, rule, today's status, window net, history (read-only).
+
+    Legacy keys (contribution_schedule, dividend_label, dividend_kind, dca_time_ct,
+    dca_today, dca_last_skip) are kept for compatibility; full detail is under
+    ``dividend`` (see snowball.treasury.dca.dividend_status).
+    """
+    from pathlib import Path
+
+    from snowball.treasury.dca import DAILY_PROFIT_MIN_USD, DAILY_TARGET_USD, KIND, LABEL, RED_DAY_FLOOR_USD, RULE_TEXT, dividend_status, kind_label
+
+    out: dict = {"contribution_schedule": LABEL, "dividend_rule": RULE_TEXT, "dividend_kind": KIND,
+                 "dividend_label": kind_label(KIND), "red_day_floor_usd": RED_DAY_FLOOR_USD,
+                 "daily_target_usd": DAILY_TARGET_USD, "daily_profit_min_usd": DAILY_PROFIT_MIN_USD,
+                 "daily_target": None, "topup_unlocked": False,
+                 "dca_time_ct": _dca_time_ct(), "dca_today": None, "dividend": None, "ytd_profit": None}
+    db = Path(getattr(settings, "treasury_sqlite_path", Path("./data/snowball_treasury.db")))
+    try:
+        st = dividend_status(db, db.parent, year_reset=getattr(settings, "year_reset", None))
+        out["dividend"] = st
+        out["dca_time_ct"] = st.get("time_ct") or out["dca_time_ct"]
+        out["dividend_rule"] = st.get("rule_text") or out["dividend_rule"]
+        out["dividend_window_text"] = st.get("window_text")
+        out["ytd_profit"] = st.get("ytd")  # YTD average daily profit (display / goal only)
+        # $100 streak: 5 straight days at/above the minimum unlocks Tb's $1,000 top-up (flag only)
+        out["topup_unlocked"] = bool((st.get("ytd") or {}).get("topup_unlocked"))
+        out["dca_today"] = st.get("today")
+        out["daily_target"] = st.get("target")
+        if st.get("last_skip"):
+            out["dca_last_skip"] = st["last_skip"]
+        out["dividend_unpaid"] = st.get("unpaid") or []  # Task 17: due (cutoff passed) and unpaid
+        out["dividend_caught_up"] = st.get("caught_up") or []
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _dca_time_ct() -> str:
+    """Today's dividend cutoff HH:MM CT (3 PM since Tb 10/2; snowball.treasury.cutoff)."""
+    from datetime import datetime, timezone
+
+    from snowball.treasury.cutoff import CT, day_end
+
+    return day_end(datetime.now(timezone.utc).astimezone(CT).date()).strftime("%H:%M")
+
+
+def _treasury_equity_fields(db, btc_value_usd) -> dict:
+    """Treasury equities (e.g. SPCX) for the snapshot, cached prices only.
+
+    No network: uses the last recorded equity_marks price, else the deposit
+    price (snowball.treasury.equities). Additive keys; never raises.
+    """
+    equities: list[dict] = []
+    stock_value = 0.0
+    try:
+        from snowball.treasury.equities import equity_holdings
+
+        for h in equity_holdings(db, price_fn=lambda _s: None, write_mark=False):
+            value = round(float(h.value_usd or 0), 2)
+            cost = round(float(h.cost_usd or 0), 2)
+            stock_value += value
+            equities.append({
+                "symbol": h.symbol,
+                "shares": h.shares,
+                "price": None if h.price is None else round(float(h.price), 4),
+                "value": value,
+                "cost": cost,
+                "unrealized": round(value - cost, 2),
+                "price_source": h.price_source,
+                "contribution_count": h.contribution_count,
+            })
+    except Exception:  # noqa: BLE001
+        equities = []
+    btc_v = round(float(btc_value_usd or 0), 2)
+    stock_v = round(stock_value, 2)
+    return {
+        "equities": equities,
+        "btc_value_usd": btc_v,
+        "stock_value_usd": stock_v,
+        "total_treasury_usd": round(btc_v + stock_v, 2),
+    }
+
+
+def _treasury_reserve_payload(state: AppState, marks: dict) -> dict:
+    """Soft-reserve numbers for CRYPTO allocation (read-only; never sells)."""
+    from pathlib import Path
+
+    from snowball.allocation import crypto_allocation_base_usd, lane_budgets_usd
+    from snowball.treasury.reserve import treasury_soft_reserve
+
+    settings = state.settings
+    enabled = bool(getattr(settings, "treasury_reserve_enabled", True))
+    av = float(
+        getattr(state, "futures_account_value_usd", None)
+        or getattr(state, "stock_account_value_usd", None)
+        or settings.bankroll_usd
+    )
+    sched = _treasury_dca_payload(settings)
+    empty = {
+        "enabled": enabled,
+        **sched,
+        "never_sell_treasury": bool(getattr(settings, "never_sell_treasury", True)),
+        "btc_qty": 0.0,
+        "mark_usd": 0.0,
+        "cost_usd": 0.0,
+        "reserve_usd": 0.0,
+        "account_value_usd": av,
+        "crypto_allocation_base_usd": av if enabled else av,
+        "crypto_budget_usd": av * float(settings.crypto_account_budget_pct),
+        "crypto_budget_usd_gross": av * float(settings.crypto_account_budget_pct),
+    }
+    db = Path(getattr(settings, "treasury_sqlite_path", Path("./data/snowball_treasury.db")))
+    empty.update(_treasury_equity_fields(db, 0.0))
+    if not enabled:
+        empty["crypto_allocation_base_usd"] = av
+        return empty
+    mark_btc = None
+    for key in ("BTC-USD", "BTC/USD", "BTC"):
+        if key in marks and marks[key] is not None and float(marks[key]) > 0:
+            mark_btc = float(marks[key])
+            break
+    db = Path(getattr(settings, "treasury_sqlite_path", Path("./data/snowball_treasury.db")))
+    try:
+        res = treasury_soft_reserve(db, mark_btc_usd=mark_btc)
+    except Exception:
+        return empty
+    eq_fields = _treasury_equity_fields(db, res["mark_usd"])
+    base = crypto_allocation_base_usd(av, res["reserve_usd"])
+    budgets = lane_budgets_usd(
+        av,
+        crypto_pct=settings.crypto_account_budget_pct,
+        stock_pct=settings.stock_account_budget_pct,
+        futures_pct=settings.futures_account_budget_pct,
+        crash_pct=settings.crash_account_budget_pct,
+        fed_pct=settings.fed_account_budget_pct,
+        crypto_stock_shared=settings.crypto_stock_shared_budget,
+        treasury_reserve_usd=res["reserve_usd"],
+    )
+    return {
+        "enabled": True,
+        **sched,
+        "never_sell_treasury": bool(getattr(settings, "never_sell_treasury", True)),
+        "btc_qty": res["btc_qty"],
+        "mark_usd": res["mark_usd"],
+        "cost_usd": res["cost_usd"],
+        "reserve_usd": res["reserve_usd"],
+        "account_value_usd": av,
+        "crypto_allocation_base_usd": base,
+        "crypto_budget_usd": budgets["crypto_usd"],
+        "crypto_budget_usd_gross": av * float(settings.crypto_account_budget_pct),
+        **eq_fields,
     }
 

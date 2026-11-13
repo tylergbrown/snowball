@@ -54,6 +54,11 @@ class WatcherSidecar:
     def poll_once(self) -> dict[str, int]:
         """Fetch all sources. Never raises to the engine loop."""
         stats = {"rss_new": 0, "te_new": 0, "fred_new": 0, "fedwatch_new": 0, "rss_errors": 0}
+        # Task 15: per-feed status persisted for the daily PDF (no secrets, no URLs with keys)
+        self._feed_status: dict[str, dict] = {}
+        for skipped in SKIPPED_FEEDS:
+            self._feed_status[f"skipped:{skipped.source}"] = {
+                "source": skipped.source, "state": "unavailable", "why": skipped.reason}
         if not self._logged_skip:
             for skipped in SKIPPED_FEEDS:
                 log.warning(
@@ -73,19 +78,36 @@ class WatcherSidecar:
             self.last_error = "rss poll failed"
         try:
             stats["te_new"] = self._poll_te()
-        except Exception:
+            self._feed_status["te_calendar"] = (
+                {"source": "tradingeconomics", "state": "ok", "new": stats["te_new"]}
+                if (self.settings.tradingeconomics_api_key or "").strip()
+                else {"source": "tradingeconomics", "state": "unavailable",
+                      "why": "TRADINGECONOMICS_API_KEY unset (no FOMC/rate calendar events)"})
+        except Exception as exc:
             log.exception("The Watcher TE poll failed")
             self.last_error = "te poll failed"
+            self._feed_status["te_calendar"] = {"source": "tradingeconomics", "state": "error",
+                                                "why": type(exc).__name__ + ": " + str(exc)[:120]}
         try:
             stats["fred_new"] = self._poll_fred()
-        except Exception:
+            self._feed_status["fred"] = (
+                {"source": "fred", "state": "ok", "new": stats["fred_new"]}
+                if (self.settings.fred_api_key or "").strip()
+                else {"source": "fred", "state": "unavailable", "why": "FRED_API_KEY unset"})
+        except Exception as exc:
             log.exception("The Watcher FRED poll failed")
             self.last_error = "fred poll failed"
+            self._feed_status["fred"] = {"source": "fred", "state": "error",
+                                         "why": type(exc).__name__ + ": " + str(exc)[:120]}
         try:
             stats["fedwatch_new"] = self._poll_fedwatch()
-        except Exception:
+            self._feed_status["cme_fedwatch"] = {"source": "cme_fedwatch", "state": "ok",
+                                                 "new": stats["fedwatch_new"]}
+        except Exception as exc:
             log.exception("The Watcher FedWatch poll failed")
             self.last_error = "fedwatch poll failed"
+            self._feed_status["cme_fedwatch"] = {"source": "cme_fedwatch", "state": "error",
+                                                 "why": type(exc).__name__ + ": " + str(exc)[:120]}
         try:
             self._maybe_halt()
         except Exception:
@@ -93,6 +115,13 @@ class WatcherSidecar:
             self.last_error = "halt window failed"
         self.last_poll_at = utcnow()
         self.store.set_meta("last_poll_at", self.last_poll_at.isoformat())
+        try:
+            import json as _json
+
+            self.store.set_meta("feed_status", _json.dumps(
+                {"at": self.last_poll_at.isoformat(), "feeds": self._feed_status}, default=str))
+        except Exception:  # noqa: BLE001
+            log.exception("The Watcher feed_status meta write failed")
         if self.last_error:
             self.store.set_meta("last_error", self.last_error)
         log.info("The Watcher poll complete", extra={"data": stats})
@@ -102,7 +131,11 @@ class WatcherSidecar:
         inserted = 0
         errors = 0
         now = utcnow()
+        status = getattr(self, "_feed_status", None)
+        if status is None:
+            status = self._feed_status = {}
         for feed in WATCHER_RSS_FEEDS:
+            key = f"rss:{feed.source}:{feed.url.rsplit('/', 1)[-1][:40]}"
             try:
                 body = fetch_text(self.http, feed.url)
                 items = parse_rss(body)
@@ -111,7 +144,9 @@ class WatcherSidecar:
                         "The Watcher RSS empty or non-XML",
                         extra={"data": {"source": feed.source, "url": feed.url}},
                     )
+                    status[key] = {"source": feed.source, "state": "empty", "why": "empty or non-XML body"}
                     continue
+                status[key] = {"source": feed.source, "state": "ok", "items": len(items)}
                 for item in items:
                     tags = tag_text(item.title, item.summary)
                     if feed.source == "treasury" and "treasury" not in tags:
@@ -133,8 +168,10 @@ class WatcherSidecar:
                     )
                     if self.store.upsert(ev):
                         inserted += 1
-            except Exception:
+            except Exception as exc:
                 errors += 1
+                status[key] = {"source": feed.source, "state": "error",
+                               "why": type(exc).__name__ + ": " + str(exc)[:120]}
                 log.exception(
                     "The Watcher RSS feed failed",
                     extra={"data": {"source": feed.source, "url": feed.url}},

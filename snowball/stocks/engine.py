@@ -144,6 +144,20 @@ class StockPaperEngine:
             "open_notional_usd": 0.0,
         }
         self._perp_map: dict[str, str] = {}
+        self._roll: Any | None = None  # LaneRollSupport once the CFM market exists
+
+    def _roll_support(self) -> Any | None:
+        if self._roll is None and self._cb_market is not None:
+            from snowball.futures.roll import LaneRollSupport
+
+            self._roll = LaneRollSupport(
+                "stocks",
+                self.state,
+                lambda: getattr(self.state, "stock_ledger", None),
+                self._cb_market,
+                lambda: bool(self.state.settings.stock_live_orders_permitted()),
+            )
+        return self._roll
 
     def refresh_universe(self, *, force: bool = False) -> None:
         settings = self.state.settings
@@ -156,6 +170,14 @@ class StockPaperEngine:
             return
         if settings.stock_live_orders_permitted():
             live_prods = list(settings.stock_product_list)
+            roll = self._roll_support()
+            if roll is not None:
+                try:
+                    live_prods = roll.products(
+                        [normalize_futures_product(p) for p in live_prods]
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("stock front-month resolution failed; using configured products")
             self.state.stock_universe_all = list(live_prods)
             self.state.stock_universe_active = list(live_prods)
             self.state.stock_universe_dynamic = []
@@ -233,7 +255,11 @@ class StockPaperEngine:
         if norm in self._perp_map:
             return self._perp_map[norm]
         sym = normalize_symbol(product)
-        return self._perp_map.get(sym)
+        hit = self._perp_map.get(sym)
+        if hit is None and is_cfm_product(norm) and self.state.settings.stock_live_orders_permitted():
+            # auto-rolled / front-month CFM ids resolve to themselves
+            return norm
+        return hit
 
     def _crash_has_opposing_short(self, product: str) -> bool:
         """True when Crash Guard holds a short on the same CFM index."""
@@ -343,6 +369,12 @@ class StockPaperEngine:
         now = utcnow()
         halted = halt_active(settings.halt_file)
         can_trade = trading_enabled(settings)
+        roll = self._roll_support()
+        if roll is not None:
+            try:
+                roll.tick(now, halted=halted, can_trade=can_trade)
+            except Exception:  # noqa: BLE001
+                log.exception("stocks contract roll tick failed")
 
         # Always refresh/manage products with open lots (e.g. CFM TEK/US5), even if
         # paper universe refresh temporarily omits them from the active watchlist.
@@ -868,6 +900,12 @@ class StockPaperEngine:
         settings = self.state.settings
         ledger = self.state.stock_ledger
         assert ledger is not None
+        from snowball.futures.stops import futures_entry_gate
+
+        if not futures_entry_gate(self.state, product, "stocks", now,
+                                  side="long", market=self._cb_market,
+                                  live=bool(settings.stock_live_orders_permitted()))[0]:
+            return
         target = float(
             notional_usd if notional_usd is not None else settings.per_leg_base_usd
         )
@@ -1162,7 +1200,7 @@ class StockPaperEngine:
             getattr(settings, "never_sell_red_emergency", True)
         )
         for lot in lots:
-            if refuse_red and paper_px < lot.entry_price:
+            if refuse_red and paper_px < lot.gate_entry_price:
                 log.info(
                     "stock paper sell skipped never_sell_red",
                     extra={
@@ -1273,7 +1311,7 @@ class StockPaperEngine:
                     )
                     continue
             elif settings.never_sell_red or getattr(settings, "never_sell_red_emergency", True):
-                if ref is not None and ref < lot.entry_price:
+                if ref is not None and ref < lot.gate_entry_price:
                     log.warning(
                         "stock live emergency close skipped never_sell_red",
                         extra={"data": {"product": pid, "position_id": lot.id}},

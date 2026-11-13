@@ -17,10 +17,12 @@ def build_crash_snapshot(state: AppState) -> dict[str, Any]:
     now = utcnow()
     store = getattr(state, "crash_ledger", None)
     if store is None or not getattr(settings, "crash_enabled", False):
+        note = str(getattr(settings, "crash_disabled_note", "") or "").strip()
         return {
             "enabled": False,
             "mode": "paper",
-            "label": "Crash Guard (disabled)",
+            "label": "Crash Guard (disabled - " + note + ")" if note else "Crash Guard (disabled)",
+            "disabled_note": note or None,
             "pairs": [],
             "positions": [],
             "fills": [],
@@ -188,7 +190,12 @@ def build_crash_snapshot(state: AppState) -> dict[str, Any]:
                 "max_book_positions": settings.crash_max_positions * max(1, len(products)),
                 "min_take_profit_pct": settings.min_take_profit_pct,
                 "fee_buffer_pct": getattr(settings, "fee_buffer_pct", 0.0),
-                "effective_take_profit_floor": settings.effective_min_take_profit_pct(),
+                "effective_take_profit_floor": (
+                    float(getattr(settings, "crash_cover_pct", 0.0) or 0.0)
+                    or settings.effective_min_take_profit_pct()
+                ),
+                "legacy_take_profit_floor": settings.effective_min_take_profit_pct(),
+                "crash_cover_pct_net_of_fees": float(getattr(settings, "crash_cover_pct", 0.0) or 0.0),
                 "never_cover_red": True,
                 "cfm_max_contracts": settings.cfm_max_contracts,
                 "cfm_leverage": settings.cfm_leverage,

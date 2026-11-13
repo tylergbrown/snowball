@@ -25,3 +25,6 @@ data/clerk_cache/
 # earnings scout uses data/snowball_earnings.db (covered by data/*.db)
 reports/*.pdf
 tools/*.bak*
+
+# local secrets directory (never commit)
+secrets/

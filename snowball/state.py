@@ -28,9 +28,16 @@ class AppState:
     yolo: YoloStore | None = None
     watcher_sidecar: object | None = None
     yolo_sidecar: object | None = None
+    yolo_transcripts: object | None = None
     clerk: ClerkStore | None = None
     clerk_sidecar: object | None = None
     earnings: object | None = None
+    # Task 16: research proposals store + generator (None unless RESEARCH_PROPOSALS_ENABLED)
+    proposals: object | None = None
+    proposal_gen: object | None = None
+    # Forward Guidance (Tb 10/3): latest run summary (regimes, spot gate, research regime input)
+    forward_guidance: dict = field(default_factory=dict)
+    forward_runner: object | None = None
     earnings_sidecar: object | None = None
     # --- STOCK PAPER (isolated; never mixes with crypto ledger) ---
     stock_ledger: PaperLedger | None = None
@@ -48,6 +55,7 @@ class AppState:
     # --- Future Trader (isolated; never mixes with crypto/stock ledgers) ---
     futures_ledger: PaperLedger | None = None
     futures_pairs: dict[str, PairSnapshot] = field(default_factory=dict)
+    futures_stock_pairs: dict[str, PairSnapshot] = field(default_factory=dict)  # Task 10 merged stock strategies
     futures_last_tick_at: datetime | None = None
     futures_mark_source: str = "coinbase_perp"
     futures_engine: object | None = None
@@ -55,6 +63,16 @@ class AppState:
     futures_account_value_usd: float | None = None
     futures_budget_usd: float | None = None
     futures_per_index_allotment_usd: float | None = None
+    # Contract rolls across all CFM lanes: {lane: {"PRODUCT#id": status}}
+    contract_roll_status: dict = field(default_factory=dict)
+    # Spot dust (2026-10-01, untested live): blocked-buy counters for Scout (in-memory, reset on restart)
+    dust_buy_stats: dict = field(default_factory=dict)
+    # Futures stops / netted pairs / one-index gate / spot USD floor (2026-10-01)
+    stop_store: object | None = None
+    futures_stop_views: dict = field(default_factory=dict)
+    stop_counters: dict = field(default_factory=dict)
+    netted_report: list = field(default_factory=list)
+    spot_floor_stats: dict = field(default_factory=dict)
     # --- Crash Guard (isolated shorts; never mixes with long books) ---
     crash_ledger: object | None = None
     crash_pairs: dict[str, PairSnapshot] = field(default_factory=dict)
@@ -71,6 +89,8 @@ class AppState:
     fed_last_tick_at: datetime | None = None
     fed_mark_source: str = "coinbase_perp"
     fed_engine: object | None = None
+    # FedWatch research-only runner while FED_ENABLED=false (FED_RESEARCH_ENABLED); never trades.
+    fed_research_engine: object | None = None
     fed_account_value_usd: float | None = None
     fed_budget_usd: float | None = None
     fed_per_index_allotment_usd: float | None = None

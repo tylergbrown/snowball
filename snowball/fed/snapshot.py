@@ -18,16 +18,19 @@ def build_fed_snapshot(state: AppState) -> dict[str, Any]:
     now = utcnow()
     store = getattr(state, "fed_ledger", None)
     if store is None or not getattr(settings, "fed_enabled", False):
+        note = str(getattr(settings, "fed_disabled_note", "") or "").strip()
         return {
             "enabled": False,
             "mode": "paper",
-            "label": "Fed Desk (disabled)",
+            "label": "Fed Desk (disabled - " + note + ")" if note else "Fed Desk (disabled)",
+            "disabled_note": note or None,
             "pairs": [],
             "positions": [],
             "fills": [],
             "risk": {},
             "products": [],
-            "research": {},
+            "research": dict(getattr(state, "fed_last_research", None) or {}),
+            "research_only": getattr(state, "fed_research_engine", None) is not None,
             "bet_eligible": False,
         }
 
@@ -210,7 +213,12 @@ def build_fed_snapshot(state: AppState) -> dict[str, Any]:
                 "max_book_positions": settings.fed_max_positions * max(1, len(products)),
                 "min_take_profit_pct": settings.min_take_profit_pct,
                 "fee_buffer_pct": getattr(settings, "fee_buffer_pct", 0.0),
-                "effective_take_profit_floor": settings.effective_min_take_profit_pct(),
+                "effective_take_profit_floor": (
+                    float(getattr(settings, "fed_cover_pct", 0.0) or 0.0)
+                    or settings.effective_min_take_profit_pct()
+                ),
+                "legacy_take_profit_floor": settings.effective_min_take_profit_pct(),
+                "fed_cover_pct_net_of_fees": float(getattr(settings, "fed_cover_pct", 0.0) or 0.0),
                 "never_sell_red": True,
                 "never_cover_red": True,
                 "cfm_max_contracts": settings.cfm_max_contracts,

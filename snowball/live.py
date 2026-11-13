@@ -58,6 +58,18 @@ def parse_order_fill(order: dict[str, Any]) -> tuple[float, float, float]:
     return fill_px, filled, fee_usd
 
 
+MAKER_GTD_GRACE_SEC = 60.0
+
+
+def maker_gtd_end_time(wait_sec: float, now: "datetime | None" = None) -> str:
+    """ISO-8601 UTC end_time for a maker GTD order: settle window + grace (min 2 minutes)."""
+    from datetime import datetime, timedelta, timezone
+
+    now = now or datetime.now(timezone.utc)
+    life = max(120.0, float(wait_sec) + MAKER_GTD_GRACE_SEC)
+    return (now + timedelta(seconds=life)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 class LiveBroker:
     """Hard-gated live path. Construction fails unless MODE=live AND LIVE_ENABLED=true.
 
@@ -109,6 +121,18 @@ class LiveBroker:
                     return float(block["free"])
         return 0.0
 
+    def fetch_free_btc(self) -> float:
+        """Free BTC balance (treasury hard-block floor uses this)."""
+        bal = self._exchange.fetch_balance()  # type: ignore[attr-defined]
+        free = (bal or {}).get("free") or {}
+        if isinstance(free, dict) and free.get("BTC") is not None:
+            return float(free["BTC"])
+        if isinstance(bal, dict):
+            block = bal.get("BTC")
+            if isinstance(block, dict) and block.get("free") is not None:
+                return float(block["free"])
+        return 0.0
+
     def create_market_order(
         self,
         product: str,
@@ -129,6 +153,11 @@ class LiveBroker:
         """
         from snowball.market import to_ccxt_symbol
 
+        from snowball.treasury.equities import TreasuryHoldingRefused, is_treasury_equity_spot
+
+        if is_treasury_equity_spot(product):
+            # Treasury is receive-only: never trade treasury-held equities (e.g. SPCX).
+            raise TreasuryHoldingRefused(f'treasury holding {product} is never traded')
         symbol = to_ccxt_symbol(product)
         side_l = (side or '').lower()
         if side_l == 'buy':
@@ -245,7 +274,7 @@ class LiveBroker:
         timeout_sec: float | None = None,
         post_only: bool = True,
     ) -> dict:
-        """Place a GTC/post-only limit that rests as maker; settle or cancel on timeout.
+        """Place a GTD/post-only limit that rests as maker; settle or cancel on timeout.
 
         Buy requires a bid (or explicit price below ask). Sell requires an ask
         (or explicit price above bid). Does not place market orders. Unfilled
@@ -289,16 +318,19 @@ class LiveBroker:
                 raise ValueError("maker sell would cross bid; refused")
 
         symbol = to_ccxt_symbol(product)
-        params: dict[str, object] = {"timeInForce": "GTC"}
-        if post_only:
-            params["postOnly"] = True
-        order = self._exchange.create_order(  # type: ignore[attr-defined]
-            symbol, "limit", side_l, float(amount), float(limit_px), params
-        )
         wait = (
             DEFAULT_MAKER_TIMEOUT_SEC
             if timeout_sec is None
             else max(1.0, float(timeout_sec))
+        )
+        # GTD, not GTC: if this process dies mid-wait (restart/SIGTERM) the exchange expires the
+        # order itself instead of leaving an untracked resting buy that fills hours later
+        # (10/14: MOG GTC buy placed 7:35 AM CT, orphaned by the 7:36 restart, filled 9:34 PM CT).
+        params: dict[str, object] = {"timeInForce": "GTD", "end_time": maker_gtd_end_time(wait)}
+        if post_only:
+            params["postOnly"] = True
+        order = self._exchange.create_order(  # type: ignore[attr-defined]
+            symbol, "limit", side_l, float(amount), float(limit_px), params
         )
         return self._settle_maker_order(
             order if isinstance(order, dict) else {},

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from snowball import signal_context
+
 import logging
 import time
 from datetime import datetime
@@ -21,7 +23,9 @@ from snowball.crash.store import CrashStore
 from snowball.crash.triggers import (
     btc_24h_twin_log as btc_24h_twin_log,
     evaluate_crash_triggers,
+    crash_entry_allowed,
     short_cover_allowed,
+    short_cover_pct_net_allowed,
     short_unrealized_pnl_pct,
 )
 from snowball.halt import halt_active, trading_enabled
@@ -73,11 +77,25 @@ class CrashEngine:
                 api_passphrase=s.coinbase_api_passphrase,
                 allow_orders=allow,
             )
+        from snowball.futures.roll import LaneRollSupport
+
+        self._roll = LaneRollSupport(
+            "crash",
+            state,
+            lambda: getattr(self.state, "crash_ledger", None),
+            self.market,
+            lambda: bool(self.state.settings.crash_live_orders_permitted()),
+        )
 
     def product_list(self) -> list[str]:
         settings = self.state.settings
         items = [normalize_futures_product(p) for p in settings.crash_product_list]
-        return items or list(DEFAULT_CRASH_PRODUCTS)
+        items = items or list(DEFAULT_CRASH_PRODUCTS)
+        try:
+            return self._roll.products(items)
+        except Exception:  # noqa: BLE001
+            log.exception("crash front-month resolution failed; using configured products")
+            return items
 
     def tick(self) -> None:
         settings = self.state.settings
@@ -102,6 +120,10 @@ class CrashEngine:
         now = utcnow()
         halted = halt_active(settings.halt_file)
         can_trade = trading_enabled(settings)
+        try:
+            self._roll.tick(now, halted=halted, can_trade=can_trade)
+        except Exception:  # noqa: BLE001
+            log.exception("crash contract roll tick failed")
 
         marks: dict[str, float] = {}
         for product in products:
@@ -111,6 +133,19 @@ class CrashEngine:
 
         self._refresh_budget(marks)
         self._maybe_log_btc_twin()
+
+        # Futures stop-loss + liquidation guard (Tb 2026-10-01): every poll, also under HALT /
+        # daily kill, before the cover/entry logic. FUTURES-ONLY exception to never-cover-red.
+        try:
+            from snowball.futures.stops import LaneHooks, run_stops
+
+            run_stops(self.state, LaneHooks(
+                lane="crash", ledger=store, market=self.market, pairs=self.state.crash_pairs,
+                live=bool(settings.crash_live_orders_permitted()), book=self._stop_book,
+                skip=lambda lot: bool(self._roll.in_flight(lot.id)),
+            ), now=now, can_trade=can_trade)
+        except Exception:  # noqa: BLE001
+            log.exception("crash stop tick failed")
 
         equity = store.equity_usd(marks)
         utc_date, start_eq, killed = store.ensure_utc_day(now, equity)
@@ -262,8 +297,19 @@ class CrashEngine:
                     mid = tr.bb_lower + (tr.bb_width / 2.0)
                     snap.bb_mid_1d = mid
                     snap.bb_upper_1d = tr.bb_lower + tr.bb_width
+                ok_e, why_e, sma_v = crash_entry_allowed(
+                    tr, closes, snap.last,
+                    min_triggers=int(getattr(settings, "crash_min_triggers", 2)),
+                    require_below_sma=bool(getattr(settings, "crash_require_below_sma", True)),
+                    sma_days=int(getattr(settings, "crash_trend_sma_days", 20)),
+                )
                 self._last_triggers[product] = {
                     "fire": tr.fire,
+                    "entry_ok": bool(ok_e),
+                    "entry_block": None if ok_e else why_e,
+                    "n_triggers": len(tr.reasons),
+                    "sma": sma_v,
+                    "last": snap.last,
                     "reasons": list(tr.reasons),
                     "daily_return": tr.daily_return,
                     "rsi_1d": tr.rsi_1d,
@@ -314,6 +360,16 @@ class CrashEngine:
         tr_info = self._last_triggers.get(product) or {}
         if not tr_info.get("fire"):
             return
+        # (B) 2026-10-10: >= CRASH_MIN_TRIGGERS triggers + price below the 20-day average.
+        if not tr_info.get("entry_ok", False):
+            from snowball.futures.stops import _count, _throttled
+
+            _count(self.state, "crash_entry_filtered")
+            if _throttled(("crash_entry_filtered", product, str(tr_info.get("entry_block"))), 3600.0):
+                log.info("crash entry filtered (fix B)", extra={"data": {
+                    "product": product, "why": tr_info.get("entry_block"), "reasons": tr_info.get("reasons"),
+                    "sma": tr_info.get("sma"), "last": tr_info.get("last")}})
+            return
 
         # Flat + trigger → open short
         allot = float(self._last_budget.get("per_index_usd") or 0.0)
@@ -328,6 +384,16 @@ class CrashEngine:
             return
         reasons = tr_info.get("reasons") or []
         reason = f"crash_guard:trigger:{','.join(reasons)}"
+        signal_context.stage(
+            product, reason, lane="crash", strategy="crash_guard", action="entry", side="short",
+            rule="crash trigger fired: " + (", ".join(reasons) or "?"), price=mark,
+            snap=self.state.crash_pairs.get(product) if hasattr(self.state, "crash_pairs") else None,
+            now=now, timeframe="1d",
+            indicators={k: tr_info.get(k) for k in ("daily_return", "rsi_1d", "bb_width", "bb_width_prior")},
+            target={"min_take_profit_pct": settings.min_take_profit_pct, "fee_buffer_pct": settings.fee_buffer_pct,
+                    "crash_cover_pct_net": float(getattr(settings, "crash_cover_pct", 0.0) or 0.0)},
+            gates={"flat": True, "halted": bool(halted), "daily_killed": bool(daily_killed), "notional_usd": allot},
+        )
         self._open_short(
             product=product,
             marks=marks,
@@ -335,6 +401,49 @@ class CrashEngine:
             now=now,
             notional_usd=allot,
         )
+
+    def _cover_ok(self, lot: Position, px: float | None) -> tuple[bool, str]:
+        """Cover gate for every crash path (scan, paper fill, live limit, live fill).
+
+        (B) 2026-10-10: CRASH_COVER_PCT (2.5%) net of real round-trip CFM fees (actual entry fee
+        + estimated exit fee) when > 0; else legacy MIN_TAKE_PROFIT_PCT + FEE_BUFFER_PCT. Applies
+        to already-open lots too. Never covers red.
+        """
+        settings = self.state.settings
+        cp = float(getattr(settings, "crash_cover_pct", 0.0) or 0.0)
+        if cp <= 0:
+            return short_cover_allowed(
+                lot.gate_entry_price,
+                px,
+                min_take_profit_pct=settings.min_take_profit_pct,
+                fee_buffer_pct=settings.fee_buffer_pct,
+                never_cover_red=True,
+            )
+        if px is None or float(px) <= 0:
+            return False, "no_mark"
+        fees = 0.0
+        if is_cfm_product(lot.product):
+            try:
+                from snowball.futures.stops import _aged_fees
+
+                ent, ex = _aged_fees(self.state, self.state.crash_ledger, lot, float(px))
+                fees = float(ent) + float(ex)
+            except Exception:  # noqa: BLE001
+                log.exception("crash cover fee estimate failed; using fee buffer")
+                fees = float(settings.fee_buffer_pct) * float(lot.gate_entry_price) * float(lot.qty)
+        else:
+            fees = float(settings.fee_buffer_pct) * float(lot.gate_entry_price) * float(lot.qty)
+        return short_cover_pct_net_allowed(
+            lot.gate_entry_price, float(px), cover_pct=cp, fee_round_trip_usd=fees, qty=float(lot.qty)
+        )
+
+    def _stop_book(self, lot: Position, fill_px: float, fee_usd: float, reason: str, now: datetime) -> float:
+        store = self.state.crash_ledger
+        assert store is not None
+        fill = store.cover_short(lot.id, fill_px=fill_px, slippage_bps=0.0, fee_usd=fee_usd, reason=reason, ts=now)
+        if lot.product in self.state.crash_pairs:
+            self.state.crash_pairs[lot.product].open_count = store.open_count(lot.product)
+        return (lot.entry_price - fill.price) * fill.qty - fill.fee_usd
 
     def _maybe_cover(
         self,
@@ -346,13 +455,7 @@ class CrashEngine:
         settings = self.state.settings
         mark = marks.get(product)
         for lot in lots:
-            ok, why = short_cover_allowed(
-                lot.entry_price,
-                mark,
-                min_take_profit_pct=settings.min_take_profit_pct,
-                fee_buffer_pct=settings.fee_buffer_pct,
-                never_cover_red=True,
-            )
+            ok, why = self._cover_ok(lot, mark)
             if not ok:
                 log.info(
                     "crash cover refused",
@@ -368,6 +471,15 @@ class CrashEngine:
                     },
                 )
                 continue
+            signal_context.stage(
+                product, "crash_guard:take_profit", lane="crash", strategy="crash_guard", action="exit",
+                side="buy", rule="short green >= cover target net of fees (never-cover-red)", price=mark, now=now,
+                floor={"min_take_profit_pct": settings.min_take_profit_pct, "fee_buffer_pct": settings.fee_buffer_pct,
+                       "crash_cover_pct_net": float(getattr(settings, "crash_cover_pct", 0.0) or 0.0)},
+                gates={"never_cover_red": True, "short_cover_allowed": why,
+                       "lot": {"id": lot.id, "entry": lot.gate_entry_price,
+                               "short_pnl_pct": short_unrealized_pnl_pct(lot.entry_price, mark)}},
+            )
             self._cover_short(product, lot, marks, reason="crash_guard:take_profit", now=now)
 
     def _open_short(
@@ -384,6 +496,11 @@ class CrashEngine:
         assert store is not None
         if store.open_count(product) >= settings.crash_max_positions:
             log.info("crash open blocked: max positions", extra={"data": {"product": product}})
+            return
+        from snowball.futures.stops import futures_entry_gate
+
+        if not futures_entry_gate(self.state, product, "crash", now, side="short", market=self.market,
+                                  live=bool(settings.crash_live_orders_permitted()))[0]:
             return
         if settings.crash_live_orders_permitted():
             self._open_short_live(product, reason=reason, now=now, notional_usd=notional_usd)
@@ -599,15 +716,19 @@ class CrashEngine:
         _refuse_unless_paper_or_dual_live(settings)
         store = self.state.crash_ledger
         assert store is not None
+        from snowball.futures.stops import _throttled, close_pending, is_netted
+
+        if is_netted(self.state, "crash", lot.id):
+            log.info("crash cover skipped: netted pair (bookkeeping only)", extra={"data": {"position_id": lot.id}})
+            return
+        if close_pending(self.state, "crash", lot.id):
+            if _throttled(("close_pending", "crash", lot.id)):
+                log.info("crash cover skipped: stop/aged-exit order already in flight for this lot",
+                         extra={"data": {"position_id": lot.id}})
+            return
         # Re-check never cover red at fill time
         mark = marks.get(product)
-        ok, why = short_cover_allowed(
-            lot.entry_price,
-            mark,
-            min_take_profit_pct=settings.min_take_profit_pct,
-            fee_buffer_pct=settings.fee_buffer_pct,
-            never_cover_red=True,
-        )
+        ok, why = self._cover_ok(lot, mark)
         if not ok:
             log.info(
                 "crash cover aborted",
@@ -625,13 +746,7 @@ class CrashEngine:
         paper_px = fill_price(ticker, "buy", settings.slippage_bps)
         if paper_px is None or paper_px <= 0:
             return
-        ok2, why2 = short_cover_allowed(
-            lot.entry_price,
-            paper_px,
-            min_take_profit_pct=settings.min_take_profit_pct,
-            fee_buffer_pct=settings.fee_buffer_pct,
-            never_cover_red=True,
-        )
+        ok2, why2 = self._cover_ok(lot, paper_px)
         if not ok2:
             log.info(
                 "crash paper cover refused at fill",
@@ -701,19 +816,22 @@ class CrashEngine:
                 )
                 return
             # Final green check at intended cover price
-            ok, why = short_cover_allowed(
-                lot.entry_price,
-                limit_px,
-                min_take_profit_pct=settings.min_take_profit_pct,
-                fee_buffer_pct=settings.fee_buffer_pct,
-                never_cover_red=True,
-            )
+            ok, why = self._cover_ok(lot, limit_px)
             if not ok:
                 log.info(
                     "crash live cover refused at limit",
                     extra={"data": {"product": product, "why": why, "limit_px": limit_px}},
                 )
                 return
+            if is_cfm_product(product):
+                from snowball.futures.stops import verify_close_allowed
+
+                ok_pos, why_pos, ex_n = verify_close_allowed(self.market, product, "short", int(amount))
+                if not ok_pos:
+                    log.error("crash live cover refused by exchange-position check",
+                              extra={"data": {"product": product, "position_id": lot.id, "why": why_pos,
+                                              "exchange_contracts": ex_n}})
+                    return
             timeout = float(getattr(settings, "maker_timeout_seconds", 90.0) or 90.0)
             order = self.market.create_swap_maker_limit_order(
                 product,
@@ -739,13 +857,7 @@ class CrashEngine:
                 extra={"data": {"product": product, "order_id": order.get("id")}},
             )
             return
-        ok3, why3 = short_cover_allowed(
-            lot.entry_price,
-            fill_px,
-            min_take_profit_pct=settings.min_take_profit_pct,
-            fee_buffer_pct=settings.fee_buffer_pct,
-            never_cover_red=True,
-        )
+        ok3, why3 = self._cover_ok(lot, fill_px)
         if not ok3:
             # Should be rare (fill worse than limit); leave position accounting alone —
             # but order already filled. Record cover anyway with warning; never leave
